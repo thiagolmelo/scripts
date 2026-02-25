@@ -1,0 +1,11 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Push to GitHub",
+            "type": "shell",
+            "command": "git add . ; git commit -m 'scripts' ; git push origin main",
+            "problemMatcher": []
+        }
+    ]
+}
