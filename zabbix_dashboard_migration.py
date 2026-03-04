@@ -49,13 +49,14 @@ class ZabbixAPI:
 class DashboardMigrator:
     """Main class for dashboard migration"""
     
-    def __init__(self, source_api: ZabbixAPI, dest_api: ZabbixAPI):
+    def __init__(self, source_api: ZabbixAPI, dest_api: ZabbixAPI, overwrite: bool = True):
         self.source = source_api
         self.dest = dest_api
         self.name_cache = {}
         self.id_cache = {}
         self.failed_dashboards = []
         self.migrated_count = 0
+        self.overwrite = overwrite
         
     def get_all_dashboards(self) -> List[Dict]:
         """Retrieve all dashboards from source"""
@@ -373,6 +374,41 @@ class DashboardMigrator:
         
         return converted, missing_objects
     
+    def delete_existing_dashboard(self, dashboard_name: str) -> bool:
+        """Delete dashboard with same name if it exists in destination"""
+        if not self.overwrite:
+            # Check if dashboard exists without deleting
+            existing = self.dest.call("dashboard.get", {
+                "filter": {"name": dashboard_name},
+                "output": ["dashboardid", "name"]
+            })
+            if existing:
+                print(f"  ⚠ Dashboard already exists (skipping, use --overwrite to replace)")
+                return False
+            return True
+        
+        try:
+            # Check if dashboard exists
+            existing = self.dest.call("dashboard.get", {
+                "filter": {"name": dashboard_name},
+                "output": ["dashboardid", "name"]
+            })
+            
+            if existing:
+                dashboard_id = existing[0]["dashboardid"]
+                print(f"  - Found existing dashboard (ID: {dashboard_id}), deleting...")
+                
+                # Delete the dashboard
+                self.dest.call("dashboard.delete", [dashboard_id])
+                print(f"  ✓ Deleted existing dashboard")
+                return True
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ⚠ Warning: Could not delete existing dashboard: {e}")
+            return False
+    
     def create_dashboard(self, dashboard: Dict) -> bool:
         """Create dashboard in destination instance"""
         try:
@@ -440,7 +476,8 @@ class DashboardMigrator:
             source_version = self.source.call("apiinfo.version")
             dest_version = self.dest.call("apiinfo.version")
             print(f"Source Zabbix version: {source_version}")
-            print(f"Destination Zabbix version: {dest_version}\n")
+            print(f"Destination Zabbix version: {dest_version}")
+            print(f"Overwrite existing dashboards: {'Yes' if self.overwrite else 'No'}\n")
         except Exception as e:
             print(f"Error checking versions: {e}")
             return
@@ -482,15 +519,25 @@ class DashboardMigrator:
                         "details": missing_objects
                     })
                 else:
-                    # Create dashboard
-                    print("  - Creating dashboard...")
-                    if self.create_dashboard(resolved_dashboard):
-                        self.migrated_count += 1
-                    else:
+                    # Delete existing dashboard with same name if it exists
+                    can_proceed = self.delete_existing_dashboard(dashboard_name)
+                    
+                    if not can_proceed:
+                        # Dashboard exists and overwrite is disabled
                         self.failed_dashboards.append({
                             "name": dashboard_name,
-                            "reason": "Creation failed"
+                            "reason": "Dashboard already exists (use --overwrite)"
                         })
+                    else:
+                        # Create dashboard
+                        print("  - Creating dashboard...")
+                        if self.create_dashboard(resolved_dashboard):
+                            self.migrated_count += 1
+                        else:
+                            self.failed_dashboards.append({
+                                "name": dashboard_name,
+                                "reason": "Creation failed"
+                            })
             
             except Exception as e:
                 print(f"  ✗ Error: {e}")
@@ -534,7 +581,8 @@ Example usage:
     --source-url https://zabbix64.example.com \\
     --source-token abc123... \\
     --dest-url https://zabbix70.example.com \\
-    --dest-token xyz789...
+    --dest-token xyz789... \\
+    --overwrite
         """
     )
     
@@ -546,6 +594,11 @@ Example usage:
                        help="Destination Zabbix 7.0 URL")
     parser.add_argument("--dest-token", required=True,
                        help="Destination Zabbix API token")
+    parser.add_argument("--overwrite", action="store_true",
+                       help="Overwrite existing dashboards with same name (default: enabled)")
+    parser.add_argument("--no-overwrite", dest="overwrite", action="store_false",
+                       help="Skip dashboards that already exist in destination")
+    parser.set_defaults(overwrite=True)
     
     args = parser.parse_args()
     
@@ -555,7 +608,7 @@ Example usage:
         dest_api = ZabbixAPI(args.dest_url, args.dest_token)
         
         # Run migration
-        migrator = DashboardMigrator(source_api, dest_api)
+        migrator = DashboardMigrator(source_api, dest_api, overwrite=args.overwrite)
         migrator.migrate()
         
     except Exception as e:
