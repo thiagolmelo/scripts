@@ -190,7 +190,7 @@ class DashboardMigrator:
 
                 else:
                     # DEBUG: log unhandled field types so we can identify them
-                    print(f"    [DEBUG] unhandled field type={field_type} value={field.get('value')} (widget: {widget.get('type')})")
+                    print(f"    [DEBUG] unhandled field type={field_type} name={field.get('name','?')} value={field.get('value')} (widget: {widget.get('type')})")
 
                 converted["fields"].append(converted_field)
         
