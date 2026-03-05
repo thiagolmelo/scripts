@@ -419,11 +419,12 @@ class DashboardMigrator:
         """
         import re
         filtered = []
-        tag_operator_pattern = re.compile(r'^tags\.\d+\.operator$')
+        # In Zabbix 6.4 tag fields are named: tags.tag.N, tags.operator.N, tags.value.N
+        # In Zabbix 7.0 the operator subfield was removed — drop it to avoid API errors
+        tag_operator_pattern = re.compile(r'^tags\.operator\.\d+$')
         for field in fields:
             field_name = field.get("name", "")
             if tag_operator_pattern.match(field_name):
-                # Skip — this field is not supported in Zabbix 7.0
                 continue
             filtered.append(field)
         return filtered
