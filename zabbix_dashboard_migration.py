@@ -384,25 +384,26 @@ class DashboardMigrator:
                     
                     if "widgets" in page:
                         for widget in page["widgets"]:
-                            # Zabbix 6.4 uses a 24-column grid.
-                            # Zabbix 7.0 uses a 36-column grid (factor 1.5).
-                            #
-                            # Scale START and END positions independently with round(),
-                            # then derive width/height from the difference.
-                            # This guarantees adjacent widgets remain adjacent with no
-                            # gaps and no overlaps regardless of rounding.
+                            # Zabbix 6.4 → 7.0 grid change (official docs):
+                            # - Horizontal: 24 columns → 36 columns  (scale ×1.5)
+                            # - Vertical:   rows 0-62, height 2-32   (UNCHANGED)
+                            # Only x and width must be scaled. y and height stay as-is.
                             SCALE = 1.5
                             src_x = int(widget.get("x", 0))
                             src_y = int(widget.get("y", 0))
                             src_w = int(widget.get("width", 1))
-                            src_h = int(widget.get("height", 1))
+                            src_h = int(widget.get("height", 2))
 
-                            x      = round(src_x * SCALE)
-                            y      = round(src_y * SCALE)
-                            width  = round((src_x + src_w) * SCALE) - x
-                            height = round((src_y + src_h) * SCALE) - y
+                            # Scale START and END horizontally, derive width from difference
+                            # to guarantee adjacent widgets remain adjacent (no gaps/overlaps)
+                            x     = round(src_x * SCALE)
+                            width = round((src_x + src_w) * SCALE) - x
 
-                            # Clamp to official 7.0 grid limits (doc: x 0-35, y 0-62, w 1-36, h 2-32)
+                            # Vertical coordinates are unchanged
+                            y      = src_y
+                            height = src_h
+
+                            # Clamp to official 7.0 limits: x 0-35, width 1-36, height 2-32
                             if x + width > 36:
                                 width = 36 - x
                             width  = max(1, min(width, 36))
