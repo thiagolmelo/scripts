@@ -419,12 +419,16 @@ class DashboardMigrator:
         """
         import re
         filtered = []
-        # In Zabbix 6.4 tag fields are named: tags.tag.N, tags.operator.N, tags.value.N
-        # In Zabbix 7.0 the operator subfield was removed — drop it to avoid API errors
-        tag_operator_pattern = re.compile(r'^tags\.operator\.\d+$')
+        # In Zabbix 6.4, widget tag filters use flat fields:
+        #   tags.tag.N, tags.operator.N, tags.value.N
+        # In Zabbix 7.0, the tag field structure changed entirely for several
+        # widget types (dataover, web, etc.) — sending the old format causes
+        #   "Invalid parameter tags/N: unexpected parameter 0"
+        # Safest fix: drop all tag filter fields; the widget will show all data.
+        tag_field_pattern = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
         for field in fields:
             field_name = field.get("name", "")
-            if tag_operator_pattern.match(field_name):
+            if tag_field_pattern.match(field_name):
                 continue
             filtered.append(field)
         return filtered
