@@ -385,18 +385,29 @@ class DashboardMigrator:
                     if "widgets" in page:
                         for widget in page["widgets"]:
                             # Zabbix 6.4 uses a 24-column grid.
-                            # Zabbix 7.0 uses a 36-column grid.
-                            # All coordinates and dimensions must be scaled by 36/24 = 1.5
-                            # to preserve the original layout proportions.
+                            # Zabbix 7.0 uses a 36-column grid (factor 1.5).
+                            #
+                            # Scale START and END positions independently with round(),
+                            # then derive width/height from the difference.
+                            # This guarantees adjacent widgets remain adjacent with no
+                            # gaps and no overlaps regardless of rounding.
                             SCALE = 1.5
-                            x      = round(int(widget.get("x", 0))      * SCALE)
-                            y      = round(int(widget.get("y", 0))       * SCALE)
-                            width  = round(int(widget.get("width", 1))   * SCALE)
-                            height = round(int(widget.get("height", 1))  * SCALE)
-                            # Ensure nothing goes out of the 36-column grid
+                            src_x = int(widget.get("x", 0))
+                            src_y = int(widget.get("y", 0))
+                            src_w = int(widget.get("width", 1))
+                            src_h = int(widget.get("height", 1))
+
+                            x      = round(src_x * SCALE)
+                            y      = round(src_y * SCALE)
+                            width  = round((src_x + src_w) * SCALE) - x
+                            height = round((src_y + src_h) * SCALE) - y
+
+                            # Clamp to official 7.0 grid limits (doc: x 0-35, y 0-62, w 1-36, h 2-32)
                             if x + width > 36:
                                 width = 36 - x
-                            print(f"    [POS] widget={widget.get('type')} name={widget.get('name','?')!r} x={x} y={y} w={width} h={height}")
+                            width  = max(1, min(width, 36))
+                            height = max(2, min(height, 32))
+
                             clean_widget = {
                                 "type": widget["type"],
                                 "name": widget.get("name", ""),
