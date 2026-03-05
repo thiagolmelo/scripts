@@ -388,13 +388,18 @@ class DashboardMigrator:
                             # casting to int to ensure the API accepts them correctly.
                             # Zabbix 6.4 and 7.0 both use a 24-column grid so no
                             # coordinate translation is needed.
+                            x      = int(widget.get("x", 0))
+                            y      = int(widget.get("y", 0))
+                            width  = int(widget.get("width", 1))
+                            height = int(widget.get("height", 1))
+                            print(f"    [POS] widget={widget.get('type')} name={widget.get('name','?')!r} x={x} y={y} w={width} h={height}")
                             clean_widget = {
                                 "type": widget["type"],
                                 "name": widget.get("name", ""),
-                                "x": int(widget.get("x", 0)),
-                                "y": int(widget.get("y", 0)),
-                                "width": int(widget.get("width", 1)),
-                                "height": int(widget.get("height", 1)),
+                                "x": x,
+                                "y": y,
+                                "width": width,
+                                "height": height,
                                 "view_mode": int(widget.get("view_mode", 0))
                             }
                             
