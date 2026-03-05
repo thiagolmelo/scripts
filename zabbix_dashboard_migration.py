@@ -141,7 +141,9 @@ class DashboardMigrator:
             for field in widget["fields"]:
                 converted_field = field.copy()
                 
-                if field["type"] == "4":  # Host group
+                # Zabbix widget field types:
+                # 2 = Item, 4 = Graph, 6 = Host group, 7 = Host
+                if field["type"] == "6":  # Host group
                     group_data = self.source.call("hostgroup.get", {
                         "groupids": field["value"],
                         "output": ["name"]
@@ -149,10 +151,9 @@ class DashboardMigrator:
                     if group_data:
                         converted_field["value_name"] = group_data[0]["name"]
                     else:
-                        # Host group no longer exists in source — mark as inaccessible
                         converted_field["value_name"] = _INACCESSIBLE
-                
-                elif field["type"] == "0":  # Host
+
+                elif field["type"] == "7":  # Host
                     host_data = self.source.call("host.get", {
                         "hostids": field["value"],
                         "output": ["host"]
@@ -160,9 +161,8 @@ class DashboardMigrator:
                     if host_data:
                         converted_field["value_name"] = host_data[0]["host"]
                     else:
-                        # Host is deleted/inaccessible in source — skip silently
                         converted_field["value_name"] = _INACCESSIBLE
-                
+
                 elif field["type"] == "2":  # Item
                     item_data = self.source.call("item.get", {
                         "itemids": field["value"],
@@ -174,8 +174,8 @@ class DashboardMigrator:
                         converted_field["host_name"] = item_data[0]["hosts"][0]["host"]
                     else:
                         converted_field["value_name"] = _INACCESSIBLE
-                
-                elif field["type"] == "6":  # Graph
+
+                elif field["type"] == "4":  # Graph
                     graph_data = self.source.call("graph.get", {
                         "graphids": field["value"],
                         "output": ["name"],
@@ -272,7 +272,9 @@ class DashboardMigrator:
                         # Skip entirely — do not append this field
                         continue
 
-                    if field["type"] == "4":  # Host group
+                    # Zabbix widget field types:
+                    # 2 = Item, 4 = Graph, 6 = Host group, 7 = Host
+                    if field["type"] == "6":  # Host group
                         group_data = self.dest.call("hostgroup.get", {
                             "filter": {"name": field["value_name"]},
                             "output": ["groupid"]
@@ -282,7 +284,7 @@ class DashboardMigrator:
                         else:
                             missing_objects.append(f"Host group: {field['value_name']}")
                     
-                    elif field["type"] == "0":  # Host
+                    elif field["type"] == "7":  # Host
                         host_data = self.dest.call("host.get", {
                             "filter": {"host": field["value_name"]},
                             "output": ["hostid"]
@@ -306,7 +308,7 @@ class DashboardMigrator:
                                     f"Item: {field['value_name']} on host {field['host_name']}"
                                 )
                     
-                    elif field["type"] == "6":  # Graph
+                    elif field["type"] == "4":  # Graph
                         if "host_name" in field:
                             host_data = self.dest.call("host.get", {
                                 "filter": {"host": field["host_name"]},
