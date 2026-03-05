@@ -384,14 +384,18 @@ class DashboardMigrator:
                     
                     if "widgets" in page:
                         for widget in page["widgets"]:
+                            # Preserve exact position and dimensions from source,
+                            # casting to int to ensure the API accepts them correctly.
+                            # Zabbix 6.4 and 7.0 both use a 24-column grid so no
+                            # coordinate translation is needed.
                             clean_widget = {
                                 "type": widget["type"],
                                 "name": widget.get("name", ""),
-                                "x": widget.get("x", "0"),
-                                "y": widget.get("y", "0"),
-                                "width": widget.get("width", "1"),
-                                "height": widget.get("height", "1"),
-                                "view_mode": widget.get("view_mode", "0")
+                                "x": int(widget.get("x", 0)),
+                                "y": int(widget.get("y", 0)),
+                                "width": int(widget.get("width", 1)),
+                                "height": int(widget.get("height", 1)),
+                                "view_mode": int(widget.get("view_mode", 0))
                             }
                             
                             if "fields" in widget:
