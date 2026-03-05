@@ -153,7 +153,7 @@ class DashboardMigrator:
                     else:
                         converted_field["value_name"] = _INACCESSIBLE
 
-                elif field_type == "7":  # Host
+                elif field_type == "3":  # Host
                     host_data = self.source.call("host.get", {
                         "hostids": field["value"],
                         "output": ["host"]
@@ -291,7 +291,7 @@ class DashboardMigrator:
                         else:
                             missing_objects.append(f"Host group: {field['value_name']}")
                     
-                    elif field_type == "7":  # Host
+                    elif field_type == "3":  # Host
                         host_data = self.dest.call("host.get", {
                             "filter": {"host": field["value_name"]},
                             "output": ["hostid"]
