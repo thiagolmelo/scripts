@@ -395,7 +395,7 @@ class DashboardMigrator:
                             }
                             
                             if "fields" in widget:
-                                clean_widget["fields"] = widget["fields"]
+                                clean_widget["fields"] = self._filter_widget_fields(widget["fields"])
                             
                             clean_page["widgets"].append(clean_widget)
                     
@@ -408,6 +408,26 @@ class DashboardMigrator:
         except Exception as e:
             print(f"  ✗ Failed to create dashboard: {e}")
             return False
+
+    def _filter_widget_fields(self, fields: List[Dict]) -> List[Dict]:
+        """Remove widget fields that are incompatible with Zabbix 7.0.
+        
+        In Zabbix 7.0, the widget tag 'operator' subfield was removed.
+        Fields named like 'tags.N.operator' must be stripped before sending
+        to the destination API, or the create call will fail with:
+          Invalid parameter "tags/N": unexpected parameter "0"
+        """
+        import re
+        filtered = []
+        tag_operator_pattern = re.compile(r'^tags\.\d+\.operator$')
+        for field in fields:
+            field_name = field.get("name", "")
+            if tag_operator_pattern.match(field_name):
+                # Skip — this field is not supported in Zabbix 7.0
+                continue
+            filtered.append(field)
+        return filtered
+
     
     def migrate(self):
         """Main migration process"""
