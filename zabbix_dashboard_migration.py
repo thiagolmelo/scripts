@@ -140,10 +140,10 @@ class DashboardMigrator:
             converted["fields"] = []
             for field in widget["fields"]:
                 converted_field = field.copy()
-                
-                # Zabbix widget field types:
-                # 2 = Item, 4 = Graph, 6 = Host group, 7 = Host
-                if field["type"] == "6":  # Host group
+                # Normalize type to string for safe comparison
+                field_type = str(field.get("type", ""))
+
+                if field_type == "6":  # Host group
                     group_data = self.source.call("hostgroup.get", {
                         "groupids": field["value"],
                         "output": ["name"]
@@ -153,7 +153,7 @@ class DashboardMigrator:
                     else:
                         converted_field["value_name"] = _INACCESSIBLE
 
-                elif field["type"] == "7":  # Host
+                elif field_type == "7":  # Host
                     host_data = self.source.call("host.get", {
                         "hostids": field["value"],
                         "output": ["host"]
@@ -163,7 +163,7 @@ class DashboardMigrator:
                     else:
                         converted_field["value_name"] = _INACCESSIBLE
 
-                elif field["type"] == "2":  # Item
+                elif field_type == "2":  # Item
                     item_data = self.source.call("item.get", {
                         "itemids": field["value"],
                         "output": ["name", "key_"],
@@ -175,7 +175,7 @@ class DashboardMigrator:
                     else:
                         converted_field["value_name"] = _INACCESSIBLE
 
-                elif field["type"] == "4":  # Graph
+                elif field_type == "4":  # Graph
                     graph_data = self.source.call("graph.get", {
                         "graphids": field["value"],
                         "output": ["name"],
@@ -187,7 +187,11 @@ class DashboardMigrator:
                             converted_field["host_name"] = graph_data[0]["hosts"][0]["host"]
                     else:
                         converted_field["value_name"] = _INACCESSIBLE
-                
+
+                else:
+                    # DEBUG: log unhandled field types so we can identify them
+                    print(f"    [DEBUG] unhandled field type={field_type} value={field.get('value')} (widget: {widget.get('type')})")
+
                 converted["fields"].append(converted_field)
         
         return converted
@@ -272,9 +276,12 @@ class DashboardMigrator:
                         # Skip entirely — do not append this field
                         continue
 
+                    # Normalize type to string for safe comparison
+                    field_type = str(field.get("type", ""))
+
                     # Zabbix widget field types:
                     # 2 = Item, 4 = Graph, 6 = Host group, 7 = Host
-                    if field["type"] == "6":  # Host group
+                    if field_type == "6":  # Host group
                         group_data = self.dest.call("hostgroup.get", {
                             "filter": {"name": field["value_name"]},
                             "output": ["groupid"]
@@ -284,7 +291,7 @@ class DashboardMigrator:
                         else:
                             missing_objects.append(f"Host group: {field['value_name']}")
                     
-                    elif field["type"] == "7":  # Host
+                    elif field_type == "7":  # Host
                         host_data = self.dest.call("host.get", {
                             "filter": {"host": field["value_name"]},
                             "output": ["hostid"]
@@ -294,7 +301,7 @@ class DashboardMigrator:
                         else:
                             missing_objects.append(f"Host: {field['value_name']}")
                     
-                    elif field["type"] == "2":  # Item
+                    elif field_type == "2":  # Item
                         if "host_name" in field:
                             item_data = self.dest.call("item.get", {
                                 "filter": {"key_": field["value_name"]},
@@ -308,7 +315,7 @@ class DashboardMigrator:
                                     f"Item: {field['value_name']} on host {field['host_name']}"
                                 )
                     
-                    elif field["type"] == "4":  # Graph
+                    elif field_type == "4":  # Graph
                         if "host_name" in field:
                             host_data = self.dest.call("host.get", {
                                 "filter": {"host": field["host_name"]},
