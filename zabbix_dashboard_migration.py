@@ -335,9 +335,23 @@ class DashboardMigrator:
         
         return converted, missing_objects
     
+    def delete_existing_dashboard(self, name: str) -> None:
+        """Delete a dashboard by name in destination if it exists"""
+        existing = self.dest.call("dashboard.get", {
+            "filter": {"name": name},
+            "output": ["dashboardid"]
+        })
+        if existing:
+            dashboard_id = existing[0]["dashboardid"]
+            self.dest.call("dashboard.delete", [dashboard_id])
+            print(f"  - Found existing dashboard (ID: {dashboard_id}), deleting...")
+
     def create_dashboard(self, dashboard: Dict) -> bool:
         """Create dashboard in destination instance"""
         try:
+            # Remove existing dashboard with the same name before creating
+            self.delete_existing_dashboard(dashboard["name"])
+
             clean_dashboard = {
                 "name": dashboard["name"],
                 "display_period": dashboard.get("display_period", "30"),
