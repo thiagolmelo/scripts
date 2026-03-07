@@ -497,10 +497,10 @@ class ZabbixMigrator:
 
         # ── 6. Export all needed templates in ONE call ───────────────────────
         try:
-            exported = self.source.configuration.export(
+            exported = self._to_export_str(self.source.configuration.export(
                 format="json",
                 options={"templates": list(needed_ids)}
-            )
+            ))
         except Exception as exc:
             self._fail("templates", "configuration.export failed", exc)
             return
@@ -579,10 +579,10 @@ class ZabbixMigrator:
         # ── Export all enabled hosts ─────────────────────────────────────────
         hids = [h["hostid"] for h in enabled]
         try:
-            all_exported = self.source.configuration.export(
+            all_exported = self._to_export_str(self.source.configuration.export(
                 format="json",
                 options={"hosts": hids}
-            )
+            ))
         except Exception as exc:
             self._fail("hosts", "configuration.export failed", exc)
             return
@@ -603,10 +603,10 @@ class ZabbixMigrator:
             ok_count = 0
             for host in enabled:
                 try:
-                    exported = self.source.configuration.export(
+                    exported = self._to_export_str(self.source.configuration.export(
                         format="json",
                         options={"hosts": [host["hostid"]]}
-                    )
+                    ))
                     self._raw_import(fmt="json", source=exported, rules=HOST_IMPORT_RULES)
                     ok_count += 1
                 except Exception as exc:
@@ -690,10 +690,10 @@ class ZabbixMigrator:
 
         mids = [m["sysmapid"] for m in maps]
         try:
-            exported = self.source.configuration.export(
+            exported = self._to_export_str(self.source.configuration.export(
                 format="json",
                 options={"maps": mids}
-            )
+            ))
         except Exception as exc:
             self._fail("maps", "configuration.export failed", exc)
             return
@@ -1398,6 +1398,18 @@ class ZabbixMigrator:
     # =======================================================================
     # Generic helpers
     # =======================================================================
+
+    @staticmethod
+    def _to_export_str(raw) -> str:
+        """
+        Normalize the value returned by configuration.export.
+        pyzabbix may return a plain str, a dict, or an APIObject (dict subclass).
+        _raw_import needs a plain JSON string.
+        """
+        if isinstance(raw, str):
+            return raw
+        # dict or APIObject — serialize to JSON string
+        return json.dumps(dict(raw))
 
     def _raw_import(self, fmt: str, source: str, rules: Dict):
         """
