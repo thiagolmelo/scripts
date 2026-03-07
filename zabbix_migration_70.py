@@ -148,13 +148,12 @@ def load_instances(environment: str) -> Dict:
 # Git pull helper
 # ---------------------------------------------------------------------------
 
-def pull_repository() -> bool:
+def pull_repository(repo_name: str = None) -> bool:
     """
     Perform a 'git pull <repo> <branch>' using information from
-    ../projects_branch.yml (one level above the script directory).
+    projects_branch.yml, found by walking upward from the script directory.
 
-    The repository name is derived from the script's parent folder name,
-    which by convention matches the 'name' field in projects_branch.yml.
+    repo_name: explicit project name; if None, the current folder name is used.
 
     Expected YAML structure:
       projects:
@@ -163,7 +162,7 @@ def pull_repository() -> bool:
     """
     import subprocess
 
-    repo_name  = os.path.basename(BASE_DIR)
+    repo_name = repo_name or os.path.basename(BASE_DIR)
 
     # Walk upward from the script's directory until projects_branch.yml is found.
     # The script lives inside <repo>/<subdir>/, so the file may be 2+ levels up.
@@ -1341,12 +1340,13 @@ Config files (same directory as this script):
         """
     )
     parser.add_argument(
-        "--pull-repository", action="store_true",
+        "--pull-repository", nargs="?", const="", metavar="PROJECT_NAME",
         help=(
             "Pull latest code from Bitbucket before running. "
-            "Reads repo name (current folder) and branch from ../projects_branch.yml. "
-            "Can be used standalone (no migration args required) or combined with "
-            "--env / --cia / --migrate to pull-then-migrate in one command."
+            "Optionally pass the project name (e.g. --pull-repository zabbix-python-scripts); "
+            "if omitted, the current folder name is used. "
+            "Branch is read from projects_branch.yml found by walking up from the script dir. "
+            "Can be used standalone or combined with --env / --cia / --migrate."
         )
     )
     parser.add_argument(
@@ -1385,15 +1385,14 @@ Config files (same directory as this script):
     )
 
     # ── --pull-repository ────────────────────────────────────────────────────
-    if args.pull_repository:
+    if args.pull_repository is not None:
         print("\n" + "=" * 70)
         print("  Git Pull")
         print("=" * 70)
-        ok = pull_repository()
+        ok = pull_repository(repo_name=args.pull_repository or None)
         print("=" * 70)
         if not ok:
             sys.exit(1)
-        # If no migration was requested, stop here
         if not args.migrate:
             sys.exit(0)
 
@@ -1413,7 +1412,7 @@ Config files (same directory as this script):
             sys.exit(1)
     else:
         # Neither --pull-repository nor --migrate was given
-        if not args.pull_repository:
+        if args.pull_repository is None:
             parser.print_help()
             sys.exit(1)
         sys.exit(0)
