@@ -1450,16 +1450,16 @@ class ZabbixMigrator:
                   getattr(self.source, "_ZabbixAPI__auth", None)
         api_url = self._source_url.rstrip("/") + "/api_jsonrpc.php"
 
-        payload = json.dumps({
+        payload = json.dumps(self._sanitize({
             "jsonrpc": "2.0",
             "method":  "configuration.export",
             "id":      1,
-            "auth":    token,
+            "auth":    str(token) if token is not None else None,
             "params":  {
                 "format":  "json",
                 "options": {object_type: ids}
             }
-        })
+        }))
 
         resp = _requests.post(
             api_url,
@@ -1477,28 +1477,40 @@ class ZabbixMigrator:
             return result
         return json.dumps(result)
 
+    @staticmethod
+    def _sanitize(obj):
+        """
+        Recursively convert any object to plain JSON-safe Python types.
+        Handles pyzabbix APIObject regardless of whether it subclasses dict.
+        """
+        # Primitives — already safe
+        if obj is None or isinstance(obj, (bool, int, float, str)):
+            return obj
+        # Plain dict — recurse into values
+        if type(obj) is dict:
+            return {str(k): ZabbixMigrator._sanitize(v) for k, v in obj.items()}
+        # Plain list/tuple
+        if type(obj) in (list, tuple):
+            return [ZabbixMigrator._sanitize(i) for i in obj]
+        # Dict-like (APIObject, AttrDict, any dict subclass)
+        try:
+            return {str(k): ZabbixMigrator._sanitize(v) for k, v in obj.items()}
+        except (AttributeError, TypeError):
+            pass
+        # Any iterable
+        try:
+            return [ZabbixMigrator._sanitize(i) for i in obj]
+        except TypeError:
+            pass
+        # Last resort — stringify
+        return str(obj)
+
     def _raw_import(self, fmt: str, source, rules: Dict):
         """
-        Call configuration.import directly via raw HTTP POST, bypassing
-        pyzabbix's automatic camelCase↔snake_case key transformation which
-        corrupts the rules parameter names and causes API errors.
-
-        'source' may be a str, dict, or pyzabbix APIObject — all are handled.
+        Call configuration.import via raw HTTP POST, bypassing pyzabbix
+        so that rule key names are never mangled.
         """
         import requests as _requests
-
-        class _SafeEncoder(json.JSONEncoder):
-            """Serialises pyzabbix APIObject (and any other dict-like) safely."""
-            def default(self, obj):
-                try:
-                    return dict(obj)          # APIObject, AttrDict, etc.
-                except Exception:
-                    pass
-                try:
-                    return list(obj)          # any other iterable
-                except Exception:
-                    pass
-                return super().default(obj)   # raises TypeError as usual
 
         token   = getattr(self.dest, "auth", None) or \
                   getattr(self.dest, "_ZabbixAPI__auth", None)
@@ -1508,15 +1520,16 @@ class ZabbixMigrator:
             "jsonrpc": "2.0",
             "method":  "configuration.import",
             "id":      1,
-            "auth":    str(token) if token else None,
+            "auth":    str(token) if token is not None else None,
             "params":  {
                 "format": fmt,
-                "source": source if isinstance(source, str) else json.dumps(source, cls=_SafeEncoder),
+                "source": source if isinstance(source, str)
+                          else json.dumps(self._sanitize(source)),
                 "rules":  rules,
             }
         }
 
-        raw_body = json.dumps(payload, cls=_SafeEncoder)
+        raw_body = json.dumps(self._sanitize(payload))
         resp = _requests.post(
             api_url,
             data=raw_body,
@@ -1526,7 +1539,10 @@ class ZabbixMigrator:
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            raise Exception(data["error"].get("data") or data["error"].get("message", str(data["error"])))
+            raise Exception(
+                data["error"].get("data") or
+                data["error"].get("message", str(data["error"]))
+            )
         return data.get("result", True)
 
     def _ensure_groups_in_dest(
