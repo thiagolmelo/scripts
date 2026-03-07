@@ -106,8 +106,12 @@ class DashboardMigrator:
     """Migrates dashboards from a Zabbix 6.4 source to a Zabbix 7.0 destination."""
 
     def __init__(self, source_url: str, dest_url: str,
-                 username: str, password: str, cia_name: str):
+                 username: str, password: str, cia_name: str,
+                 skip_existing: bool = False,
+                 dashboard_filter: str = None):
         self.cia_name = cia_name
+        self.skip_existing = skip_existing
+        self.dashboard_filter = dashboard_filter
         self.failed_dashboards: List[Dict] = []
         self.migrated_count = 0
 
@@ -131,6 +135,35 @@ class DashboardMigrator:
             self.dest.logout()
         except Exception:
             pass
+
+    # -----------------------------------------------------------------------
+    # Source diagnostic helpers
+    # -----------------------------------------------------------------------
+
+    def _source_hostgroup_empty(self, group_name: str) -> bool:
+        """Return True if the host group exists in source but contains no hosts."""
+        try:
+            count = self.source.host.get(
+                groupids=self.source.hostgroup.get(
+                    filter={"name": group_name},
+                    output=["groupid"]
+                )[0]["groupid"],
+                countOutput=True
+            )
+            return int(count) == 0
+        except Exception:
+            return False  # can't determine, assume non-empty
+
+    def _source_host_disabled(self, host_name: str) -> bool:
+        """Return True if the host exists in source but is disabled (status=1)."""
+        try:
+            data = self.source.host.get(
+                filter={"host": host_name},
+                output=["status"]
+            )
+            return bool(data) and str(data[0]["status"]) == "1"
+        except Exception:
+            return False  # can't determine
 
     # -----------------------------------------------------------------------
     # Fetch
@@ -450,7 +483,17 @@ class DashboardMigrator:
                     if data:
                         cf["value"] = data[0]["groupid"]
                     else:
-                        missing.append(f"Host group '{vname}' [{ctx}]")
+                        if self._source_hostgroup_empty(vname):
+                            annotation = (
+                                " [NOTE: group is EMPTY in source (no hosts)"
+                                " -- verify if it should exist in destination]"
+                            )
+                        else:
+                            annotation = (
+                                " [!! UNEXPECTED: group has hosts in source"
+                                " but is missing in destination -- please investigate !!]"
+                            )
+                        missing.append(f"Host group '{vname}' [{ctx}]{annotation}")
 
                 elif ftype == FIELD_TYPE_HOST:              # 3 -> Host
                     data = self.dest.host.get(
@@ -460,7 +503,17 @@ class DashboardMigrator:
                     if data:
                         cf["value"] = data[0]["hostid"]
                     else:
-                        missing.append(f"Host '{vname}' [{ctx}]")
+                        if self._source_host_disabled(vname):
+                            annotation = (
+                                " [NOTE: host is DISABLED in source"
+                                " -- verify if it should be migrated to destination]"
+                            )
+                        else:
+                            annotation = (
+                                " [!! UNEXPECTED: host is active in source"
+                                " but is missing in destination -- please investigate !!]"
+                            )
+                        missing.append(f"Host '{vname}' [{ctx}]{annotation}")
 
                 elif ftype == FIELD_TYPE_ITEM:              # 4 -> Item
                     host_name = field.get("host_name")
@@ -598,6 +651,14 @@ class DashboardMigrator:
     # Phase 3: create in destination
     # -----------------------------------------------------------------------
 
+    def _dashboard_exists_in_dest(self, name: str) -> bool:
+        """Return True if a dashboard with this name already exists in destination."""
+        existing = self.dest.dashboard.get(
+            filter={"name": name},
+            output=["dashboardid"]
+        )
+        return bool(existing)
+
     def _delete_existing_dashboard(self, name: str):
         """Delete a dashboard in the destination if it already exists."""
         existing = self.dest.dashboard.get(
@@ -624,7 +685,13 @@ class DashboardMigrator:
     def create_dashboard(self, dashboard: Dict) -> bool:
         """Build the cleaned payload and create the dashboard in the destination."""
         try:
-            self._delete_existing_dashboard(dashboard["name"])
+            # Handle existing dashboard based on mode
+            if self._dashboard_exists_in_dest(dashboard["name"]):
+                if self.skip_existing:
+                    print(f"    ~ Skipped (already exists): {dashboard['name']}")
+                    return None  # None = skipped, not failed
+                else:
+                    self._delete_existing_dashboard(dashboard["name"])
 
             clean = {
                 "name":           dashboard["name"],
@@ -722,6 +789,16 @@ class DashboardMigrator:
             print("  No dashboards found.")
             return
 
+        # Filter by name if --dashboard was specified
+        if self.dashboard_filter:
+            dashboards = [d for d in dashboards
+                          if d.get("name") == self.dashboard_filter]
+            if not dashboards:
+                print(f"  Dashboard '{self.dashboard_filter}' not found in source.")
+                return
+            print(f"  Filtered to dashboard: '{self.dashboard_filter}'")
+
+        self.skipped_count = 0
         print()
         for dashboard in dashboards:
             name = dashboard.get("name", "Unnamed")
@@ -735,7 +812,10 @@ class DashboardMigrator:
                 resolved = self.resolve_object_ids(converted)
 
                 print("    - Creating dashboard...")
-                if self.create_dashboard(resolved):
+                result = self.create_dashboard(resolved)
+                if result is None:
+                    self.skipped_count += 1
+                elif result:
                     self.migrated_count += 1
                 else:
                     self.failed_dashboards.append({
@@ -760,9 +840,10 @@ class DashboardMigrator:
 
     def print_summary(self):
         """Print a summary of this CIA's migration results."""
-        ok  = self.migrated_count
-        err = len(self.failed_dashboards)
-        print(f"  Migrated: {ok}   Failed: {err}")
+        ok      = self.migrated_count
+        skipped = getattr(self, "skipped_count", 0)
+        err     = len(self.failed_dashboards)
+        print(f"  Migrated: {ok}   Skipped (already exist): {skipped}   Failed: {err}")
 
         if self.failed_dashboards:
             print("  Failed dashboards:")
@@ -800,6 +881,12 @@ Examples:
   # Migrate all CIAs in PRD environment
   python migrate_dashboards.py --env prd --cia all
 
+  # Migrate only one specific dashboard by name
+  python migrate_dashboards.py --env ppr --cia biz01 --dashboard "CVS UAT Monitoring"
+
+  # Skip dashboards that already exist in destination (do not overwrite)
+  python migrate_dashboards.py --env ppr --cia biz01 --skip-existing
+
   # Enable verbose debug output
   python migrate_dashboards.py --env ppr --cia biz01 --debug
 
@@ -816,6 +903,14 @@ Config files required in the same directory as this script:
     parser.add_argument(
         "--cia", required=True,
         help="CIA name to migrate (e.g. biz01) or 'all' to migrate every CIA"
+    )
+    parser.add_argument(
+        "--dashboard", default=None, metavar="NAME",
+        help="Migrate only the dashboard with this exact name (optional)"
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip dashboards that already exist in destination instead of overwriting them"
     )
     parser.add_argument(
         "--debug", action="store_true",
@@ -868,7 +963,9 @@ Config files required in the same directory as this script:
 
     print("\n" + "=" * 70)
     print(f"  Zabbix Dashboard Migration  |  env={args.env}  |  "
-          f"cia={'all' if args.cia == 'all' else args.cia}")
+          f"cia={'all' if args.cia == 'all' else args.cia}"
+          + (f"  |  dashboard='{args.dashboard}'" if args.dashboard else "")
+          + ("  |  skip-existing" if args.skip_existing else ""))
     print("=" * 70)
 
     for cia_name in cia_names:
@@ -889,7 +986,9 @@ Config files required in the same directory as this script:
                 dest_url=dest_url,
                 username=creds["username"],
                 password=creds["password"],
-                cia_name=cia_name
+                cia_name=cia_name,
+                skip_existing=args.skip_existing,
+                dashboard_filter=args.dashboard,
             )
             migrator.migrate()
             migrator.print_summary()
