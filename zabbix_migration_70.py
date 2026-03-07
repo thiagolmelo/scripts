@@ -43,6 +43,7 @@ import sys
 import json
 import argparse
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import yaml
@@ -114,6 +115,131 @@ MAP_IMPORT_RULES = {
 }
 
 logger = logging.getLogger(__name__)
+
+LOG_FILE = os.path.join(BASE_DIR, "migration.log")
+
+
+# ---------------------------------------------------------------------------
+# Incremental log writer
+# ---------------------------------------------------------------------------
+
+class MigrationLog:
+    """
+    Appends structured, timestamped detail to migration.log.
+    Console output shows statistics only; this file keeps the full detail
+    for post-run investigation.
+    """
+
+    def __init__(self, env: str, cia: str, types_run: List[str],
+                 dashboard_filter: str = None):
+        self.path       = LOG_FILE
+        self.run_ts     = datetime.now()
+        self.env        = env
+        self.cia        = cia
+        self.types_run  = types_run
+        self.dashboard_filter = dashboard_filter
+        self._sections: List[str] = []
+
+    def _ts(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def section(self, cia_name: str, migrator: "ZabbixMigrator"):
+        """Collect detail for one CIA after its migration completes."""
+        lines = [
+            f"",
+            f"  CIA: {cia_name}",
+            f"  {'─' * 60}",
+        ]
+
+        for t in self.types_run:
+            r = migrator.results[t]
+            lines.append(
+                f"  [{t.capitalize():12}] "
+                f"Migrated: {r['migrated']:4}  "
+                f"Skipped: {r['skipped']:4}  "
+                f"Failed: {r['failed']:4}"
+            )
+            for err in r["errors"]:
+                name   = err.get("name", "")
+                reason = err.get("reason", "")
+                prefix = f"'{name}' -- " if name else ""
+                lines.append(f"      ERROR: {prefix}{reason}")
+                for d in err.get("details", []):
+                    lines.append(f"          . {d}")
+
+        # Disabled hosts
+        if "hosts" in self.types_run and migrator.disabled_hosts:
+            lines.append(
+                f"\n  Disabled hosts NOT imported [{len(migrator.disabled_hosts)}]:"
+            )
+            for name in sorted(migrator.disabled_hosts):
+                lines.append(f"    - {name}  [DISABLED in source]")
+
+        # Hosts missing after import
+        if "hosts" in self.types_run and migrator.missing_hosts_after_import:
+            lines.append(
+                f"\n  Enabled hosts missing in destination after import "
+                f"[{len(migrator.missing_hosts_after_import)}]:"
+            )
+            for name in migrator.missing_hosts_after_import:
+                lines.append(f"    - {name}  [MISSING in destination]")
+
+        # Skipped templates
+        if "templates" in self.types_run and migrator.skipped_templates:
+            lines.append(
+                f"\n  Templates skipped (no enabled host link) "
+                f"[{len(migrator.skipped_templates)}]:"
+            )
+            for name in sorted(migrator.skipped_templates):
+                lines.append(f"    - {name}  [no active host link, direct or indirect]")
+
+        self._sections.append("\n".join(lines))
+
+    def write(self, global_results: Dict[str, Dict]):
+        """Flush the full run to the log file (append mode)."""
+        run_start = self.run_ts.strftime("%Y-%m-%d %H:%M:%S")
+        run_end   = self._ts()
+
+        header = [
+            "",
+            "=" * 70,
+            f"  RUN STARTED : {run_start}",
+            f"  RUN FINISHED: {run_end}",
+            f"  env={self.env}  cia={self.cia}  "
+            f"migrate={' '.join(self.types_run)}",
+        ]
+        if self.dashboard_filter:
+            header.append(f"  dashboard filter='{self.dashboard_filter}'")
+        header.append("=" * 70)
+
+        global_lines = [
+            "",
+            "  Global totals:",
+        ]
+        for t in self.types_run:
+            r = global_results[t]
+            global_lines.append(
+                f"  [{t.capitalize():12}] "
+                f"Migrated: {r['migrated']:4}  "
+                f"Skipped: {r['skipped']:4}  "
+                f"Failed: {r['failed']:4}"
+            )
+
+        body = (
+            "\n".join(header)
+            + "\n"
+            + "\n".join(self._sections)
+            + "\n"
+            + "\n".join(global_lines)
+            + "\n"
+        )
+
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(body)
+
+        print(f"\n  Details written to: {self.path}")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +374,7 @@ class ZabbixMigrator:
         self.cia_name         = cia_name
         self.skip_existing    = skip_existing
         self.dashboard_filter = dashboard_filter
+        self._dest_url        = dest_url   # kept for raw API calls (bypass pyzabbix)
 
         # Per-type result counters
         self.results: Dict[str, Dict] = {
@@ -380,8 +507,8 @@ class ZabbixMigrator:
 
         # ── 7. Import into destination (single call = no ordering issues) ────
         try:
-            self.dest.configuration.import_(
-                format="json",
+            self._raw_import(
+                fmt="json",
                 source=exported,
                 rules=TEMPLATE_IMPORT_RULES
             )
@@ -460,8 +587,8 @@ class ZabbixMigrator:
 
         # Import into destination
         try:
-            self.dest.configuration.import_(
-                format="json",
+            self._raw_import(
+                fmt="json",
                 source=exported,
                 rules=HOST_IMPORT_RULES
             )
@@ -552,8 +679,8 @@ class ZabbixMigrator:
             return
 
         try:
-            self.dest.configuration.import_(
-                format="json",
+            self._raw_import(
+                fmt="json",
                 source=exported,
                 rules=MAP_IMPORT_RULES
             )
@@ -1252,6 +1379,37 @@ class ZabbixMigrator:
     # Generic helpers
     # =======================================================================
 
+    def _raw_import(self, fmt: str, source: str, rules: Dict):
+        """
+        Call configuration.import directly via raw HTTP POST, bypassing
+        pyzabbix's automatic camelCase↔snake_case key transformation which
+        corrupts the rules parameter names and causes API errors.
+        """
+        import requests as _requests
+
+        # zabbix_utils stores the session token in .auth after login
+        token   = getattr(self.dest, "auth", None) or getattr(self.dest, "_ZabbixAPI__auth", None)
+        api_url = self._dest_url.rstrip("/") + "/api_jsonrpc.php"
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "configuration.import",
+            "id":      1,
+            "auth":    token,
+            "params":  {
+                "format": fmt,
+                "source": source,
+                "rules":  rules,        # keys sent verbatim — no pyzabbix transformation
+            }
+        }
+
+        resp = _requests.post(api_url, json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(data["error"].get("data") or data["error"].get("message", str(data["error"])))
+        return data.get("result", True)
+
     def _ensure_groups_in_dest(
             self, src_groups: List[Dict], name_key: str,
             getter, creator, label: str):
@@ -1287,40 +1445,13 @@ class ZabbixMigrator:
     # =======================================================================
 
     def print_summary(self, types_run: List[str]):
+        """Print per-type statistics to console only. All detail is in the log file."""
         for t in types_run:
             r = self.results[t]
             print(f"  [{t.capitalize():12}] "
                   f"Migrated: {r['migrated']:4}  "
                   f"Skipped: {r['skipped']:4}  "
                   f"Failed: {r['failed']:4}")
-            for err in r["errors"]:
-                name   = err.get("name", "")
-                reason = err.get("reason", "")
-                prefix = f"'{name}' -- " if name else ""
-                print(f"      - {prefix}{reason}")
-                for d in err.get("details", []):
-                    print(f"          . {d}")
-
-        # Disabled hosts detail list
-        if "hosts" in types_run and self.disabled_hosts:
-            print(f"\n  Disabled hosts in source (NOT imported) "
-                  f"[{len(self.disabled_hosts)}]:")
-            for name in sorted(self.disabled_hosts):
-                print(f"    - {name}  [DISABLED in source]")
-
-        # Hosts missing in destination after import
-        if "hosts" in types_run and self.missing_hosts_after_import:
-            print(f"\n  Enabled hosts NOT found in destination after import "
-                  f"[{len(self.missing_hosts_after_import)}]:")
-            for name in self.missing_hosts_after_import:
-                print(f"    - {name}  [MISSING in destination]")
-
-        # Skipped templates detail list
-        if "templates" in types_run and self.skipped_templates:
-            print(f"\n  Templates not linked to any enabled host (NOT imported) "
-                  f"[{len(self.skipped_templates)}]:")
-            for name in sorted(self.skipped_templates):
-                print(f"    - {name}  [no active host link, direct or indirect]")
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1644,13 @@ Config files (same directory as this script):
         for t in MIGRATION_ORDER
     }
 
+    mlog = MigrationLog(
+        env=args.env,
+        cia=args.cia,
+        types_run=types_to_run,
+        dashboard_filter=args.dashboard,
+    )
+
     for cia_name in cia_names:
         cfg        = cia_map[cia_name]
         source_url = cfg["url_export"]
@@ -1549,6 +1687,7 @@ Config files (same directory as this script):
 
             print(f"\n  Summary for CIA '{cia_name}':")
             migrator.print_summary(types_to_run)
+            mlog.section(cia_name, migrator)
 
             for t in types_to_run:
                 for k in ("migrated", "skipped", "failed"):
@@ -1563,7 +1702,7 @@ Config files (same directory as this script):
             if migrator:
                 migrator.logout()
 
-    # Global summary
+    # Global summary — console: stats only
     print("\n" + "=" * 70)
     print("  Global Summary")
     print("=" * 70)
@@ -1573,10 +1712,10 @@ Config files (same directory as this script):
               f"Migrated: {r['migrated']:4}  "
               f"Skipped: {r['skipped']:4}  "
               f"Failed: {r['failed']:4}")
-    print()
-    print("  Note: Objects inaccessible in source were silently skipped")
-    print("        and are NOT counted as failures.")
-    print("=" * 70 + "\n")
+    print("=" * 70)
+
+    # Flush full detail to log file
+    mlog.write(global_results)
 
 
 if __name__ == "__main__":
