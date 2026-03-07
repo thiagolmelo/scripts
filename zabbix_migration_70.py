@@ -33,6 +33,8 @@ Usage:
   python zabbix_migration_70.py --env ppr --cia biz01 --migrate dashboards \\
       --dashboard "CVS UAT Monitoring" --skip-existing
   python zabbix_migration_70.py --env ppr --cia all   --migrate all --debug
+  python zabbix_migration_70.py --pull-repository
+  python zabbix_migration_70.py --pull-repository --env ppr --cia biz01 --migrate all
 """
 
 import os
@@ -140,6 +142,81 @@ def load_instances(environment: str) -> Dict:
     if not config or "cia" not in config:
         raise ValueError(f"'{path}' must contain a 'cia' mapping.")
     return config
+
+
+# ---------------------------------------------------------------------------
+# Git pull helper
+# ---------------------------------------------------------------------------
+
+def pull_repository() -> bool:
+    """
+    Perform a 'git pull <repo> <branch>' using information from
+    ../projects_branch.yml (one level above the script directory).
+
+    The repository name is derived from the script's parent folder name,
+    which by convention matches the 'name' field in projects_branch.yml.
+
+    Expected YAML structure:
+      projects:
+        - name: "zabbix-python-scripts"
+          branch: "feature/NXIBW17-601"
+    """
+    import subprocess
+
+    repo_name  = os.path.basename(BASE_DIR)
+    yml_path   = os.path.normpath(os.path.join(BASE_DIR, "..", "projects_branch.yml"))
+
+    print(f"\n  Repository : {repo_name}")
+    print(f"  Config file: {yml_path}")
+
+    # Load YAML
+    if not os.path.exists(yml_path):
+        print(f"  ERROR: '{yml_path}' not found.", file=sys.stderr)
+        return False
+
+    with open(yml_path, "r") as f:
+        data = yaml.safe_load(f)
+
+    projects = data.get("projects") if data else None
+    if not projects:
+        print(f"  ERROR: 'projects' key missing or empty in '{yml_path}'.",
+              file=sys.stderr)
+        return False
+
+    # Accept both a list of entries or a single dict
+    if isinstance(projects, dict):
+        projects = [projects]
+
+    # Find the entry whose 'name' matches this folder
+    entry = next(
+        (p for p in projects if p.get("name") == repo_name),
+        None
+    )
+    if not entry:
+        print(
+            f"  ERROR: No entry with name='{repo_name}' found in '{yml_path}'.\n"
+            f"         Available names: "
+            f"{[p.get('name') for p in projects]}",
+            file=sys.stderr
+        )
+        return False
+
+    branch = entry.get("branch")
+    if not branch:
+        print(f"  ERROR: 'branch' missing for project '{repo_name}'.", file=sys.stderr)
+        return False
+
+    cmd = ["git", "pull", repo_name, branch]
+    print(f"  Running    : {' '.join(cmd)}\n")
+
+    result = subprocess.run(cmd, cwd=BASE_DIR)
+    if result.returncode == 0:
+        print("\n  git pull completed successfully.")
+        return True
+    else:
+        print(f"\n  ERROR: git pull exited with code {result.returncode}.",
+              file=sys.stderr)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1299,12 @@ Migration order when 'all' is selected:
   1. templates  2. hosts  3. maps  4. dashboards
 
 Examples:
+  # Pull latest code from Bitbucket (standalone)
+  python zabbix_migration_70.py --pull-repository
+
+  # Pull then immediately run a full migration
+  python zabbix_migration_70.py --pull-repository --env ppr --cia biz01 --migrate all
+
   # Migrate everything for one CIA
   python zabbix_migration_70.py --env ppr --cia biz01 --migrate all
 
@@ -1242,18 +1325,28 @@ Config files (same directory as this script):
   zabbix_credential.yml          username / password
   zabbix_instances_ppr.yml       CIA source/destination URLs for PPR
   zabbix_instances_prd.yml       CIA source/destination URLs for PRD
+  ../projects_branch.yml         repo name + branch for --pull-repository
         """
     )
     parser.add_argument(
-        "--env", required=True, choices=["ppr", "prd"],
-        help="Target environment (ppr or prd)"
+        "--pull-repository", action="store_true",
+        help=(
+            "Pull latest code from Bitbucket before running. "
+            "Reads repo name (current folder) and branch from ../projects_branch.yml. "
+            "Can be used standalone (no migration args required) or combined with "
+            "--env / --cia / --migrate to pull-then-migrate in one command."
+        )
     )
     parser.add_argument(
-        "--cia", required=True,
-        help="CIA name (e.g. biz01) or 'all' to process every CIA"
+        "--env", default=None, choices=["ppr", "prd"],
+        help="Target environment (ppr or prd) — required when --migrate is used"
     )
     parser.add_argument(
-        "--migrate", required=True, nargs="+",
+        "--cia", default=None,
+        help="CIA name (e.g. biz01) or 'all' — required when --migrate is used"
+    )
+    parser.add_argument(
+        "--migrate", default=None, nargs="+",
         choices=["templates", "hosts", "maps", "dashboards", "all"],
         metavar="TYPE",
         help="Object type(s) to migrate: templates hosts maps dashboards all"
@@ -1278,6 +1371,40 @@ Config files (same directory as this script):
         format="%(levelname)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)]
     )
+
+    # ── --pull-repository ────────────────────────────────────────────────────
+    if args.pull_repository:
+        print("\n" + "=" * 70)
+        print("  Git Pull")
+        print("=" * 70)
+        ok = pull_repository()
+        print("=" * 70)
+        if not ok:
+            sys.exit(1)
+        # If no migration was requested, stop here
+        if not args.migrate:
+            sys.exit(0)
+
+    # ── Validate migration args (only needed when --migrate is used) ─────────
+    if args.migrate:
+        missing = []
+        if not args.env:
+            missing.append("--env")
+        if not args.cia:
+            missing.append("--cia")
+        if missing:
+            print(
+                f"ERROR: {' and '.join(missing)} "
+                f"{'is' if len(missing) == 1 else 'are'} required when --migrate is used.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+    else:
+        # Neither --pull-repository nor --migrate was given
+        if not args.pull_repository:
+            parser.print_help()
+            sys.exit(1)
+        sys.exit(0)
 
     # Determine which migration types to run (in canonical order)
     types_to_run = parse_migrate_types(args.migrate)
