@@ -490,6 +490,22 @@ class ZabbixMigrator:
             return
 
         needed_list = [t for t in all_templates if t["templateid"] in needed_ids]
+
+        # ── skip_existing: remove templates already in destination ───────────
+        if self.skip_existing and needed_list:
+            try:
+                dest_tpls     = self.dest.template.get(output=["name"])
+                dest_tpl_names = {t["name"] for t in dest_tpls}
+                already        = [t for t in needed_list if t["name"] in dest_tpl_names]
+                needed_list    = [t for t in needed_list if t["name"] not in dest_tpl_names]
+                needed_ids     = {t["templateid"] for t in needed_list}
+                if already:
+                    self.results["templates"]["skipped"] += len(already)
+                    print(f"  [Templates] Skipping {len(already)} template(s) "
+                          f"already in destination (--skip-existing).")
+            except Exception as exc:
+                print(f"  [Templates] Warning: could not check existing templates: {exc}")
+
         print(f"  [Templates] Will import {len(needed_list)} template(s) "
               f"(single batch to preserve nested dependencies).")
 
@@ -574,7 +590,22 @@ class ZabbixMigrator:
 
         self._ensure_host_groups_for_hosts()
 
-        # ── Export all enabled hosts ─────────────────────────────────────────
+        # ── skip_existing: remove hosts already in destination ───────────────
+        if self.skip_existing:
+            try:
+                dest_host_names = {h["name"] for h in self.dest.host.get(output=["name"])}
+                already  = [h for h in enabled if h["name"] in dest_host_names]
+                enabled  = [h for h in enabled if h["name"] not in dest_host_names]
+                if already:
+                    self.results["hosts"]["skipped"] += len(already)
+                    print(f"  [Hosts] Skipping {len(already)} host(s) "
+                          f"already in destination (--skip-existing).")
+            except Exception as exc:
+                print(f"  [Hosts] Warning: could not check existing hosts: {exc}")
+
+        if not enabled:
+            print("  [Hosts] No new hosts to import after skip-existing filter.")
+            return
         hids = [h["hostid"] for h in enabled]
         try:
             all_exported = self._raw_export("hosts", hids)
@@ -679,6 +710,23 @@ class ZabbixMigrator:
 
         # Maps can reference host groups — ensure they exist
         self._ensure_host_groups_for_maps()
+
+        # ── skip_existing: remove maps already in destination ────────────────
+        if self.skip_existing:
+            try:
+                dest_map_names = {m["name"] for m in self.dest.map.get(output=["name"])}
+                already = [m for m in maps if m["name"] in dest_map_names]
+                maps    = [m for m in maps if m["name"] not in dest_map_names]
+                if already:
+                    self.results["maps"]["skipped"] += len(already)
+                    print(f"  [Maps] Skipping {len(already)} map(s) "
+                          f"already in destination (--skip-existing).")
+            except Exception as exc:
+                print(f"  [Maps] Warning: could not check existing maps: {exc}")
+
+        if not maps:
+            print("  [Maps] No new maps to import after skip-existing filter.")
+            return
 
         mids = [m["sysmapid"] for m in maps]
         try:
@@ -1439,19 +1487,18 @@ class ZabbixMigrator:
         """
         import requests as _requests
 
-        # Recursively convert any APIObject / dict-subclass to plain types
-        def _plain(obj):
-            if isinstance(obj, dict):
-                return {k: _plain(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_plain(i) for i in obj]
-            return obj
-
-        # Normalise source: APIObject/dict → JSON string; plain str kept as-is
-        if isinstance(source, str):
-            source_str = source
-        else:
-            source_str = json.dumps(_plain(dict(source)))
+        class _SafeEncoder(json.JSONEncoder):
+            """Serialises pyzabbix APIObject (and any other dict-like) safely."""
+            def default(self, obj):
+                try:
+                    return dict(obj)          # APIObject, AttrDict, etc.
+                except Exception:
+                    pass
+                try:
+                    return list(obj)          # any other iterable
+                except Exception:
+                    pass
+                return super().default(obj)   # raises TypeError as usual
 
         token   = getattr(self.dest, "auth", None) or \
                   getattr(self.dest, "_ZabbixAPI__auth", None)
@@ -1461,16 +1508,15 @@ class ZabbixMigrator:
             "jsonrpc": "2.0",
             "method":  "configuration.import",
             "id":      1,
-            "auth":    token,
+            "auth":    str(token) if token else None,
             "params":  {
                 "format": fmt,
-                "source": source_str,
-                "rules":  rules,        # keys sent verbatim — no pyzabbix transformation
+                "source": source if isinstance(source, str) else json.dumps(source, cls=_SafeEncoder),
+                "rules":  rules,
             }
         }
 
-        # Serialise manually so nested APIObjects never reach json.dumps
-        raw_body = json.dumps(_plain(payload))
+        raw_body = json.dumps(payload, cls=_SafeEncoder)
         resp = _requests.post(
             api_url,
             data=raw_body,
@@ -1620,7 +1666,7 @@ Config files (same directory as this script):
     )
     parser.add_argument(
         "--skip-existing", action="store_true",
-        help="(dashboards only) Skip dashboards that already exist in destination"
+        help="Skip objects that already exist in destination (applies to all types)"
     )
     parser.add_argument(
         "--debug", action="store_true",
