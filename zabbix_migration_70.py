@@ -538,8 +538,13 @@ class ZabbixMigrator:
     def migrate_hosts(self):
         """
         Export and import only ENABLED hosts from source.
-        Disabled hosts are skipped and listed in the final report.
-        After import, verifies which hosts are actually present in destination.
+
+        Strategy:
+          1. Try batch import of all enabled hosts at once (fast path).
+          2. If batch fails, fall back to importing each host individually
+             so a single bad host does not block the rest.
+          3. Disabled hosts are skipped silently — detail goes to log only.
+          4. After import, verify counts in destination.
         """
         print("  [Hosts] Fetching host list from source...")
         try:
@@ -554,7 +559,6 @@ class ZabbixMigrator:
             print("  [Hosts] No hosts found.")
             return
 
-        # Separate enabled (status=0) from disabled (status=1)
         enabled  = [h for h in all_hosts if str(h.get("status", "0")) == "0"]
         disabled = [h for h in all_hosts if str(h.get("status", "0")) != "0"]
 
@@ -564,20 +568,18 @@ class ZabbixMigrator:
         if disabled:
             self.disabled_hosts = [h["name"] for h in disabled]
             self.results["hosts"]["skipped"] += len(disabled)
-            print(f"  [Hosts] Skipping {len(disabled)} disabled host(s) "
-                  f"(listed in final report).")
+            # No console detail — disabled list goes to log file only
 
         if not enabled:
             print("  [Hosts] No enabled hosts to import.")
             return
 
-        # Ensure host groups exist before import
         self._ensure_host_groups_for_hosts()
 
-        # Export only enabled hosts
+        # ── Export all enabled hosts ─────────────────────────────────────────
         hids = [h["hostid"] for h in enabled]
         try:
-            exported = self.source.configuration.export(
+            all_exported = self.source.configuration.export(
                 format="json",
                 options={"hosts": hids}
             )
@@ -585,24 +587,48 @@ class ZabbixMigrator:
             self._fail("hosts", "configuration.export failed", exc)
             return
 
-        # Import into destination
+        # ── Attempt 1: batch import ──────────────────────────────────────────
+        print(f"  [Hosts] Importing {len(enabled)} hosts (batch)...")
+        batch_ok = False
         try:
-            self._raw_import(
-                fmt="json",
-                source=exported,
-                rules=HOST_IMPORT_RULES
-            )
-        except Exception as exc:
-            self._fail("hosts", "configuration.import failed", exc)
-            return
+            self._raw_import(fmt="json", source=all_exported, rules=HOST_IMPORT_RULES)
+            batch_ok = True
+            print(f"  [Hosts] Batch import succeeded.")
+        except Exception as batch_exc:
+            print(f"  [Hosts] Batch import failed: {batch_exc}")
+            print(f"  [Hosts] Falling back to per-host import...")
 
-        # ── Post-import verification ────────────────────────────────────────
-        print("  [Hosts] Verifying import in destination...")
+        # ── Attempt 2: per-host fallback ─────────────────────────────────────
+        if not batch_ok:
+            ok_count = 0
+            for host in enabled:
+                try:
+                    exported = self.source.configuration.export(
+                        format="json",
+                        options={"hosts": [host["hostid"]]}
+                    )
+                    self._raw_import(fmt="json", source=exported, rules=HOST_IMPORT_RULES)
+                    ok_count += 1
+                except Exception as exc:
+                    reason = str(exc)
+                    self.results["hosts"]["errors"].append({
+                        "name": host["name"],
+                        "reason": reason
+                    })
+                    self.results["hosts"]["failed"] += 1
+                    logger.debug("Host '%s' failed: %s", host["name"], reason)
+
+            print(f"  [Hosts] Per-host import done: "
+                  f"{ok_count} OK, {self.results['hosts']['failed']} failed "
+                  f"(see log for details).")
+
+        # ── Post-import verification ─────────────────────────────────────────
+        print("  [Hosts] Verifying destination...")
         try:
             dest_hosts = self.dest.host.get(output=["name"])
             dest_names = {h["name"] for h in dest_hosts}
         except Exception as exc:
-            print(f"  [Hosts] Warning: could not verify destination hosts: {exc}")
+            print(f"  [Hosts] Warning: could not verify destination: {exc}")
             dest_names = None
 
         enabled_names = {h["name"] for h in enabled}
@@ -610,28 +636,22 @@ class ZabbixMigrator:
         if dest_names is not None:
             missing_after = sorted(enabled_names - dest_names)
             confirmed     = len(enabled_names) - len(missing_after)
-
-            print(f"  [Hosts] Destination — enabled hosts present: {len(dest_names)}.")
-            print(f"  [Hosts] Confirmed migrated: {confirmed}  |  "
-                  f"Missing after import: {len(missing_after)}.")
-
             self.results["hosts"]["migrated"] += confirmed
-
+            print(f"  [Hosts] Destination — confirmed: {confirmed}, "
+                  f"missing: {len(missing_after)}.")
             if missing_after:
-                self.results["hosts"]["failed"] += len(missing_after)
-                for name in missing_after:
-                    self.results["hosts"]["errors"].append({
-                        "name": name,
-                        "reason": "host not found in destination after import"
-                    })
-                # Store for summary detail list
                 self.missing_hosts_after_import = missing_after
-            else:
-                print(f"  [Hosts] All {confirmed} enabled hosts successfully imported.")
+                # Add to errors only if not already recorded from per-host loop
+                already = {e["name"] for e in self.results["hosts"]["errors"]}
+                for name in missing_after:
+                    if name not in already:
+                        self.results["hosts"]["errors"].append({
+                            "name": name,
+                            "reason": "not found in destination after import"
+                        })
+                        self.results["hosts"]["failed"] += 1
         else:
-            # Verification unavailable — credit the full count
             self.results["hosts"]["migrated"] += len(enabled)
-            print(f"  [Hosts] Successfully exported {len(enabled)} hosts (verification skipped).")
 
     def _ensure_host_groups_for_hosts(self):
         """Create any missing host groups in destination before host import."""
@@ -1685,14 +1705,6 @@ Config files (same directory as this script):
                 elif mtype == "dashboards":
                     migrator.migrate_dashboards()
 
-            print(f"\n  Summary for CIA '{cia_name}':")
-            migrator.print_summary(types_to_run)
-            mlog.section(cia_name, migrator)
-
-            for t in types_to_run:
-                for k in ("migrated", "skipped", "failed"):
-                    global_results[t][k] += migrator.results[t][k]
-
         except Exception as exc:
             print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
             for t in types_to_run:
@@ -1700,6 +1712,12 @@ Config files (same directory as this script):
 
         finally:
             if migrator:
+                print(f"\n  Summary for CIA '{cia_name}':")
+                migrator.print_summary(types_to_run)
+                mlog.section(cia_name, migrator)
+                for t in types_to_run:
+                    for k in ("migrated", "skipped", "failed"):
+                        global_results[t][k] += migrator.results[t][k]
                 migrator.logout()
 
     # Global summary — console: stats only
@@ -1714,7 +1732,7 @@ Config files (same directory as this script):
               f"Failed: {r['failed']:4}")
     print("=" * 70)
 
-    # Flush full detail to log file
+    # Always flush full detail to log file
     mlog.write(global_results)
 
 
