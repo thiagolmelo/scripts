@@ -1,0 +1,1295 @@
+#!/usr/bin/env python3
+"""
+zabbix_migration_70.py
+Migrates objects from Zabbix 6.4 to Zabbix 7.0.
+
+Supported object types (and their execution order when 'all' is selected):
+  1. templates   - exported/imported via native configuration API
+  2. hosts       - exported/imported via native configuration API
+  3. maps        - exported/imported via native configuration API
+  4. dashboards  - migrated with full widget field resolution + owner logic
+
+For templates and hosts the required template/host groups are automatically
+created in the destination before import.
+
+For dashboards:
+  - The original owner is preserved when the same username exists in destination.
+  - When it does not exist, the fallback owner 'prd-metrologie-instru-api' is
+    used and the dashboard is shared (Edit permission) with every usergroup of
+    the original owner that can be found in the destination.
+
+Official Zabbix 6.4 widget field types:
+  0=Integer  1=String  2=HostGroup  3=Host  4=Item  5=ItemPrototype
+  6=Graph    7=GraphPrototype       8=Map
+
+Config files (same directory as this script):
+  zabbix_credential.yml        - username / password
+  zabbix_instances_{env}.yml   - cia.<n>.url_export / url_import
+
+Usage:
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate templates hosts
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate dashboards
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate dashboards \\
+      --dashboard "CVS UAT Monitoring" --skip-existing
+  python zabbix_migration_70.py --env ppr --cia all   --migrate all --debug
+"""
+
+import os
+import re
+import sys
+import json
+import argparse
+import logging
+from typing import Dict, List, Optional, Tuple
+
+import yaml
+from zabbix_utils import ZabbixAPI
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Migration order when 'all' is requested
+MIGRATION_ORDER = ["templates", "hosts", "maps", "dashboards"]
+
+# Sentinel: widget field references a deleted / inaccessible object
+_INACCESSIBLE = "__INACCESSIBLE__"
+
+# Fallback dashboard owner when original user is not in destination
+FALLBACK_OWNER = "prd-metrologie-instru-api"
+
+# Dashboard sharing permission: 3 = read-write (Edit)
+PERM_READ_WRITE = 3
+
+# Official Zabbix 6.4 widget field type constants
+FIELD_TYPE_INTEGER        = "0"
+FIELD_TYPE_STRING         = "1"
+FIELD_TYPE_HOST_GROUP     = "2"
+FIELD_TYPE_HOST           = "3"
+FIELD_TYPE_ITEM           = "4"
+FIELD_TYPE_ITEM_PROTOTYPE = "5"
+FIELD_TYPE_GRAPH          = "6"
+FIELD_TYPE_GRAPH_PROTO    = "7"
+FIELD_TYPE_MAP            = "8"
+
+# Zabbix 6.4 tag filter fields — flat structure incompatible with 7.0 API
+_TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
+
+# Grid: 6.4 = 24 cols, 7.0 = 36 cols. Only horizontal scaled (x1.5).
+# Vertical grid is identical in both versions (y 0-62, height 2-32).
+GRID_SCALE = 1.5
+
+# Configuration import rules
+TEMPLATE_IMPORT_RULES = {
+    "templateGroups":  {"createMissing": True,  "updateExisting": False},
+    "templates":       {"createMissing": True,  "updateExisting": True},
+    "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "graphs":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "discoveryRules":  {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "valueMaps":       {"createMissing": True,  "updateExisting": False},
+    "httptests":       {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+}
+
+HOST_IMPORT_RULES = {
+    "hostGroups":      {"createMissing": True,  "updateExisting": False},
+    "hosts":           {"createMissing": True,  "updateExisting": True},
+    "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "graphs":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "discoveryRules":  {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "valueMaps":       {"createMissing": True,  "updateExisting": False},
+    "httptests":       {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+}
+
+MAP_IMPORT_RULES = {
+    "maps":   {"createMissing": True, "updateExisting": True},
+    "images": {"createMissing": True, "updateExisting": False},
+}
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config loaders
+# ---------------------------------------------------------------------------
+
+def load_credentials() -> Dict:
+    """Load Zabbix credentials from zabbix_credential.yml."""
+    path = os.path.join(BASE_DIR, "zabbix_credential.yml")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Credentials file not found: {path}")
+    with open(path, "r") as f:
+        creds = yaml.safe_load(f)
+    if not creds or "username" not in creds or "password" not in creds:
+        raise ValueError(f"'{path}' must contain 'username' and 'password' keys.")
+    return creds
+
+
+def load_instances(environment: str) -> Dict:
+    """Load Zabbix instance URLs from zabbix_instances_{env}.yml."""
+    filename = f"zabbix_instances_{environment}.yml"
+    path = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Instances file not found: {path}")
+    with open(path, "r") as f:
+        config = yaml.safe_load(f)
+    if not config or "cia" not in config:
+        raise ValueError(f"'{path}' must contain a 'cia' mapping.")
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Main migrator
+# ---------------------------------------------------------------------------
+
+class ZabbixMigrator:
+    """
+    Migrates Templates, Hosts, Maps, and Dashboards from Zabbix 6.4 to 7.0.
+    One instance per CIA pair (source URL / destination URL).
+    """
+
+    def __init__(self, source_url: str, dest_url: str,
+                 username: str, password: str, cia_name: str,
+                 skip_existing: bool = False,
+                 dashboard_filter: Optional[str] = None):
+        self.cia_name         = cia_name
+        self.skip_existing    = skip_existing
+        self.dashboard_filter = dashboard_filter
+
+        # Per-type result counters
+        self.results: Dict[str, Dict] = {
+            t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": []}
+            for t in MIGRATION_ORDER
+        }
+
+        logger.debug("Connecting to source: %s", source_url)
+        self.source = ZabbixAPI(url=source_url)
+        self.source.login(user=username, password=password)
+        logger.debug("Source login OK.")
+
+        logger.debug("Connecting to destination: %s", dest_url)
+        self.dest = ZabbixAPI(url=dest_url)
+        self.dest.login(user=username, password=password)
+        logger.debug("Destination login OK.")
+
+    def logout(self):
+        """Gracefully logout from both APIs."""
+        for api in (self.source, self.dest):
+            try:
+                api.logout()
+            except Exception:
+                pass
+
+    # =======================================================================
+    # 1. TEMPLATES
+    # =======================================================================
+
+    def migrate_templates(self):
+        """Export all templates from source and import to destination."""
+        print("  [Templates] Fetching template list from source...")
+        try:
+            templates = self.source.template.get(output=["templateid", "name"])
+        except Exception as exc:
+            self._fail("templates", "template.get failed", exc)
+            return
+
+        if not templates:
+            print("  [Templates] No templates found.")
+            return
+
+        print(f"  [Templates] Found {len(templates)} templates.")
+
+        # Ensure every template group exists before import
+        self._ensure_template_groups_for_templates()
+
+        # Export all templates at once
+        tids = [t["templateid"] for t in templates]
+        try:
+            exported = self.source.configuration.export(
+                format="json",
+                options={"templates": tids}
+            )
+        except Exception as exc:
+            self._fail("templates", "configuration.export failed", exc)
+            return
+
+        # Import into destination
+        try:
+            self.dest.configuration.import_(
+                format="json",
+                source=exported,
+                rules=TEMPLATE_IMPORT_RULES
+            )
+            count = len(templates)
+            self.results["templates"]["migrated"] += count
+            print(f"  [Templates] Successfully imported {count} templates.")
+        except Exception as exc:
+            self._fail("templates", "configuration.import failed", exc)
+
+    def _ensure_template_groups_for_templates(self):
+        """Create any missing template groups in destination before template import."""
+        try:
+            src_groups = self.source.templategroup.get(output=["name"])
+            self._ensure_groups_in_dest(
+                src_groups, "name",
+                lambda name: self.dest.templategroup.get(filter={"name": name}, output=["groupid"]),
+                lambda name: self.dest.templategroup.create(name=name),
+                label="template group"
+            )
+        except Exception as exc:
+            print(f"  [Templates] Warning: could not pre-create template groups: {exc}")
+
+    # =======================================================================
+    # 2. HOSTS
+    # =======================================================================
+
+    def migrate_hosts(self):
+        """Export all hosts from source and import to destination."""
+        print("  [Hosts] Fetching host list from source...")
+        try:
+            hosts = self.source.host.get(output=["hostid", "name"])
+        except Exception as exc:
+            self._fail("hosts", "host.get failed", exc)
+            return
+
+        if not hosts:
+            print("  [Hosts] No hosts found.")
+            return
+
+        print(f"  [Hosts] Found {len(hosts)} hosts.")
+
+        # Ensure every host group exists before import
+        self._ensure_host_groups_for_hosts()
+
+        # Export all hosts at once
+        hids = [h["hostid"] for h in hosts]
+        try:
+            exported = self.source.configuration.export(
+                format="json",
+                options={"hosts": hids}
+            )
+        except Exception as exc:
+            self._fail("hosts", "configuration.export failed", exc)
+            return
+
+        # Import into destination
+        try:
+            self.dest.configuration.import_(
+                format="json",
+                source=exported,
+                rules=HOST_IMPORT_RULES
+            )
+            count = len(hosts)
+            self.results["hosts"]["migrated"] += count
+            print(f"  [Hosts] Successfully imported {count} hosts.")
+        except Exception as exc:
+            self._fail("hosts", "configuration.import failed", exc)
+
+    def _ensure_host_groups_for_hosts(self):
+        """Create any missing host groups in destination before host import."""
+        try:
+            src_groups = self.source.hostgroup.get(output=["name"])
+            self._ensure_groups_in_dest(
+                src_groups, "name",
+                lambda name: self.dest.hostgroup.get(filter={"name": name}, output=["groupid"]),
+                lambda name: self.dest.hostgroup.create(name=name),
+                label="host group"
+            )
+        except Exception as exc:
+            print(f"  [Hosts] Warning: could not pre-create host groups: {exc}")
+
+    # =======================================================================
+    # 3. MAPS
+    # =======================================================================
+
+    def migrate_maps(self):
+        """Export all network maps from source and import to destination."""
+        print("  [Maps] Fetching map list from source...")
+        try:
+            maps = self.source.map.get(output=["sysmapid", "name"])
+        except Exception as exc:
+            self._fail("maps", "map.get failed", exc)
+            return
+
+        if not maps:
+            print("  [Maps] No maps found.")
+            return
+
+        print(f"  [Maps] Found {len(maps)} maps.")
+
+        # Maps can reference host groups — ensure they exist
+        self._ensure_host_groups_for_maps()
+
+        mids = [m["sysmapid"] for m in maps]
+        try:
+            exported = self.source.configuration.export(
+                format="json",
+                options={"maps": mids}
+            )
+        except Exception as exc:
+            self._fail("maps", "configuration.export failed", exc)
+            return
+
+        try:
+            self.dest.configuration.import_(
+                format="json",
+                source=exported,
+                rules=MAP_IMPORT_RULES
+            )
+            count = len(maps)
+            self.results["maps"]["migrated"] += count
+            print(f"  [Maps] Successfully imported {count} maps.")
+        except Exception as exc:
+            self._fail("maps", "configuration.import failed", exc)
+
+    def _ensure_host_groups_for_maps(self):
+        """Create any missing host groups in destination before map import."""
+        try:
+            src_groups = self.source.hostgroup.get(output=["name"])
+            self._ensure_groups_in_dest(
+                src_groups, "name",
+                lambda name: self.dest.hostgroup.get(filter={"name": name}, output=["groupid"]),
+                lambda name: self.dest.hostgroup.create(name=name),
+                label="host group (for maps)"
+            )
+        except Exception as exc:
+            print(f"  [Maps] Warning: could not pre-create host groups: {exc}")
+
+    # =======================================================================
+    # 4. DASHBOARDS
+    # =======================================================================
+
+    def migrate_dashboards(self):
+        """Migrate all dashboards with full widget field resolution."""
+        print("  [Dashboards] Fetching dashboard list from source...")
+        try:
+            dashboards = self.source.dashboard.get(
+                output="extend",
+                selectPages="extend",
+                selectUsers="extend",
+                selectUserGroups="extend"
+            )
+        except Exception as exc:
+            self._fail("dashboards", "dashboard.get failed", exc)
+            return
+
+        if not dashboards:
+            print("  [Dashboards] No dashboards found.")
+            return
+
+        print(f"  [Dashboards] Found {len(dashboards)} dashboards.")
+
+        # Filter to a specific dashboard if requested
+        if self.dashboard_filter:
+            dashboards = [d for d in dashboards
+                          if d.get("name") == self.dashboard_filter]
+            if not dashboards:
+                print(f"  [Dashboards] Dashboard '{self.dashboard_filter}' not found in source.")
+                return
+            print(f"  [Dashboards] Filtered to: '{self.dashboard_filter}'")
+
+        print()
+        for dashboard in dashboards:
+            name = dashboard.get("name", "Unnamed")
+            print(f"  [Dashboards] Processing: {name}")
+            self._migrate_one_dashboard(dashboard)
+            print()
+
+    def _migrate_one_dashboard(self, dashboard: Dict):
+        name = dashboard.get("name", "Unnamed")
+        try:
+            # Check existence
+            if self._dashboard_exists(name):
+                if self.skip_existing:
+                    print(f"    ~ Skipped (already exists): {name}")
+                    self.results["dashboards"]["skipped"] += 1
+                    return
+                else:
+                    self._delete_dashboard(name)
+
+            print("    - Resolving owner...")
+            owner_userid, extra_groups = self._resolve_dashboard_owner(
+                dashboard.get("userid", "")
+            )
+
+            print("    - Converting widget IDs to names...")
+            converted = self._resolve_names(dashboard)
+
+            print("    - Resolving names to destination IDs...")
+            resolved, missing = self._resolve_ids(converted)
+
+            if missing:
+                print(f"    x Skipped -- {len(missing)} missing objects in destination:")
+                for obj in missing:
+                    print(f"      - {obj}")
+                self.results["dashboards"]["failed"] += 1
+                self.results["dashboards"]["errors"].append({
+                    "name": name,
+                    "reason": "Missing objects in destination",
+                    "details": missing
+                })
+                return
+
+            print("    - Creating dashboard...")
+            self._create_dashboard(resolved, owner_userid, extra_groups)
+            self.results["dashboards"]["migrated"] += 1
+
+        except Exception as exc:
+            print(f"    x Error: {exc}")
+            self.results["dashboards"]["failed"] += 1
+            self.results["dashboards"]["errors"].append({
+                "name": name, "reason": str(exc)
+            })
+
+    # -----------------------------------------------------------------------
+    # Dashboard: owner resolution
+    # -----------------------------------------------------------------------
+
+    def _resolve_dashboard_owner(self, source_userid: str) -> Tuple[str, List[Dict]]:
+        """
+        Determine the owner userid and any extra sharing groups for the destination.
+
+        Steps:
+          1. Look up original owner username in source.
+          2. Try to find the same user in destination → use their ID directly.
+          3. If not found:
+             a. Use fallback owner FALLBACK_OWNER.
+             b. Get the original user's usergroups in source.
+             c. Find which of those groups exist in destination.
+             d. Return those groups for sharing with Edit (read-write) permission.
+        """
+        extra_groups: List[Dict] = []
+
+        # Get original owner's username
+        src_username = None
+        if source_userid:
+            try:
+                data = self.source.user.get(
+                    userids=source_userid,
+                    output=["username"]
+                )
+                src_username = data[0]["username"] if data else None
+            except Exception as exc:
+                logger.debug("Could not get source user %s: %s", source_userid, exc)
+
+        if src_username:
+            # Try to find same user in destination
+            try:
+                dest_data = self.dest.user.get(
+                    filter={"username": src_username},
+                    output=["userid"]
+                )
+                if dest_data:
+                    logger.debug("Owner '%s' found in destination.", src_username)
+                    return dest_data[0]["userid"], []
+            except Exception as exc:
+                logger.debug("Error looking up user '%s' in destination: %s",
+                             src_username, exc)
+
+        # Owner not found in destination — use fallback
+        print(f"    ! Owner '{src_username or source_userid}' not found in destination.")
+        print(f"      Using fallback owner: '{FALLBACK_OWNER}'")
+
+        fallback_id = self._get_fallback_owner_id()
+
+        # Resolve original user's groups and find which exist in destination
+        if src_username and source_userid:
+            extra_groups = self._resolve_owner_groups_for_sharing(
+                source_userid, src_username
+            )
+
+        return fallback_id, extra_groups
+
+    def _get_fallback_owner_id(self) -> str:
+        """Return the userid of FALLBACK_OWNER in destination, raise if not found."""
+        try:
+            data = self.dest.user.get(
+                filter={"username": FALLBACK_OWNER},
+                output=["userid"]
+            )
+            if data:
+                return data[0]["userid"]
+        except Exception as exc:
+            logger.debug("Error looking up fallback user: %s", exc)
+        raise RuntimeError(
+            f"Fallback owner '{FALLBACK_OWNER}' not found in destination. "
+            "Please create this user before running the migration."
+        )
+
+    def _resolve_owner_groups_for_sharing(
+            self, source_userid: str, src_username: str) -> List[Dict]:
+        """
+        Get the source user's usergroups and return those that also exist in
+        the destination, formatted as dashboard sharing entries with Edit permission.
+        """
+        sharing: List[Dict] = []
+        try:
+            # Get groups of original user in source
+            src_groups = self.source.usergroup.get(
+                userids=source_userid,
+                output=["usrgrpid", "name"]
+            )
+        except Exception as exc:
+            logger.debug("Could not get usergroups for '%s': %s", src_username, exc)
+            return sharing
+
+        print(f"      Original user '{src_username}' belongs to "
+              f"{len(src_groups)} group(s) in source:")
+
+        for grp in src_groups:
+            gname = grp["name"]
+            try:
+                dest_grp = self.dest.usergroup.get(
+                    filter={"name": gname},
+                    output=["usrgrpid"]
+                )
+                if dest_grp:
+                    sharing.append({
+                        "usrgrpid":  dest_grp[0]["usrgrpid"],
+                        "permission": PERM_READ_WRITE
+                    })
+                    print(f"        + Group '{gname}' exists in destination → "
+                          "will share with Edit permission")
+                else:
+                    print(f"        - Group '{gname}' NOT found in destination → skipped")
+            except Exception as exc:
+                logger.debug("Error resolving group '%s': %s", gname, exc)
+
+        return sharing
+
+    # -----------------------------------------------------------------------
+    # Dashboard: name/ID resolution (phase 1 — source side)
+    # -----------------------------------------------------------------------
+
+    def _resolve_names(self, dashboard: Dict) -> Dict:
+        """Convert every object ID in a dashboard to a portable name."""
+        converted = dashboard.copy()
+
+        # Shared users
+        if dashboard.get("users"):
+            converted["users"] = []
+            for user in dashboard["users"]:
+                try:
+                    data = self.source.user.get(
+                        userids=user["userid"], output=["username"])
+                    if data:
+                        converted["users"].append({
+                            "username":   data[0]["username"],
+                            "permission": user["permission"]
+                        })
+                except Exception:
+                    pass
+
+        # Shared user groups
+        if dashboard.get("userGroups"):
+            converted["userGroups"] = []
+            for group in dashboard["userGroups"]:
+                try:
+                    data = self.source.usergroup.get(
+                        usrgrpids=group["usrgrpid"], output=["name"])
+                    if data:
+                        converted["userGroups"].append({
+                            "name":       data[0]["name"],
+                            "permission": group["permission"]
+                        })
+                except Exception:
+                    pass
+
+        # Pages and widgets
+        if dashboard.get("pages"):
+            converted["pages"] = []
+            for page in dashboard["pages"]:
+                cp = page.copy()
+                if page.get("widgets"):
+                    cp["widgets"] = [
+                        self._widget_ids_to_names(w) for w in page["widgets"]
+                    ]
+                converted["pages"].append(cp)
+
+        return converted
+
+    def _widget_ids_to_names(self, widget: Dict) -> Dict:
+        """Resolve every object-reference field ID to a portable name."""
+        converted = widget.copy()
+        wtype = widget.get("type", "?")
+
+        if not widget.get("fields"):
+            return converted
+
+        converted["fields"] = []
+        for field in widget["fields"]:
+            cf    = field.copy()
+            ftype = str(field.get("type", ""))
+            fname = field.get("name", "")
+            fval  = field.get("value")
+
+            try:
+                if ftype == FIELD_TYPE_HOST_GROUP:
+                    data = self.source.hostgroup.get(groupids=fval, output=["name"])
+                    cf["value_name"] = data[0]["name"] if data else _INACCESSIBLE
+
+                elif ftype == FIELD_TYPE_HOST:
+                    data = self.source.host.get(hostids=fval, output=["host"])
+                    cf["value_name"] = data[0]["host"] if data else _INACCESSIBLE
+
+                elif ftype == FIELD_TYPE_ITEM:
+                    data = self.source.item.get(
+                        itemids=fval, output=["key_"], selectHosts=["host"])
+                    if data:
+                        cf["value_name"] = data[0]["key_"]
+                        cf["host_name"]  = data[0]["hosts"][0]["host"]
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+
+                elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:
+                    data = self.source.itemprototype.get(
+                        itemids=fval, output=["key_"], selectHosts=["host"])
+                    if data:
+                        cf["value_name"] = data[0]["key_"]
+                        cf["host_name"]  = data[0]["hosts"][0]["host"]
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+
+                elif ftype == FIELD_TYPE_GRAPH:
+                    data = self.source.graph.get(
+                        graphids=fval, output=["name"], selectHosts=["host"])
+                    if data:
+                        cf["value_name"] = data[0]["name"]
+                        if data[0].get("hosts"):
+                            cf["host_name"] = data[0]["hosts"][0]["host"]
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+
+                elif ftype == FIELD_TYPE_GRAPH_PROTO:
+                    data = self.source.graphprototype.get(
+                        graphids=fval, output=["name"], selectHosts=["host"])
+                    if data:
+                        cf["value_name"] = data[0]["name"]
+                        if data[0].get("hosts"):
+                            cf["host_name"] = data[0]["hosts"][0]["host"]
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+
+                elif ftype == FIELD_TYPE_MAP:
+                    data = self.source.map.get(sysmapids=fval, output=["name"])
+                    cf["value_name"] = data[0]["name"] if data else _INACCESSIBLE
+
+                else:
+                    logger.debug("[%s] field '%s' type=%s -> pass-through",
+                                 wtype, fname, ftype)
+
+            except Exception as exc:
+                logger.debug("[%s] field '%s' error: %s -> inaccessible",
+                             wtype, fname, exc)
+                cf["value_name"] = _INACCESSIBLE
+
+            converted["fields"].append(cf)
+
+        return converted
+
+    # -----------------------------------------------------------------------
+    # Dashboard: name/ID resolution (phase 2 — destination side)
+    # -----------------------------------------------------------------------
+
+    def _resolve_ids(self, dashboard: Dict) -> Tuple[Dict, List[str]]:
+        """Convert portable names back to IDs valid in the destination."""
+        converted = dashboard.copy()
+        missing: List[str] = []
+
+        # Shared users
+        if dashboard.get("users"):
+            converted["users"] = []
+            for user in dashboard["users"]:
+                data = self.dest.user.get(
+                    filter={"username": user["username"]}, output=["userid"])
+                if data:
+                    converted["users"].append({
+                        "userid":     data[0]["userid"],
+                        "permission": user["permission"]
+                    })
+                else:
+                    missing.append(f"Shared user: '{user['username']}'")
+
+        # Shared user groups
+        if dashboard.get("userGroups"):
+            converted["userGroups"] = []
+            for group in dashboard["userGroups"]:
+                data = self.dest.usergroup.get(
+                    filter={"name": group["name"]}, output=["usrgrpid"])
+                if data:
+                    converted["userGroups"].append({
+                        "usrgrpid":   data[0]["usrgrpid"],
+                        "permission": group["permission"]
+                    })
+                else:
+                    missing.append(f"Shared user group: '{group['name']}'")
+
+        # Pages and widgets
+        if dashboard.get("pages"):
+            converted["pages"] = []
+            for page in dashboard["pages"]:
+                cp = page.copy()
+                if page.get("widgets"):
+                    cp["widgets"] = []
+                    for widget in page["widgets"]:
+                        w, w_miss = self._widget_names_to_ids(widget)
+                        cp["widgets"].append(w)
+                        missing.extend(w_miss)
+                converted["pages"].append(cp)
+
+        return converted, missing
+
+    def _widget_names_to_ids(self, widget: Dict) -> Tuple[Dict, List[str]]:
+        """Resolve portable names to destination IDs. Drop _INACCESSIBLE fields."""
+        converted = widget.copy()
+        missing: List[str] = []
+        wname = widget.get("name", "?")
+        wtype = widget.get("type", "?")
+
+        if not widget.get("fields"):
+            return converted, missing
+
+        converted["fields"] = []
+        for field in widget["fields"]:
+            cf    = field.copy()
+            ftype = str(field.get("type", ""))
+            fname = field.get("name", "")
+
+            # Pass-through fields (no value_name means integer/string/etc.)
+            if "value_name" not in field:
+                converted["fields"].append(cf)
+                continue
+
+            # Silently drop fields that were inaccessible in source
+            if field["value_name"] == _INACCESSIBLE:
+                logger.debug("[%s '%s'] field '%s' inaccessible in source, dropped",
+                             wtype, wname, fname)
+                continue
+
+            vname = field["value_name"]
+            ctx   = f"widget '{wname}' (type:{wtype}) field '{fname}'"
+
+            try:
+                if ftype == FIELD_TYPE_HOST_GROUP:
+                    data = self.dest.hostgroup.get(
+                        filter={"name": vname}, output=["groupid"])
+                    if data:
+                        cf["value"] = data[0]["groupid"]
+                    else:
+                        annotation = self._annotate_missing_group(vname)
+                        missing.append(f"Host group '{vname}' [{ctx}]{annotation}")
+
+                elif ftype == FIELD_TYPE_HOST:
+                    data = self.dest.host.get(
+                        filter={"host": vname}, output=["hostid"])
+                    if data:
+                        cf["value"] = data[0]["hostid"]
+                    else:
+                        annotation = self._annotate_missing_host(vname)
+                        missing.append(f"Host '{vname}' [{ctx}]{annotation}")
+
+                elif ftype == FIELD_TYPE_ITEM:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            items = self.dest.item.get(
+                                filter={"key_": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["itemid"])
+                            if items:
+                                cf["value"] = items[0]["itemid"]
+                            else:
+                                missing.append(
+                                    f"Item '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for item '{vname}') [{ctx}]")
+                    else:
+                        missing.append(f"Item '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            protos = self.dest.itemprototype.get(
+                                filter={"key_": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["itemid"])
+                            if protos:
+                                cf["value"] = protos[0]["itemid"]
+                            else:
+                                missing.append(
+                                    f"Item prototype '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for item_proto '{vname}') [{ctx}]")
+                    else:
+                        missing.append(f"Item prototype '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_GRAPH:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            graphs = self.dest.graph.get(
+                                filter={"name": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["graphid"])
+                            if graphs:
+                                cf["value"] = graphs[0]["graphid"]
+                            else:
+                                missing.append(
+                                    f"Graph '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for graph '{vname}') [{ctx}]")
+                    else:
+                        graphs = self.dest.graph.get(
+                            filter={"name": vname}, output=["graphid"])
+                        if graphs:
+                            cf["value"] = graphs[0]["graphid"]
+                        else:
+                            missing.append(f"Graph '{vname}' [{ctx}]")
+
+                elif ftype == FIELD_TYPE_GRAPH_PROTO:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            protos = self.dest.graphprototype.get(
+                                filter={"name": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["graphid"])
+                            if protos:
+                                cf["value"] = protos[0]["graphid"]
+                            else:
+                                missing.append(
+                                    f"Graph prototype '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for graph_proto '{vname}') [{ctx}]")
+                    else:
+                        missing.append(f"Graph prototype '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_MAP:
+                    data = self.dest.map.get(
+                        filter={"name": vname}, output=["sysmapid"])
+                    if data:
+                        cf["value"] = data[0]["sysmapid"]
+                    else:
+                        missing.append(f"Map '{vname}' [{ctx}]")
+
+            except Exception as exc:
+                missing.append(f"{ctx} -- error: {exc}")
+
+            cf.pop("value_name", None)
+            cf.pop("host_name",  None)
+            converted["fields"].append(cf)
+
+        return converted, missing
+
+    # -----------------------------------------------------------------------
+    # Dashboard: create
+    # -----------------------------------------------------------------------
+
+    def _create_dashboard(self, dashboard: Dict,
+                          owner_userid: str,
+                          extra_groups: List[Dict]):
+        """Build cleaned payload and create dashboard in destination."""
+        name = dashboard["name"]
+
+        clean = {
+            "name":           name,
+            "userid":         owner_userid,
+            "display_period": int(dashboard.get("display_period", 30)),
+            "auto_start":     int(dashboard.get("auto_start", 1)),
+        }
+
+        # Merge existing shared users
+        if dashboard.get("users"):
+            clean["users"] = dashboard["users"]
+
+        # Merge existing shared groups + groups added for fallback owner
+        all_groups = list(dashboard.get("userGroups") or [])
+        for eg in extra_groups:
+            # Avoid duplicates
+            if not any(g.get("usrgrpid") == eg["usrgrpid"] for g in all_groups):
+                all_groups.append(eg)
+        if all_groups:
+            clean["userGroups"] = all_groups
+
+        clean["pages"] = []
+        for page in dashboard.get("pages", []):
+            clean_page = {
+                "name":           page.get("name", ""),
+                "display_period": int(page.get("display_period", 0)),
+                "widgets":        []
+            }
+            for widget in page.get("widgets", []):
+                # --- Grid scaling (horizontal only, per official docs) ---
+                # 6.4: x 0-23, width 1-24   7.0: x 0-35, width 1-36  (x1.5)
+                # Vertical unchanged: y 0-62, height 2-32
+                src_x = int(widget.get("x", 0))
+                src_w = int(widget.get("width", 1))
+
+                x     = round(src_x * GRID_SCALE)
+                width = round((src_x + src_w) * GRID_SCALE) - x
+
+                y      = int(widget.get("y", 0))
+                height = int(widget.get("height", 2))
+
+                if x + width > 36:
+                    width = 36 - x
+                width  = max(1, min(width, 36))
+                height = max(2, min(height, 32))
+
+                cw = {
+                    "type":      widget["type"],
+                    "name":      widget.get("name", ""),
+                    "x":         x,
+                    "y":         y,
+                    "width":     width,
+                    "height":    height,
+                    "view_mode": int(widget.get("view_mode", 0)),
+                }
+                if widget.get("fields"):
+                    cw["fields"] = [
+                        f for f in widget["fields"]
+                        if not _TAG_FIELD_RE.match(f.get("name", ""))
+                    ]
+                clean_page["widgets"].append(cw)
+
+            clean["pages"].append(clean_page)
+
+        self.dest.dashboard.create(**clean)
+        print(f"    + Created: {name}")
+
+    # -----------------------------------------------------------------------
+    # Dashboard: helpers
+    # -----------------------------------------------------------------------
+
+    def _dashboard_exists(self, name: str) -> bool:
+        return bool(self.dest.dashboard.get(
+            filter={"name": name}, output=["dashboardid"]))
+
+    def _delete_dashboard(self, name: str):
+        existing = self.dest.dashboard.get(
+            filter={"name": name}, output=["dashboardid"])
+        if existing:
+            self.dest.dashboard.delete(existing[0]["dashboardid"])
+            logger.debug("Deleted existing dashboard '%s'", name)
+
+    def _annotate_missing_group(self, group_name: str) -> str:
+        """Add diagnostic annotation for a host group missing in destination."""
+        try:
+            src_grp = self.source.hostgroup.get(
+                filter={"name": group_name}, output=["groupid"])
+            if not src_grp:
+                return " [group also absent from source — possibly deleted]"
+            gid = src_grp[0]["groupid"]
+            count = int(self.source.host.get(groupids=gid, countOutput=True))
+            if count == 0:
+                return (
+                    " [NOTE: group is EMPTY in source (no hosts)"
+                    " -- verify if it should exist in destination]"
+                )
+            else:
+                return (
+                    f" [!! UNEXPECTED: group has {count} host(s) in source"
+                    " but is MISSING in destination -- please investigate !!]"
+                )
+        except Exception:
+            return " [could not determine source status]"
+
+    def _annotate_missing_host(self, host_name: str) -> str:
+        """Add diagnostic annotation for a host missing in destination."""
+        try:
+            data = self.source.host.get(
+                filter={"host": host_name}, output=["status"])
+            if not data:
+                return " [host also absent from source — possibly deleted]"
+            if str(data[0]["status"]) == "1":
+                return (
+                    " [NOTE: host is DISABLED in source"
+                    " -- verify if it should be migrated to destination]"
+                )
+            else:
+                return (
+                    " [!! UNEXPECTED: host is ACTIVE in source"
+                    " but is MISSING in destination -- please investigate !!]"
+                )
+        except Exception:
+            return " [could not determine source status]"
+
+    # =======================================================================
+    # Generic helpers
+    # =======================================================================
+
+    def _ensure_groups_in_dest(
+            self, src_groups: List[Dict], name_key: str,
+            getter, creator, label: str):
+        """
+        For every group in src_groups, create it in destination if absent.
+        getter(name) -> list   creator(name) -> result
+        """
+        created = skipped = 0
+        for grp in src_groups:
+            name = grp[name_key]
+            try:
+                if not getter(name):
+                    creator(name)
+                    logger.debug("Created %s '%s' in destination.", label, name)
+                    created += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                logger.debug("Could not ensure %s '%s': %s", label, name, exc)
+        if created:
+            print(f"    Created {created} missing {label}(s) in destination "
+                  f"({skipped} already existed).")
+
+    def _fail(self, migration_type: str, msg: str, exc: Exception):
+        """Record a top-level failure for a migration type."""
+        full = f"{msg}: {exc}"
+        print(f"  [{migration_type.capitalize()}] ERROR: {full}")
+        self.results[migration_type]["failed"] += 1
+        self.results[migration_type]["errors"].append({"reason": full})
+
+    # =======================================================================
+    # Summary
+    # =======================================================================
+
+    def print_summary(self, types_run: List[str]):
+        for t in types_run:
+            r = self.results[t]
+            print(f"  [{t.capitalize():12}] "
+                  f"Migrated: {r['migrated']:4}  "
+                  f"Skipped: {r['skipped']:4}  "
+                  f"Failed: {r['failed']:4}")
+            for err in r["errors"]:
+                name = err.get("name", "")
+                reason = err.get("reason", "")
+                prefix = f"'{name}' -- " if name else ""
+                print(f"      - {prefix}{reason}")
+                for d in err.get("details", []):
+                    print(f"          . {d}")
+
+
+# ---------------------------------------------------------------------------
+# Custom exception
+# ---------------------------------------------------------------------------
+
+class MissingObjectsError(Exception):
+    def __init__(self, missing_objects: List[str]):
+        self.missing_objects = missing_objects
+        super().__init__(f"Missing {len(missing_objects)} objects")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_migrate_types(raw: List[str]) -> List[str]:
+    """Expand 'all' and deduplicate while preserving MIGRATION_ORDER."""
+    expanded = set()
+    for item in raw:
+        if item == "all":
+            expanded.update(MIGRATION_ORDER)
+        else:
+            expanded.add(item)
+    return [t for t in MIGRATION_ORDER if t in expanded]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Migrate Zabbix objects from 6.4 to 7.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Migration order when 'all' is selected:
+  1. templates  2. hosts  3. maps  4. dashboards
+
+Examples:
+  # Migrate everything for one CIA
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all
+
+  # Migrate only templates and hosts
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate templates hosts
+
+  # Migrate dashboards for all CIAs, skip existing ones
+  python zabbix_migration_70.py --env prd --cia all --migrate dashboards --skip-existing
+
+  # Migrate a specific dashboard by name
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate dashboards \\
+      --dashboard "CVS UAT Monitoring"
+
+  # Full migration with debug output
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --debug
+
+Config files (same directory as this script):
+  zabbix_credential.yml          username / password
+  zabbix_instances_ppr.yml       CIA source/destination URLs for PPR
+  zabbix_instances_prd.yml       CIA source/destination URLs for PRD
+        """
+    )
+    parser.add_argument(
+        "--env", required=True, choices=["ppr", "prd"],
+        help="Target environment (ppr or prd)"
+    )
+    parser.add_argument(
+        "--cia", required=True,
+        help="CIA name (e.g. biz01) or 'all' to process every CIA"
+    )
+    parser.add_argument(
+        "--migrate", required=True, nargs="+",
+        choices=["templates", "hosts", "maps", "dashboards", "all"],
+        metavar="TYPE",
+        help="Object type(s) to migrate: templates hosts maps dashboards all"
+    )
+    parser.add_argument(
+        "--dashboard", default=None, metavar="NAME",
+        help="(dashboards only) Migrate a single dashboard by exact name"
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="(dashboards only) Skip dashboards that already exist in destination"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable verbose debug logging"
+    )
+    args = parser.parse_args()
+
+    # Logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(levelname)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    # Determine which migration types to run (in canonical order)
+    types_to_run = parse_migrate_types(args.migrate)
+    if not types_to_run:
+        print("ERROR: no valid migration types specified.", file=sys.stderr)
+        sys.exit(1)
+
+    # Load config
+    try:
+        creds = load_credentials()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        config = load_instances(args.env)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    cia_map: Dict = config["cia"]
+
+    if args.cia == "all":
+        cia_names = list(cia_map.keys())
+    else:
+        if args.cia not in cia_map:
+            print(
+                f"ERROR: CIA '{args.cia}' not found. "
+                f"Available: {', '.join(cia_map.keys())}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        cia_names = [args.cia]
+
+    # Header
+    print("\n" + "=" * 70)
+    print(f"  Zabbix Migration 6.4 -> 7.0")
+    print(f"  env={args.env}  cia={args.cia}  migrate={' '.join(types_to_run)}")
+    if args.dashboard:
+        print(f"  dashboard filter='{args.dashboard}'")
+    if args.skip_existing:
+        print("  mode=skip-existing")
+    print("=" * 70)
+
+    # Global totals
+    global_results: Dict[str, Dict] = {
+        t: {"migrated": 0, "skipped": 0, "failed": 0}
+        for t in MIGRATION_ORDER
+    }
+
+    for cia_name in cia_names:
+        cfg        = cia_map[cia_name]
+        source_url = cfg["url_export"]
+        dest_url   = cfg["url_import"]
+
+        print(f"\n{'─' * 70}")
+        print(f"  CIA   : {cia_name}")
+        print(f"  Source: {source_url}")
+        print(f"  Dest  : {dest_url}")
+        print(f"{'─' * 70}")
+
+        migrator = None
+        try:
+            migrator = ZabbixMigrator(
+                source_url=source_url,
+                dest_url=dest_url,
+                username=creds["username"],
+                password=creds["password"],
+                cia_name=cia_name,
+                skip_existing=args.skip_existing,
+                dashboard_filter=args.dashboard,
+            )
+
+            for mtype in types_to_run:
+                print(f"\n  -- {mtype.upper()} --")
+                if mtype == "templates":
+                    migrator.migrate_templates()
+                elif mtype == "hosts":
+                    migrator.migrate_hosts()
+                elif mtype == "maps":
+                    migrator.migrate_maps()
+                elif mtype == "dashboards":
+                    migrator.migrate_dashboards()
+
+            print(f"\n  Summary for CIA '{cia_name}':")
+            migrator.print_summary(types_to_run)
+
+            for t in types_to_run:
+                for k in ("migrated", "skipped", "failed"):
+                    global_results[t][k] += migrator.results[t][k]
+
+        except Exception as exc:
+            print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
+            for t in types_to_run:
+                global_results[t]["failed"] += 1
+
+        finally:
+            if migrator:
+                migrator.logout()
+
+    # Global summary
+    print("\n" + "=" * 70)
+    print("  Global Summary")
+    print("=" * 70)
+    for t in types_to_run:
+        r = global_results[t]
+        print(f"  [{t.capitalize():12}] "
+              f"Migrated: {r['migrated']:4}  "
+              f"Skipped: {r['skipped']:4}  "
+              f"Failed: {r['failed']:4}")
+    print()
+    print("  Note: Objects inaccessible in source were silently skipped")
+    print("        and are NOT counted as failures.")
+    print("=" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    main()
