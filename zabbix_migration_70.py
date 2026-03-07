@@ -374,6 +374,7 @@ class ZabbixMigrator:
         self.cia_name         = cia_name
         self.skip_existing    = skip_existing
         self.dashboard_filter = dashboard_filter
+        self._source_url      = source_url  # kept for raw API calls
         self._dest_url        = dest_url   # kept for raw API calls (bypass pyzabbix)
 
         # Per-type result counters
@@ -497,10 +498,7 @@ class ZabbixMigrator:
 
         # ── 6. Export all needed templates in ONE call ───────────────────────
         try:
-            exported = self._to_export_str(self.source.configuration.export(
-                format="json",
-                options={"templates": list(needed_ids)}
-            ))
+            exported = self._raw_export("templates", list(needed_ids))
         except Exception as exc:
             self._fail("templates", "configuration.export failed", exc)
             return
@@ -579,10 +577,7 @@ class ZabbixMigrator:
         # ── Export all enabled hosts ─────────────────────────────────────────
         hids = [h["hostid"] for h in enabled]
         try:
-            all_exported = self._to_export_str(self.source.configuration.export(
-                format="json",
-                options={"hosts": hids}
-            ))
+            all_exported = self._raw_export("hosts", hids)
         except Exception as exc:
             self._fail("hosts", "configuration.export failed", exc)
             return
@@ -603,10 +598,7 @@ class ZabbixMigrator:
             ok_count = 0
             for host in enabled:
                 try:
-                    exported = self._to_export_str(self.source.configuration.export(
-                        format="json",
-                        options={"hosts": [host["hostid"]]}
-                    ))
+                    exported = self._raw_export("hosts", [host["hostid"]])
                     self._raw_import(fmt="json", source=exported, rules=HOST_IMPORT_RULES)
                     ok_count += 1
                 except Exception as exc:
@@ -690,10 +682,7 @@ class ZabbixMigrator:
 
         mids = [m["sysmapid"] for m in maps]
         try:
-            exported = self._to_export_str(self.source.configuration.export(
-                format="json",
-                options={"maps": mids}
-            ))
+            exported = self._raw_export("maps", mids)
         except Exception as exc:
             self._fail("maps", "configuration.export failed", exc)
             return
@@ -1399,28 +1388,73 @@ class ZabbixMigrator:
     # Generic helpers
     # =======================================================================
 
-    @staticmethod
-    def _to_export_str(raw) -> str:
+    def _raw_export(self, object_type: str, ids: List[str]) -> str:
         """
-        Normalize the value returned by configuration.export.
-        pyzabbix may return a plain str, a dict, or an APIObject (dict subclass).
-        _raw_import needs a plain JSON string.
-        """
-        if isinstance(raw, str):
-            return raw
-        # dict or APIObject — serialize to JSON string
-        return json.dumps(dict(raw))
+        Call configuration.export via raw HTTP POST on the SOURCE instance,
+        bypassing pyzabbix so the result is always a plain JSON string.
 
-    def _raw_import(self, fmt: str, source: str, rules: Dict):
+        object_type: 'templates', 'hosts', or 'maps'
+        ids:         list of id strings to export
+        """
+        import requests as _requests
+
+        token   = getattr(self.source, "auth", None) or \
+                  getattr(self.source, "_ZabbixAPI__auth", None)
+        api_url = self._source_url.rstrip("/") + "/api_jsonrpc.php"
+
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "method":  "configuration.export",
+            "id":      1,
+            "auth":    token,
+            "params":  {
+                "format":  "json",
+                "options": {object_type: ids}
+            }
+        })
+
+        resp = _requests.post(
+            api_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(data["error"].get("data") or data["error"].get("message", str(data["error"])))
+        result = data.get("result", "")
+        # result is already a JSON string when format="json"
+        if isinstance(result, str):
+            return result
+        return json.dumps(result)
+
+    def _raw_import(self, fmt: str, source, rules: Dict):
         """
         Call configuration.import directly via raw HTTP POST, bypassing
         pyzabbix's automatic camelCase↔snake_case key transformation which
         corrupts the rules parameter names and causes API errors.
+
+        'source' may be a str, dict, or pyzabbix APIObject — all are handled.
         """
         import requests as _requests
 
-        # zabbix_utils stores the session token in .auth after login
-        token   = getattr(self.dest, "auth", None) or getattr(self.dest, "_ZabbixAPI__auth", None)
+        # Recursively convert any APIObject / dict-subclass to plain types
+        def _plain(obj):
+            if isinstance(obj, dict):
+                return {k: _plain(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_plain(i) for i in obj]
+            return obj
+
+        # Normalise source: APIObject/dict → JSON string; plain str kept as-is
+        if isinstance(source, str):
+            source_str = source
+        else:
+            source_str = json.dumps(_plain(dict(source)))
+
+        token   = getattr(self.dest, "auth", None) or \
+                  getattr(self.dest, "_ZabbixAPI__auth", None)
         api_url = self._dest_url.rstrip("/") + "/api_jsonrpc.php"
 
         payload = {
@@ -1430,12 +1464,19 @@ class ZabbixMigrator:
             "auth":    token,
             "params":  {
                 "format": fmt,
-                "source": source,
+                "source": source_str,
                 "rules":  rules,        # keys sent verbatim — no pyzabbix transformation
             }
         }
 
-        resp = _requests.post(api_url, json=payload, timeout=120)
+        # Serialise manually so nested APIObjects never reach json.dumps
+        raw_body = json.dumps(_plain(payload))
+        resp = _requests.post(
+            api_url,
+            data=raw_body,
+            headers={"Content-Type": "application/json"},
+            timeout=120
+        )
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
