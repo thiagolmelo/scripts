@@ -97,7 +97,8 @@ TEMPLATE_IMPORT_RULES = {
 }
 
 HOST_IMPORT_RULES = {
-    "groups":          {"createMissing": True,  "updateExisting": False},   # Zabbix 7.0: "groups" not "hostGroups"
+    # Note: host groups are pre-created by _ensure_host_groups_for_hosts()
+    # before import, so no "groups" rule is needed here.
     "hosts":           {"createMissing": True,  "updateExisting": True},
     "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
