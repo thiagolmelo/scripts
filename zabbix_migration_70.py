@@ -164,7 +164,19 @@ def pull_repository() -> bool:
     import subprocess
 
     repo_name  = os.path.basename(BASE_DIR)
-    yml_path   = os.path.normpath(os.path.join(BASE_DIR, "..", "projects_branch.yml"))
+
+    # Walk upward from the script's directory until projects_branch.yml is found.
+    # The script lives inside <repo>/<subdir>/, so the file may be 2+ levels up.
+    _search  = BASE_DIR
+    yml_path = None
+    for _ in range(5):                        # safety: max 5 levels
+        _search    = os.path.dirname(_search)
+        _candidate = os.path.join(_search, "projects_branch.yml")
+        if os.path.exists(_candidate):
+            yml_path = _candidate
+            break
+    if yml_path is None:                      # fallback path used only in error message
+        yml_path = os.path.normpath(os.path.join(BASE_DIR, "..", "..", "projects_branch.yml"))
 
     print(f"\n  Repository : {repo_name}")
     print(f"  Config file: {yml_path}")
