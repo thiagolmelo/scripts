@@ -165,6 +165,10 @@ class ZabbixMigrator:
             t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": []}
             for t in MIGRATION_ORDER
         }
+        # Hosts disabled in source — tracked separately for final report
+        self.disabled_hosts: List[str] = []
+        # Templates skipped (not linked to any active host, directly or indirectly)
+        self.skipped_templates: List[str] = []
 
         logger.debug("Connecting to source: %s", source_url)
         self.source = ZabbixAPI(url=source_url)
@@ -189,44 +193,110 @@ class ZabbixMigrator:
     # =======================================================================
 
     def migrate_templates(self):
-        """Export all templates from source and import to destination."""
-        print("  [Templates] Fetching template list from source...")
+        """
+        Export and import only templates that are actually in use.
+
+        A template is considered 'in use' if:
+          - It is directly linked to at least one ENABLED host, OR
+          - It is linked (nested) inside another template that is in use
+            (resolved recursively so the full dependency tree is covered).
+
+        All needed templates are exported and imported in a SINGLE batch call
+        to avoid dependency errors caused by one template referencing objects
+        that belong to a not-yet-imported nested template.
+        """
+        print("  [Templates] Analysing template usage on source...")
+
+        # ── 1. Fetch all templates with their nested (linked) templates ──────
         try:
-            templates = self.source.template.get(output=["templateid", "name"])
+            all_templates = self.source.template.get(
+                output=["templateid", "name"],
+                selectParentTemplates=["templateid"]   # nested templates this one inherits
+            )
         except Exception as exc:
             self._fail("templates", "template.get failed", exc)
             return
 
-        if not templates:
+        if not all_templates:
             print("  [Templates] No templates found.")
             return
 
-        print(f"  [Templates] Found {len(templates)} templates.")
+        tpl_by_id  = {t["templateid"]: t for t in all_templates}
+        total      = len(all_templates)
+        print(f"  [Templates] Found {total} templates total.")
 
-        # Ensure every template group exists before import
+        # ── 2. Fetch all ENABLED hosts with their directly linked templates ──
+        try:
+            enabled_hosts = self.source.host.get(
+                filter={"status": "0"},           # 0 = enabled
+                output=["hostid", "name"],
+                selectParentTemplates=["templateid"]
+            )
+        except Exception as exc:
+            self._fail("templates", "host.get (for template linkage) failed", exc)
+            return
+
+        # Seed: templates directly linked to at least one enabled host
+        needed_ids: set = set()
+        for host in enabled_hosts:
+            for tpl in host.get("parentTemplates", []):
+                needed_ids.add(tpl["templateid"])
+
+        # ── 3. Expand: add nested templates recursively ─────────────────────
+        # If template A is needed and it inherits from template B,
+        # B must also be imported (even if no host links B directly).
+        changed = True
+        while changed:
+            changed = False
+            for tid in list(needed_ids):
+                tpl = tpl_by_id.get(tid)
+                if not tpl:
+                    continue
+                for parent in tpl.get("parentTemplates", []):
+                    pid = parent["templateid"]
+                    if pid not in needed_ids:
+                        needed_ids.add(pid)
+                        changed = True
+
+        # ── 4. Report skipped templates ──────────────────────────────────────
+        not_needed = [t for t in all_templates if t["templateid"] not in needed_ids]
+        if not_needed:
+            self.skipped_templates = [t["name"] for t in not_needed]
+            print(f"  [Templates] Skipping {len(not_needed)} template(s) "
+                  f"not linked to any enabled host (directly or indirectly).")
+            logger.debug("Skipped templates: %s", self.skipped_templates)
+
+        if not needed_ids:
+            print("  [Templates] No templates in use — nothing to import.")
+            return
+
+        needed_list = [t for t in all_templates if t["templateid"] in needed_ids]
+        print(f"  [Templates] Will import {len(needed_list)} template(s) "
+              f"(single batch to preserve nested dependencies).")
+
+        # ── 5. Ensure template groups exist before import ────────────────────
         self._ensure_template_groups_for_templates()
 
-        # Export all templates at once
-        tids = [t["templateid"] for t in templates]
+        # ── 6. Export all needed templates in ONE call ───────────────────────
         try:
             exported = self.source.configuration.export(
                 format="json",
-                options={"templates": tids}
+                options={"templates": list(needed_ids)}
             )
         except Exception as exc:
             self._fail("templates", "configuration.export failed", exc)
             return
 
-        # Import into destination
+        # ── 7. Import into destination (single call = no ordering issues) ────
         try:
             self.dest.configuration.import_(
                 format="json",
                 source=exported,
                 rules=TEMPLATE_IMPORT_RULES
             )
-            count = len(templates)
-            self.results["templates"]["migrated"] += count
-            print(f"  [Templates] Successfully imported {count} templates.")
+            self.results["templates"]["migrated"] += len(needed_list)
+            self.results["templates"]["skipped"]  += len(not_needed)
+            print(f"  [Templates] Successfully imported {len(needed_list)} templates.")
         except Exception as exc:
             self._fail("templates", "configuration.import failed", exc)
 
@@ -248,25 +318,45 @@ class ZabbixMigrator:
     # =======================================================================
 
     def migrate_hosts(self):
-        """Export all hosts from source and import to destination."""
+        """
+        Export and import only ENABLED hosts from source.
+        Disabled hosts are skipped and listed in the final report.
+        """
         print("  [Hosts] Fetching host list from source...")
         try:
-            hosts = self.source.host.get(output=["hostid", "name"])
+            all_hosts = self.source.host.get(
+                output=["hostid", "name", "status"]
+            )
         except Exception as exc:
             self._fail("hosts", "host.get failed", exc)
             return
 
-        if not hosts:
+        if not all_hosts:
             print("  [Hosts] No hosts found.")
             return
 
-        print(f"  [Hosts] Found {len(hosts)} hosts.")
+        # Separate enabled (status=0) from disabled (status=1)
+        enabled  = [h for h in all_hosts if str(h.get("status", "0")) == "0"]
+        disabled = [h for h in all_hosts if str(h.get("status", "0")) != "0"]
 
-        # Ensure every host group exists before import
+        print(f"  [Hosts] Found {len(all_hosts)} hosts: "
+              f"{len(enabled)} enabled, {len(disabled)} disabled.")
+
+        if disabled:
+            self.disabled_hosts = [h["name"] for h in disabled]
+            self.results["hosts"]["skipped"] += len(disabled)
+            print(f"  [Hosts] Skipping {len(disabled)} disabled host(s) "
+                  f"(listed in final report).")
+
+        if not enabled:
+            print("  [Hosts] No enabled hosts to import.")
+            return
+
+        # Ensure host groups exist before import
         self._ensure_host_groups_for_hosts()
 
-        # Export all hosts at once
-        hids = [h["hostid"] for h in hosts]
+        # Export only enabled hosts
+        hids = [h["hostid"] for h in enabled]
         try:
             exported = self.source.configuration.export(
                 format="json",
@@ -283,9 +373,8 @@ class ZabbixMigrator:
                 source=exported,
                 rules=HOST_IMPORT_RULES
             )
-            count = len(hosts)
-            self.results["hosts"]["migrated"] += count
-            print(f"  [Hosts] Successfully imported {count} hosts.")
+            self.results["hosts"]["migrated"] += len(enabled)
+            print(f"  [Hosts] Successfully imported {len(enabled)} hosts.")
         except Exception as exc:
             self._fail("hosts", "configuration.import failed", exc)
 
@@ -1077,12 +1166,26 @@ class ZabbixMigrator:
                   f"Skipped: {r['skipped']:4}  "
                   f"Failed: {r['failed']:4}")
             for err in r["errors"]:
-                name = err.get("name", "")
+                name   = err.get("name", "")
                 reason = err.get("reason", "")
                 prefix = f"'{name}' -- " if name else ""
                 print(f"      - {prefix}{reason}")
                 for d in err.get("details", []):
                     print(f"          . {d}")
+
+        # Disabled hosts detail list
+        if "hosts" in types_run and self.disabled_hosts:
+            print(f"\n  Disabled hosts in source (NOT imported) "
+                  f"[{len(self.disabled_hosts)}]:")
+            for name in sorted(self.disabled_hosts):
+                print(f"    - {name}  [DISABLED in source]")
+
+        # Skipped templates detail list
+        if "templates" in types_run and self.skipped_templates:
+            print(f"\n  Templates not linked to any enabled host (NOT imported) "
+                  f"[{len(self.skipped_templates)}]:")
+            for name in sorted(self.skipped_templates):
+                print(f"    - {name}  [no active host link, direct or indirect]")
 
 
 # ---------------------------------------------------------------------------
