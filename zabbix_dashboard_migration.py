@@ -3,696 +3,919 @@
 Zabbix Dashboard Migration Script
 Migrates dashboards from Zabbix 6.4 to Zabbix 7.0
 
-Widget field types (official Zabbix 6.4 API docs):
-  0  = Integer
-  1  = String
-  2  = Host group
-  3  = Host
-  4  = Item
-  5  = Item prototype
-  6  = Graph
-  7  = Graph prototype
-  8  = Map
+Official Zabbix 6.4 widget field types (dashboard/object API):
+  0  = Integer          (no resolution needed)
+  1  = String           (no resolution needed)
+  2  = Host group       ← resolve via hostgroup.get
+  3  = Host             ← resolve via host.get
+  4  = Item             ← resolve via item.get
+  5  = Item prototype   ← resolve via itemprototype.get
+  6  = Graph            ← resolve via graph.get
+  7  = Graph prototype  ← resolve via graphprototype.get
+  8  = Map              ← resolve via map.get
   9  = Service
   10 = SLA
   11 = User
   12 = Action
   13 = Media type
+
+Config files (same directory as this script):
+  zabbix_credential.yml        → username / password
+  zabbix_instances_{env}.yml   → cia.<n>.url_export / url_import
+
+Usage:
+  python migrate_dashboards.py --env ppr --cia biz01
+  python migrate_dashboards.py --env prd --cia all     # migrates every CIA
+  python migrate_dashboards.py --env ppr --cia biz01 --debug
 """
 
+import os
 import re
-import requests
-import argparse
 import sys
-from typing import Dict, List, Any, Tuple
+import argparse
+import logging
+from typing import Dict, List, Tuple
 
-# Sentinel value to mark inaccessible/deleted objects that should be skipped silently
+import yaml
+from zabbix_utils import ZabbixAPI
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Sentinel: field references a deleted / inaccessible object → skip silently
 _INACCESSIBLE = "__INACCESSIBLE__"
 
 # Official Zabbix 6.4 widget field type constants
 FIELD_TYPE_INTEGER        = "0"
 FIELD_TYPE_STRING         = "1"
-FIELD_TYPE_HOST_GROUP     = "2"
-FIELD_TYPE_HOST           = "3"
-FIELD_TYPE_ITEM           = "4"
-FIELD_TYPE_ITEM_PROTOTYPE = "5"
-FIELD_TYPE_GRAPH          = "6"
-FIELD_TYPE_GRAPH_PROTO    = "7"
-FIELD_TYPE_MAP            = "8"
-FIELD_TYPE_SERVICE        = "9"
-FIELD_TYPE_SLA            = "10"
-FIELD_TYPE_USER           = "11"
-FIELD_TYPE_ACTION         = "12"
-FIELD_TYPE_MEDIA_TYPE     = "13"
+FIELD_TYPE_HOST_GROUP     = "2"   # ← hostgroup.get
+FIELD_TYPE_HOST           = "3"   # ← host.get
+FIELD_TYPE_ITEM           = "4"   # ← item.get
+FIELD_TYPE_ITEM_PROTOTYPE = "5"   # ← itemprototype.get
+FIELD_TYPE_GRAPH          = "6"   # ← graph.get
+FIELD_TYPE_GRAPH_PROTO    = "7"   # ← graphprototype.get
+FIELD_TYPE_MAP            = "8"   # ← map.get
 
-# Tag field pattern used in Zabbix 6.4 (incompatible with 7.0 format)
+# Zabbix 6.4 tag filter fields (flat format) that break 7.0 API
 _TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
 
+# Grid scaling: 6.4 = 24 columns, 7.0 = 36 columns (×1.5 horizontal only)
+# Vertical grid is identical: y 0-62, height 2-32
+GRID_SCALE = 1.5
 
-class ZabbixAPI:
-    """Wrapper for Zabbix API calls"""
+logger = logging.getLogger(__name__)
 
-    def __init__(self, url: str, token: str):
-        self.url = url.rstrip('/') + '/api_jsonrpc.php'
-        self.token = token
-        self.request_id = 0
 
-    def call(self, method: str, params: Dict = None) -> Any:
-        """Make a Zabbix API call"""
-        self.request_id += 1
+# ---------------------------------------------------------------------------
+# Config loaders
+# ---------------------------------------------------------------------------
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": self.request_id,
-        }
+def load_credentials() -> Dict:
+    """Load Zabbix credentials from zabbix_credential.yml."""
+    path = os.path.join(BASE_DIR, "zabbix_credential.yml")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Credentials file not found: {path}")
+    with open(path, "r") as f:
+        creds = yaml.safe_load(f)
+    if not creds or "username" not in creds or "password" not in creds:
+        raise ValueError(f"'{path}' must contain 'username' and 'password' keys.")
+    return creds
 
-        if method != "apiinfo.version":
-            payload["auth"] = self.token
 
-        try:
-            response = requests.post(self.url, json=payload, timeout=30)
-            response.raise_for_status()
-            result = response.json()
+def load_instances(environment: str) -> Dict:
+    """Load Zabbix instance URLs from zabbix_instances_{env}.yml."""
+    filename = f"zabbix_instances_{environment}.yml"
+    path = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Instances file not found: {path}")
+    with open(path, "r") as f:
+        config = yaml.safe_load(f)
+    if not config or "cia" not in config:
+        raise ValueError(f"'{path}' must contain a 'cia' mapping.")
+    return config
 
-            if "error" in result:
-                raise Exception(f"Zabbix API error: {result['error']}")
 
-            return result.get("result")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Request failed: {e}")
-
+# ---------------------------------------------------------------------------
+# Main migrator class
+# ---------------------------------------------------------------------------
 
 class DashboardMigrator:
-    """Main class for dashboard migration"""
+    """Migrates dashboards from a Zabbix 6.4 source to a Zabbix 7.0 destination."""
 
-    def __init__(self, source_api: ZabbixAPI, dest_api: ZabbixAPI):
-        self.source = source_api
-        self.dest = dest_api
-        self.failed_dashboards = []
+    def __init__(self, source_url: str, dest_url: str,
+                 username: str, password: str, cia_name: str):
+        self.cia_name = cia_name
+        self.failed_dashboards: List[Dict] = []
         self.migrated_count = 0
 
-    # ------------------------------------------------------------------
+        logger.debug("Connecting to source: %s", source_url)
+        self.source = ZabbixAPI(url=source_url)
+        self.source.login(user=username, password=password)
+        logger.debug("Source login OK.")
+
+        logger.debug("Connecting to destination: %s", dest_url)
+        self.dest = ZabbixAPI(url=dest_url)
+        self.dest.login(user=username, password=password)
+        logger.debug("Destination login OK.")
+
+    def logout(self):
+        """Gracefully logout from both APIs."""
+        try:
+            self.source.logout()
+        except Exception:
+            pass
+        try:
+            self.dest.logout()
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
     # Fetch
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def get_all_dashboards(self) -> List[Dict]:
-        """Retrieve all dashboards from source"""
-        print("Fetching dashboards from source instance...")
-        dashboards = self.source.call("dashboard.get", {
-            "output": "extend",
-            "selectPages": "extend",
-            "selectUsers": "extend",
-            "selectUserGroups": "extend"
-        })
-        print(f"Found {len(dashboards)} dashboards")
+        """Retrieve all dashboards from source."""
+        print("  Fetching dashboards from source instance...")
+        dashboards = self.source.dashboard.get(
+            output="extend",
+            selectPages="extend",
+            selectUsers="extend",
+            selectUserGroups="extend"
+        )
+        print(f"  Found {len(dashboards)} dashboards.")
         return dashboards
 
-    # ------------------------------------------------------------------
-    # Phase 1: resolve IDs -> names (reading from source)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Phase 1: IDs -> portable names  (reading from source)
+    # -----------------------------------------------------------------------
 
     def resolve_object_names(self, dashboard: Dict) -> Dict:
-        """Convert IDs to portable names in dashboard definition"""
+        """Convert every object ID in the dashboard to its portable name."""
         converted = dashboard.copy()
 
-        # Users
-        if "users" in dashboard:
+        # --- Users ---
+        if dashboard.get("users"):
             converted["users"] = []
             for user in dashboard["users"]:
-                data = self.source.call("user.get", {
-                    "userids": user["userid"],
-                    "output": ["username"]
-                })
+                data = self.source.user.get(
+                    userids=user["userid"],
+                    output=["username"]
+                )
                 if data:
                     converted["users"].append({
                         "username": data[0]["username"],
                         "permission": user["permission"]
                     })
+                else:
+                    logger.debug("User ID %s not found in source.", user["userid"])
 
-        # User groups
-        if "userGroups" in dashboard:
+        # --- User groups ---
+        if dashboard.get("userGroups"):
             converted["userGroups"] = []
             for group in dashboard["userGroups"]:
-                data = self.source.call("usergroup.get", {
-                    "usrgrpids": group["usrgrpid"],
-                    "output": ["name"]
-                })
+                data = self.source.usergroup.get(
+                    usrgrpids=group["usrgrpid"],
+                    output=["name"]
+                )
                 if data:
                     converted["userGroups"].append({
                         "name": data[0]["name"],
                         "permission": group["permission"]
                     })
+                else:
+                    logger.debug("User group ID %s not found in source.", group["usrgrpid"])
 
-        # Pages / widgets
-        if "pages" in dashboard:
+        # --- Pages / widgets ---
+        if dashboard.get("pages"):
             converted["pages"] = []
             for page in dashboard["pages"]:
                 converted_page = page.copy()
-                if "widgets" in page:
+                if page.get("widgets"):
                     converted_page["widgets"] = []
                     for widget in page["widgets"]:
-                        try:
-                            converted_page["widgets"].append(
-                                self._widget_ids_to_names(widget)
-                            )
-                        except Exception as e:
-                            print(f"  Warning: Failed to convert widget: {e}")
-                            raise
+                        converted_page["widgets"].append(
+                            self._widget_ids_to_names(widget)
+                        )
                 converted["pages"].append(converted_page)
 
         return converted
 
     def _widget_ids_to_names(self, widget: Dict) -> Dict:
         """
-        For every field that references a Zabbix object by ID,
-        look up its name in the source and store it alongside the field
-        so we can resolve it in the destination later.
+        Resolve every object-reference field in a widget from ID to name.
 
-        Fields referencing deleted/inaccessible objects are marked with
-        _INACCESSIBLE and will be silently dropped at creation time.
-
-        Official Zabbix 6.4 widget field types:
+        Type mapping (official Zabbix 6.4 API docs):
           2 = Host group   3 = Host   4 = Item   5 = Item prototype
           6 = Graph        7 = Graph prototype    8 = Map
         """
         converted = widget.copy()
+        wtype = widget.get("type", "?")
 
-        if "fields" not in widget:
+        if not widget.get("fields"):
             return converted
 
         converted["fields"] = []
         for field in widget["fields"]:
             cf = field.copy()
             ftype = str(field.get("type", ""))
+            fname = field.get("name", "")
+            fval  = field.get("value")
 
-            if ftype == FIELD_TYPE_HOST_GROUP:          # 2 - Host group
-                data = self.source.call("hostgroup.get", {
-                    "groupids": field["value"],
-                    "output": ["name"]
-                })
-                cf["value_name"] = data[0]["name"] if data else _INACCESSIBLE
+            try:
+                if ftype == FIELD_TYPE_HOST_GROUP:          # 2 -> Host group
+                    data = self.source.hostgroup.get(
+                        groupids=fval,
+                        output=["name"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["name"]
+                        logger.debug("[%s] field '%s': hostgroup %s -> '%s'",
+                                     wtype, fname, fval, data[0]["name"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': hostgroup ID %s not found in source",
+                                     wtype, fname, fval)
 
-            elif ftype == FIELD_TYPE_HOST:              # 3 - Host
-                data = self.source.call("host.get", {
-                    "hostids": field["value"],
-                    "output": ["host"]
-                })
-                cf["value_name"] = data[0]["host"] if data else _INACCESSIBLE
+                elif ftype == FIELD_TYPE_HOST:              # 3 -> Host
+                    data = self.source.host.get(
+                        hostids=fval,
+                        output=["host"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["host"]
+                        logger.debug("[%s] field '%s': host %s -> '%s'",
+                                     wtype, fname, fval, data[0]["host"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': host ID %s not found in source",
+                                     wtype, fname, fval)
 
-            elif ftype == FIELD_TYPE_ITEM:              # 4 - Item
-                data = self.source.call("item.get", {
-                    "itemids": field["value"],
-                    "output": ["key_"],
-                    "selectHosts": ["host"]
-                })
-                if data:
-                    cf["value_name"] = data[0]["key_"]
-                    cf["host_name"]  = data[0]["hosts"][0]["host"]
+                elif ftype == FIELD_TYPE_ITEM:              # 4 -> Item
+                    data = self.source.item.get(
+                        itemids=fval,
+                        output=["key_"],
+                        selectHosts=["host"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["key_"]
+                        cf["host_name"]  = data[0]["hosts"][0]["host"]
+                        logger.debug("[%s] field '%s': item %s -> '%s' on '%s'",
+                                     wtype, fname, fval,
+                                     cf["value_name"], cf["host_name"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': item ID %s not found in source",
+                                     wtype, fname, fval)
+
+                elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:    # 5 -> Item prototype
+                    data = self.source.itemprototype.get(
+                        itemids=fval,
+                        output=["key_"],
+                        selectHosts=["host"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["key_"]
+                        cf["host_name"]  = data[0]["hosts"][0]["host"]
+                        logger.debug("[%s] field '%s': item_prototype %s -> '%s'",
+                                     wtype, fname, fval, cf["value_name"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': item_prototype ID %s not found",
+                                     wtype, fname, fval)
+
+                elif ftype == FIELD_TYPE_GRAPH:             # 6 -> Graph
+                    data = self.source.graph.get(
+                        graphids=fval,
+                        output=["name"],
+                        selectHosts=["host"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["name"]
+                        if data[0].get("hosts"):
+                            cf["host_name"] = data[0]["hosts"][0]["host"]
+                        logger.debug("[%s] field '%s': graph %s -> '%s'",
+                                     wtype, fname, fval, cf["value_name"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': graph ID %s not found in source",
+                                     wtype, fname, fval)
+
+                elif ftype == FIELD_TYPE_GRAPH_PROTO:       # 7 -> Graph prototype
+                    data = self.source.graphprototype.get(
+                        graphids=fval,
+                        output=["name"],
+                        selectHosts=["host"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["name"]
+                        if data[0].get("hosts"):
+                            cf["host_name"] = data[0]["hosts"][0]["host"]
+                        logger.debug("[%s] field '%s': graph_prototype %s -> '%s'",
+                                     wtype, fname, fval, cf["value_name"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': graph_prototype ID %s not found",
+                                     wtype, fname, fval)
+
+                elif ftype == FIELD_TYPE_MAP:               # 8 -> Map
+                    data = self.source.map.get(
+                        sysmapids=fval,
+                        output=["name"]
+                    )
+                    if data:
+                        cf["value_name"] = data[0]["name"]
+                        logger.debug("[%s] field '%s': map %s -> '%s'",
+                                     wtype, fname, fval, data[0]["name"])
+                    else:
+                        cf["value_name"] = _INACCESSIBLE
+                        logger.debug("[%s] field '%s': map ID %s not found in source",
+                                     wtype, fname, fval)
+
                 else:
-                    cf["value_name"] = _INACCESSIBLE
+                    # Types 0 (Integer) and 1 (String) need no resolution.
+                    # Any other numeric type is passed through as-is.
+                    logger.debug("[%s] field '%s' type=%s value=%s -> pass-through",
+                                 wtype, fname, ftype, fval)
 
-            elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:    # 5 - Item prototype
-                data = self.source.call("itemprototype.get", {
-                    "itemids": field["value"],
-                    "output": ["key_"],
-                    "selectHosts": ["host"]
-                })
-                if data:
-                    cf["value_name"] = data[0]["key_"]
-                    cf["host_name"]  = data[0]["hosts"][0]["host"]
-                else:
-                    cf["value_name"] = _INACCESSIBLE
-
-            elif ftype == FIELD_TYPE_GRAPH:             # 6 - Graph
-                data = self.source.call("graph.get", {
-                    "graphids": field["value"],
-                    "output": ["name"],
-                    "selectHosts": ["host"]
-                })
-                if data:
-                    cf["value_name"] = data[0]["name"]
-                    if data[0].get("hosts"):
-                        cf["host_name"] = data[0]["hosts"][0]["host"]
-                else:
-                    cf["value_name"] = _INACCESSIBLE
-
-            elif ftype == FIELD_TYPE_GRAPH_PROTO:       # 7 - Graph prototype
-                data = self.source.call("graphprototype.get", {
-                    "graphids": field["value"],
-                    "output": ["name"],
-                    "selectHosts": ["host"]
-                })
-                if data:
-                    cf["value_name"] = data[0]["name"]
-                    if data[0].get("hosts"):
-                        cf["host_name"] = data[0]["hosts"][0]["host"]
-                else:
-                    cf["value_name"] = _INACCESSIBLE
-
-            elif ftype == FIELD_TYPE_MAP:               # 8 - Map
-                data = self.source.call("map.get", {
-                    "sysmapids": field["value"],
-                    "output": ["name"]
-                })
-                cf["value_name"] = data[0]["name"] if data else _INACCESSIBLE
-
-            else:
-                # types 0 (Integer), 1 (String) and others pass through unchanged
-                pass
+            except Exception as exc:
+                logger.debug("[%s] field '%s' type=%s error: %s -- marking inaccessible",
+                             wtype, fname, ftype, exc)
+                cf["value_name"] = _INACCESSIBLE
 
             converted["fields"].append(cf)
 
         return converted
 
-    # ------------------------------------------------------------------
-    # Phase 2: resolve names -> IDs (looking up in destination)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Phase 2: portable names -> IDs in destination
+    # -----------------------------------------------------------------------
 
     def resolve_object_ids(self, dashboard: Dict) -> Dict:
-        """Convert portable names back to IDs in the destination instance"""
+        """Convert portable names back to IDs valid in the destination."""
         converted = dashboard.copy()
-        missing_objects = []
+        missing: List[str] = []
 
-        # Users
-        if "users" in dashboard:
+        # --- Users ---
+        if dashboard.get("users"):
             converted["users"] = []
             for user in dashboard["users"]:
-                data = self.dest.call("user.get", {
-                    "filter": {"username": user["username"]},
-                    "output": ["userid"]
-                })
+                data = self.dest.user.get(
+                    filter={"username": user["username"]},
+                    output=["userid"]
+                )
                 if data:
                     converted["users"].append({
-                        "userid": data[0]["userid"],
+                        "userid":     data[0]["userid"],
                         "permission": user["permission"]
                     })
                 else:
-                    missing_objects.append(f"User: {user['username']}")
+                    missing.append(f"User: '{user['username']}'")
 
-        # User groups
-        if "userGroups" in dashboard:
+        # --- User groups ---
+        if dashboard.get("userGroups"):
             converted["userGroups"] = []
             for group in dashboard["userGroups"]:
-                data = self.dest.call("usergroup.get", {
-                    "filter": {"name": group["name"]},
-                    "output": ["usrgrpid"]
-                })
+                data = self.dest.usergroup.get(
+                    filter={"name": group["name"]},
+                    output=["usrgrpid"]
+                )
                 if data:
                     converted["userGroups"].append({
-                        "usrgrpid": data[0]["usrgrpid"],
+                        "usrgrpid":   data[0]["usrgrpid"],
                         "permission": group["permission"]
                     })
                 else:
-                    missing_objects.append(f"User group: {group['name']}")
+                    missing.append(f"User group: '{group['name']}'")
 
-        # Pages / widgets
-        if "pages" in dashboard:
+        # --- Pages / widgets ---
+        if dashboard.get("pages"):
             converted["pages"] = []
             for page in dashboard["pages"]:
                 converted_page = page.copy()
-                if "widgets" in page:
+                if page.get("widgets"):
                     converted_page["widgets"] = []
                     for widget in page["widgets"]:
-                        try:
-                            cw, widget_missing = self._widget_names_to_ids(widget)
-                            converted_page["widgets"].append(cw)
-                            missing_objects.extend(widget_missing)
-                        except Exception as e:
-                            missing_objects.append(f"Widget conversion error: {e}")
+                        w, w_missing = self._widget_names_to_ids(widget)
+                        converted_page["widgets"].append(w)
+                        missing.extend(w_missing)
                 converted["pages"].append(converted_page)
 
-        if missing_objects:
-            raise MissingObjectsError(missing_objects)
+        if missing:
+            raise MissingObjectsError(missing)
 
         return converted
 
     def _widget_names_to_ids(self, widget: Dict) -> Tuple[Dict, List[str]]:
         """
-        Convert value_name / host_name back to numeric IDs in the destination.
+        Resolve portable names back to IDs in the destination.
         Fields marked _INACCESSIBLE are silently dropped.
-        Fields whose name cannot be found in the destination are reported.
         """
         converted = widget.copy()
-        missing = []
+        missing: List[str] = []
+        wname = widget.get("name", "?")
+        wtype = widget.get("type", "?")
 
-        if "fields" not in widget:
+        if not widget.get("fields"):
             return converted, missing
 
         converted["fields"] = []
         for field in widget["fields"]:
             cf = field.copy()
+            ftype = str(field.get("type", ""))
+            fname = field.get("name", "")
 
-            # Only fields that went through name-resolution have "value_name"
+            # Fields without value_name are pass-through (integers, strings, etc.)
             if "value_name" not in field:
                 converted["fields"].append(cf)
                 continue
 
-            # Silently drop objects that were already gone in the source
+            # Silently drop fields that were inaccessible/deleted in the source
             if field["value_name"] == _INACCESSIBLE:
+                logger.debug("[%s '%s'] field '%s' marked inaccessible -- dropped",
+                             wtype, wname, fname)
                 continue
 
-            ftype = str(field.get("type", ""))
+            vname = field["value_name"]
+            ctx   = f"widget '{wname}' (type: {wtype}), field '{fname}'"
 
-            if ftype == FIELD_TYPE_HOST_GROUP:          # 2 - Host group
-                data = self.dest.call("hostgroup.get", {
-                    "filter": {"name": field["value_name"]},
-                    "output": ["groupid"]
-                })
-                if data:
-                    cf["value"] = data[0]["groupid"]
-                else:
-                    missing.append(f"Host group: {field['value_name']}")
-
-            elif ftype == FIELD_TYPE_HOST:              # 3 - Host
-                data = self.dest.call("host.get", {
-                    "filter": {"host": field["value_name"]},
-                    "output": ["hostid"]
-                })
-                if data:
-                    cf["value"] = data[0]["hostid"]
-                else:
-                    missing.append(f"Host: {field['value_name']}")
-
-            elif ftype == FIELD_TYPE_ITEM:              # 4 - Item
-                host_name = field.get("host_name")
-                if host_name:
-                    data = self.dest.call("item.get", {
-                        "filter": {"key_": field["value_name"]},
-                        "host": host_name,
-                        "output": ["itemid"]
-                    })
+            try:
+                if ftype == FIELD_TYPE_HOST_GROUP:          # 2 -> Host group
+                    data = self.dest.hostgroup.get(
+                        filter={"name": vname},
+                        output=["groupid"]
+                    )
                     if data:
-                        cf["value"] = data[0]["itemid"]
+                        cf["value"] = data[0]["groupid"]
                     else:
-                        missing.append(f"Item: {field['value_name']} on host {host_name}")
-                else:
-                    missing.append(f"Item: {field['value_name']} (no host context)")
+                        missing.append(f"Host group '{vname}' [{ctx}]")
 
-            elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:    # 5 - Item prototype
-                host_name = field.get("host_name")
-                if host_name:
-                    data = self.dest.call("itemprototype.get", {
-                        "filter": {"key_": field["value_name"]},
-                        "host": host_name,
-                        "output": ["itemid"]
-                    })
+                elif ftype == FIELD_TYPE_HOST:              # 3 -> Host
+                    data = self.dest.host.get(
+                        filter={"host": vname},
+                        output=["hostid"]
+                    )
                     if data:
-                        cf["value"] = data[0]["itemid"]
+                        cf["value"] = data[0]["hostid"]
                     else:
-                        missing.append(f"Item prototype: {field['value_name']} on host {host_name}")
-                else:
-                    missing.append(f"Item prototype: {field['value_name']} (no host context)")
+                        missing.append(f"Host '{vname}' [{ctx}]")
 
-            elif ftype == FIELD_TYPE_GRAPH:             # 6 - Graph
-                host_name = field.get("host_name")
-                if host_name:
-                    host_data = self.dest.call("host.get", {
-                        "filter": {"host": host_name},
-                        "output": ["hostid"]
-                    })
-                    if host_data:
-                        data = self.dest.call("graph.get", {
-                            "filter": {"name": field["value_name"]},
-                            "hostids": host_data[0]["hostid"],
-                            "output": ["graphid"]
-                        })
-                        if data:
-                            cf["value"] = data[0]["graphid"]
+                elif ftype == FIELD_TYPE_ITEM:              # 4 -> Item
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name},
+                            output=["hostid"]
+                        )
+                        if hosts:
+                            items = self.dest.item.get(
+                                filter={"key_": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["itemid"]
+                            )
+                            if items:
+                                cf["value"] = items[0]["itemid"]
+                            else:
+                                missing.append(
+                                    f"Item '{vname}' on host '{host_name}' [{ctx}]"
+                                )
                         else:
-                            missing.append(f"Graph: {field['value_name']} on host {host_name}")
+                            missing.append(
+                                f"Host '{host_name}' (needed for item '{vname}') [{ctx}]"
+                            )
                     else:
-                        missing.append(f"Host: {host_name}")
-                else:
-                    missing.append(f"Graph: {field['value_name']} (no host context)")
+                        missing.append(f"Item '{vname}' (no host context) [{ctx}]")
 
-            elif ftype == FIELD_TYPE_GRAPH_PROTO:       # 7 - Graph prototype
-                host_name = field.get("host_name")
-                if host_name:
-                    host_data = self.dest.call("host.get", {
-                        "filter": {"host": host_name},
-                        "output": ["hostid"]
-                    })
-                    if host_data:
-                        data = self.dest.call("graphprototype.get", {
-                            "filter": {"name": field["value_name"]},
-                            "hostids": host_data[0]["hostid"],
-                            "output": ["graphid"]
-                        })
-                        if data:
-                            cf["value"] = data[0]["graphid"]
+                elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:    # 5 -> Item prototype
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name},
+                            output=["hostid"]
+                        )
+                        if hosts:
+                            protos = self.dest.itemprototype.get(
+                                filter={"key_": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["itemid"]
+                            )
+                            if protos:
+                                cf["value"] = protos[0]["itemid"]
+                            else:
+                                missing.append(
+                                    f"Item prototype '{vname}' on host '{host_name}' [{ctx}]"
+                                )
                         else:
-                            missing.append(f"Graph prototype: {field['value_name']} on host {host_name}")
+                            missing.append(
+                                f"Host '{host_name}' (needed for item_prototype '{vname}') [{ctx}]"
+                            )
                     else:
-                        missing.append(f"Host: {host_name}")
-                else:
-                    missing.append(f"Graph prototype: {field['value_name']} (no host context)")
+                        missing.append(f"Item prototype '{vname}' (no host context) [{ctx}]")
 
-            elif ftype == FIELD_TYPE_MAP:               # 8 - Map
-                data = self.dest.call("map.get", {
-                    "filter": {"name": field["value_name"]},
-                    "output": ["sysmapid"]
-                })
-                if data:
-                    cf["value"] = data[0]["sysmapid"]
-                else:
-                    missing.append(f"Map: {field['value_name']}")
+                elif ftype == FIELD_TYPE_GRAPH:             # 6 -> Graph
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name},
+                            output=["hostid"]
+                        )
+                        if hosts:
+                            graphs = self.dest.graph.get(
+                                filter={"name": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["graphid"]
+                            )
+                            if graphs:
+                                cf["value"] = graphs[0]["graphid"]
+                            else:
+                                missing.append(
+                                    f"Graph '{vname}' on host '{host_name}' [{ctx}]"
+                                )
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (needed for graph '{vname}') [{ctx}]"
+                            )
+                    else:
+                        # Graph without host context: search by name only
+                        graphs = self.dest.graph.get(
+                            filter={"name": vname},
+                            output=["graphid"]
+                        )
+                        if graphs:
+                            cf["value"] = graphs[0]["graphid"]
+                        else:
+                            missing.append(f"Graph '{vname}' [{ctx}]")
 
-            # Remove temporary name helpers before sending to API
+                elif ftype == FIELD_TYPE_GRAPH_PROTO:       # 7 -> Graph prototype
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name},
+                            output=["hostid"]
+                        )
+                        if hosts:
+                            protos = self.dest.graphprototype.get(
+                                filter={"name": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["graphid"]
+                            )
+                            if protos:
+                                cf["value"] = protos[0]["graphid"]
+                            else:
+                                missing.append(
+                                    f"Graph prototype '{vname}' on host '{host_name}' [{ctx}]"
+                                )
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (needed for graph_prototype '{vname}') [{ctx}]"
+                            )
+                    else:
+                        missing.append(f"Graph prototype '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_MAP:               # 8 -> Map
+                    data = self.dest.map.get(
+                        filter={"name": vname},
+                        output=["sysmapid"]
+                    )
+                    if data:
+                        cf["value"] = data[0]["sysmapid"]
+                    else:
+                        missing.append(f"Map '{vname}' [{ctx}]")
+
+            except Exception as exc:
+                missing.append(f"{ctx} -- error: {exc}")
+
+            # Remove helper fields used only during transport
             cf.pop("value_name", None)
-            cf.pop("host_name", None)
-
+            cf.pop("host_name",  None)
             converted["fields"].append(cf)
 
         return converted, missing
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Phase 3: create in destination
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
-    def delete_existing_dashboard(self, name: str) -> None:
-        """Delete a dashboard by name in destination if it exists"""
-        existing = self.dest.call("dashboard.get", {
-            "filter": {"name": name},
-            "output": ["dashboardid"]
-        })
+    def _delete_existing_dashboard(self, name: str):
+        """Delete a dashboard in the destination if it already exists."""
+        existing = self.dest.dashboard.get(
+            filter={"name": name},
+            output=["dashboardid"]
+        )
         if existing:
             did = existing[0]["dashboardid"]
-            self.dest.call("dashboard.delete", [did])
-            print(f"  - Found existing dashboard (ID: {did}), deleting...")
+            self.dest.dashboard.delete(did)
+            logger.debug("Deleted existing dashboard ID %s ('%s')", did, name)
 
-    def _filter_widget_fields(self, fields: List[Dict]) -> List[Dict]:
+    @staticmethod
+    def _filter_tag_fields(fields: List[Dict]) -> List[Dict]:
         """
-        Strip widget fields that are incompatible with Zabbix 7.0.
+        Drop Zabbix 6.4 tag filter fields that are incompatible with 7.0.
 
-        Zabbix 6.4 tag filter fields (tags.tag.N / tags.operator.N / tags.value.N)
-        use a flat structure that was replaced in 7.0. Sending the old format
-        causes: "Invalid parameter tags/N: unexpected parameter 0".
-        Safest fix: drop them -- the widget will show all data unfiltered.
+        In 6.4: tags.tag.N / tags.operator.N / tags.value.N  (flat format)
+        In 7.0: structure changed -- sending the old format raises:
+                "Invalid parameter tags/N: unexpected parameter 0"
+        Safest approach: drop them. Widget will show all data unfiltered.
         """
         return [f for f in fields if not _TAG_FIELD_RE.match(f.get("name", ""))]
 
     def create_dashboard(self, dashboard: Dict) -> bool:
-        """Create dashboard in destination instance"""
+        """Build the cleaned payload and create the dashboard in the destination."""
         try:
-            self.delete_existing_dashboard(dashboard["name"])
+            self._delete_existing_dashboard(dashboard["name"])
 
-            clean_dashboard = {
+            clean = {
                 "name":           dashboard["name"],
                 "display_period": int(dashboard.get("display_period", 30)),
                 "auto_start":     int(dashboard.get("auto_start", 1)),
             }
 
             if dashboard.get("users"):
-                clean_dashboard["users"] = dashboard["users"]
-
+                clean["users"] = dashboard["users"]
             if dashboard.get("userGroups"):
-                clean_dashboard["userGroups"] = dashboard["userGroups"]
+                clean["userGroups"] = dashboard["userGroups"]
 
-            if "pages" in dashboard:
-                clean_dashboard["pages"] = []
-                for page in dashboard["pages"]:
-                    clean_page = {
-                        "name":           page.get("name", ""),
-                        "display_period": int(page.get("display_period", 0)),
-                        "widgets":        []
+            clean["pages"] = []
+            for page in dashboard.get("pages", []):
+                clean_page = {
+                    "name":           page.get("name", ""),
+                    "display_period": int(page.get("display_period", 0)),
+                    "widgets":        []
+                }
+
+                for widget in page.get("widgets", []):
+                    # -----------------------------------------------------------
+                    # Grid scaling (official Zabbix API docs):
+                    #   6.4: x 0-23, width  1-24  (24 columns)
+                    #   7.0: x 0-35, width  1-36  (36 columns) -> scale x1.5
+                    #   Vertical grid UNCHANGED: y 0-62, height 2-32
+                    #
+                    # Use start/end rounding to prevent any gap or overlap:
+                    #   x     = round(src_x * 1.5)
+                    #   width = round((src_x + src_w) * 1.5) - x
+                    # -----------------------------------------------------------
+                    src_x = int(widget.get("x", 0))
+                    src_w = int(widget.get("width", 1))
+
+                    x     = round(src_x * GRID_SCALE)
+                    width = round((src_x + src_w) * GRID_SCALE) - x
+
+                    y      = int(widget.get("y", 0))
+                    height = int(widget.get("height", 2))
+
+                    # Clamp to 7.0 official limits
+                    if x + width > 36:
+                        width = 36 - x
+                    width  = max(1, min(width, 36))
+                    height = max(2, min(height, 32))   # min 2, max 32 per docs
+
+                    clean_widget = {
+                        "type":      widget["type"],
+                        "name":      widget.get("name", ""),
+                        "x":         x,
+                        "y":         y,
+                        "width":     width,
+                        "height":    height,
+                        "view_mode": int(widget.get("view_mode", 0)),
                     }
 
-                    for widget in page.get("widgets", []):
-                        # -----------------------------------------------
-                        # Grid scaling -- official docs:
-                        #   6.4: x 0-23, width 1-24  (24 columns)
-                        #   7.0: x 0-35, width 1-36  (36 columns)  x1.5
-                        #   height & y: identical in both versions (y 0-62, height 2-32)
-                        # Only horizontal dimensions are scaled.
-                        # Using start/end rounding to prevent gaps or overlaps.
-                        # -----------------------------------------------
-                        SCALE = 1.5
-                        src_x = int(widget.get("x", 0))
-                        src_w = int(widget.get("width", 1))
+                    if widget.get("fields"):
+                        clean_widget["fields"] = self._filter_tag_fields(
+                            widget["fields"]
+                        )
 
-                        x     = round(src_x * SCALE)
-                        width = round((src_x + src_w) * SCALE) - x
+                    clean_page["widgets"].append(clean_widget)
 
-                        y      = int(widget.get("y", 0))
-                        height = int(widget.get("height", 2))
+                clean["pages"].append(clean_page)
 
-                        # Clamp to 7.0 limits: x 0-35, width 1-36, height 2-32
-                        if x + width > 36:
-                            width = 36 - x
-                        width  = max(1, min(width, 36))
-                        height = max(2, min(height, 32))
-
-                        clean_widget = {
-                            "type":      widget["type"],
-                            "name":      widget.get("name", ""),
-                            "x":         x,
-                            "y":         y,
-                            "width":     width,
-                            "height":    height,
-                            "view_mode": int(widget.get("view_mode", 0)),
-                        }
-
-                        if "fields" in widget:
-                            clean_widget["fields"] = self._filter_widget_fields(widget["fields"])
-
-                        clean_page["widgets"].append(clean_widget)
-
-                    clean_dashboard["pages"].append(clean_page)
-
-            self.dest.call("dashboard.create", clean_dashboard)
-            print(f"  Created dashboard: {dashboard['name']}")
+            self.dest.dashboard.create(**clean)
+            print(f"    + Created: {dashboard['name']}")
             return True
 
-        except Exception as e:
-            print(f"  Failed to create dashboard: {e}")
+        except Exception as exc:
+            print(f"    x Failed to create '{dashboard['name']}': {exc}")
             return False
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Orchestration
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def migrate(self):
-        """Main migration process"""
-        print("\n" + "=" * 60)
-        print("Zabbix Dashboard Migration")
-        print("=" * 60 + "\n")
-
+        """Run the full migration for one source -> destination pair."""
         try:
-            src_ver = self.source.call("apiinfo.version")
-            dst_ver = self.dest.call("apiinfo.version")
-            print(f"Source Zabbix version:      {src_ver}")
-            print(f"Destination Zabbix version: {dst_ver}\n")
-        except Exception as e:
-            print(f"Error checking versions: {e}")
-            return
+            src_ver = self.source.apiinfo.version()
+            dst_ver = self.dest.apiinfo.version()
+            print(f"  Source version:      {src_ver}")
+            print(f"  Destination version: {dst_ver}")
+        except Exception as exc:
+            print(f"  Warning: could not check versions -- {exc}")
 
         try:
             dashboards = self.get_all_dashboards()
-        except Exception as e:
-            print(f"Error fetching dashboards: {e}")
+        except Exception as exc:
+            print(f"  Error fetching dashboards: {exc}")
             return
 
         if not dashboards:
-            print("No dashboards found to migrate")
+            print("  No dashboards found.")
             return
 
-        print("\nStarting migration...\n")
-
+        print()
         for dashboard in dashboards:
             name = dashboard.get("name", "Unnamed")
-            print(f"Processing: {name}")
+            print(f"  Processing: {name}")
 
             try:
-                print("  - Converting IDs to names...")
+                print("    - Converting IDs to names...")
                 converted = self.resolve_object_names(dashboard)
 
-                print("  - Resolving IDs in destination...")
+                print("    - Resolving names to destination IDs...")
                 resolved = self.resolve_object_ids(converted)
 
-                print("  - Creating dashboard...")
+                print("    - Creating dashboard...")
                 if self.create_dashboard(resolved):
                     self.migrated_count += 1
                 else:
-                    self.failed_dashboards.append({"name": name, "reason": "Creation failed"})
+                    self.failed_dashboards.append({
+                        "name": name, "reason": "Creation failed"
+                    })
 
-            except MissingObjectsError as e:
-                print(f"  Skipping -- missing objects in destination:")
-                for obj in e.missing_objects:
-                    print(f"    - {obj}")
+            except MissingObjectsError as exc:
+                print(f"    x Skipped -- missing objects in destination:")
+                for obj in exc.missing_objects:
+                    print(f"      - {obj}")
                 self.failed_dashboards.append({
                     "name":    name,
                     "reason":  "Missing objects in destination",
-                    "details": e.missing_objects
+                    "details": exc.missing_objects
                 })
 
-            except Exception as e:
-                print(f"  Error: {e}")
-                self.failed_dashboards.append({"name": name, "reason": str(e)})
+            except Exception as exc:
+                print(f"    x Error: {exc}")
+                self.failed_dashboards.append({"name": name, "reason": str(exc)})
 
             print()
 
-        self._print_summary()
-
-    def _print_summary(self):
-        """Print migration summary"""
-        print("\n" + "=" * 60)
-        print("Migration Summary")
-        print("=" * 60)
-        print(f"Successfully migrated: {self.migrated_count}")
-        print(f"Failed:                {len(self.failed_dashboards)}")
+    def print_summary(self):
+        """Print a summary of this CIA's migration results."""
+        ok  = self.migrated_count
+        err = len(self.failed_dashboards)
+        print(f"  Migrated: {ok}   Failed: {err}")
 
         if self.failed_dashboards:
-            print("\nFailed Dashboards:")
+            print("  Failed dashboards:")
             for f in self.failed_dashboards:
-                print(f"\n  - {f['name']}")
-                print(f"    Reason: {f['reason']}")
+                print(f"    - {f['name']}  ->  {f['reason']}")
                 if "details" in f:
-                    print("    Missing objects (present in source, absent in destination):")
                     for d in f["details"]:
-                        print(f"      - {d}")
+                        print(f"        - {d}")
 
-        print("\n" + "=" * 60)
-        print("Note: Objects already inaccessible in the source were")
-        print("      silently skipped and are NOT counted as failures.")
-        print("=" * 60)
 
+# ---------------------------------------------------------------------------
+# Custom exception
+# ---------------------------------------------------------------------------
 
 class MissingObjectsError(Exception):
-    """Raised when required objects are missing in the destination"""
+    """Raised when required objects are absent in the destination."""
     def __init__(self, missing_objects: List[str]):
         self.missing_objects = missing_objects
         super().__init__(f"Missing {len(missing_objects)} objects")
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         description="Migrate Zabbix dashboards from 6.4 to 7.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Example usage:
-  python migrate_dashboards.py \\
-    --source-url https://zabbix64.example.com \\
-    --source-token abc123... \\
-    --dest-url https://zabbix70.example.com \\
-    --dest-token xyz789...
+Examples:
+  # Migrate a single CIA in PPR environment
+  python migrate_dashboards.py --env ppr --cia biz01
+
+  # Migrate all CIAs in PRD environment
+  python migrate_dashboards.py --env prd --cia all
+
+  # Enable verbose debug output
+  python migrate_dashboards.py --env ppr --cia biz01 --debug
+
+Config files required in the same directory as this script:
+  zabbix_credential.yml          username / password
+  zabbix_instances_ppr.yml       CIA URLs for PPR
+  zabbix_instances_prd.yml       CIA URLs for PRD
         """
     )
-    parser.add_argument("--source-url",   required=True, help="Source Zabbix 6.4 URL")
-    parser.add_argument("--source-token", required=True, help="Source Zabbix API token")
-    parser.add_argument("--dest-url",     required=True, help="Destination Zabbix 7.0 URL")
-    parser.add_argument("--dest-token",   required=True, help="Destination Zabbix API token")
-
+    parser.add_argument(
+        "--env", required=True, choices=["ppr", "prd"],
+        help="Environment to migrate (ppr or prd)"
+    )
+    parser.add_argument(
+        "--cia", required=True,
+        help="CIA name to migrate (e.g. biz01) or 'all' to migrate every CIA"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging"
+    )
     args = parser.parse_args()
 
+    # Logging setup
+    log_level = logging.DEBUG if args.debug else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format="%(levelname)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    # Load credentials
     try:
-        source_api = ZabbixAPI(args.source_url,  args.source_token)
-        dest_api   = ZabbixAPI(args.dest_url,    args.dest_token)
-        DashboardMigrator(source_api, dest_api).migrate()
-    except Exception as e:
-        print(f"\nFatal error: {e}", file=sys.stderr)
+        creds = load_credentials()
+    except Exception as exc:
+        print(f"ERROR loading credentials: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    # Load instance config
+    try:
+        config = load_instances(args.env)
+    except Exception as exc:
+        print(f"ERROR loading instances config: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    cia_map: Dict = config["cia"]
+
+    # Determine which CIAs to process
+    if args.cia == "all":
+        cia_names = list(cia_map.keys())
+    else:
+        if args.cia not in cia_map:
+            print(
+                f"ERROR: CIA '{args.cia}' not found in config. "
+                f"Available: {', '.join(cia_map.keys())}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        cia_names = [args.cia]
+
+    # -----------------------------------------------------------------------
+    # Main loop -- one migrator per CIA
+    # -----------------------------------------------------------------------
+    total_migrated = 0
+    total_failed   = 0
+
+    print("\n" + "=" * 70)
+    print(f"  Zabbix Dashboard Migration  |  env={args.env}  |  "
+          f"cia={'all' if args.cia == 'all' else args.cia}")
+    print("=" * 70)
+
+    for cia_name in cia_names:
+        cia_cfg    = cia_map[cia_name]
+        source_url = cia_cfg["url_export"]
+        dest_url   = cia_cfg["url_import"]
+
+        print(f"\n{'─' * 70}")
+        print(f"  CIA   : {cia_name}")
+        print(f"  Source: {source_url}")
+        print(f"  Dest  : {dest_url}")
+        print(f"{'─' * 70}")
+
+        migrator = None
+        try:
+            migrator = DashboardMigrator(
+                source_url=source_url,
+                dest_url=dest_url,
+                username=creds["username"],
+                password=creds["password"],
+                cia_name=cia_name
+            )
+            migrator.migrate()
+            migrator.print_summary()
+            total_migrated += migrator.migrated_count
+            total_failed   += len(migrator.failed_dashboards)
+
+        except Exception as exc:
+            print(f"  FATAL error for CIA '{cia_name}': {exc}", file=sys.stderr)
+            total_failed += 1
+
+        finally:
+            if migrator:
+                migrator.logout()
+
+    # -----------------------------------------------------------------------
+    # Global summary
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  Global Summary")
+    print("=" * 70)
+    print(f"  Total migrated : {total_migrated}")
+    print(f"  Total failed   : {total_failed}")
+    print()
+    print("  Note: Objects already inaccessible in the source were silently")
+    print("        skipped and are NOT counted as failures.")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
