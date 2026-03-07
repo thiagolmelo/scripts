@@ -97,7 +97,7 @@ TEMPLATE_IMPORT_RULES = {
 }
 
 HOST_IMPORT_RULES = {
-    "hostGroups":      {"createMissing": True,  "updateExisting": False},
+    "groups":          {"createMissing": True,  "updateExisting": False},   # Zabbix 7.0: "groups" not "hostGroups"
     "hosts":           {"createMissing": True,  "updateExisting": True},
     "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
@@ -255,6 +255,8 @@ class ZabbixMigrator:
         }
         # Hosts disabled in source — tracked separately for final report
         self.disabled_hosts: List[str] = []
+        # Hosts that were enabled in source but absent in destination after import
+        self.missing_hosts_after_import: List[str] = []
         # Templates skipped (not linked to any active host, directly or indirectly)
         self.skipped_templates: List[str] = []
 
@@ -409,6 +411,7 @@ class ZabbixMigrator:
         """
         Export and import only ENABLED hosts from source.
         Disabled hosts are skipped and listed in the final report.
+        After import, verifies which hosts are actually present in destination.
         """
         print("  [Hosts] Fetching host list from source...")
         try:
@@ -427,8 +430,8 @@ class ZabbixMigrator:
         enabled  = [h for h in all_hosts if str(h.get("status", "0")) == "0"]
         disabled = [h for h in all_hosts if str(h.get("status", "0")) != "0"]
 
-        print(f"  [Hosts] Found {len(all_hosts)} hosts: "
-              f"{len(enabled)} enabled, {len(disabled)} disabled.")
+        print(f"  [Hosts] Source — total: {len(all_hosts)}, "
+              f"enabled: {len(enabled)}, disabled: {len(disabled)}.")
 
         if disabled:
             self.disabled_hosts = [h["name"] for h in disabled]
@@ -461,10 +464,46 @@ class ZabbixMigrator:
                 source=exported,
                 rules=HOST_IMPORT_RULES
             )
-            self.results["hosts"]["migrated"] += len(enabled)
-            print(f"  [Hosts] Successfully imported {len(enabled)} hosts.")
         except Exception as exc:
             self._fail("hosts", "configuration.import failed", exc)
+            return
+
+        # ── Post-import verification ────────────────────────────────────────
+        print("  [Hosts] Verifying import in destination...")
+        try:
+            dest_hosts = self.dest.host.get(output=["name"])
+            dest_names = {h["name"] for h in dest_hosts}
+        except Exception as exc:
+            print(f"  [Hosts] Warning: could not verify destination hosts: {exc}")
+            dest_names = None
+
+        enabled_names = {h["name"] for h in enabled}
+
+        if dest_names is not None:
+            missing_after = sorted(enabled_names - dest_names)
+            confirmed     = len(enabled_names) - len(missing_after)
+
+            print(f"  [Hosts] Destination — enabled hosts present: {len(dest_names)}.")
+            print(f"  [Hosts] Confirmed migrated: {confirmed}  |  "
+                  f"Missing after import: {len(missing_after)}.")
+
+            self.results["hosts"]["migrated"] += confirmed
+
+            if missing_after:
+                self.results["hosts"]["failed"] += len(missing_after)
+                for name in missing_after:
+                    self.results["hosts"]["errors"].append({
+                        "name": name,
+                        "reason": "host not found in destination after import"
+                    })
+                # Store for summary detail list
+                self.missing_hosts_after_import = missing_after
+            else:
+                print(f"  [Hosts] All {confirmed} enabled hosts successfully imported.")
+        else:
+            # Verification unavailable — credit the full count
+            self.results["hosts"]["migrated"] += len(enabled)
+            print(f"  [Hosts] Successfully exported {len(enabled)} hosts (verification skipped).")
 
     def _ensure_host_groups_for_hosts(self):
         """Create any missing host groups in destination before host import."""
@@ -1267,6 +1306,13 @@ class ZabbixMigrator:
                   f"[{len(self.disabled_hosts)}]:")
             for name in sorted(self.disabled_hosts):
                 print(f"    - {name}  [DISABLED in source]")
+
+        # Hosts missing in destination after import
+        if "hosts" in types_run and self.missing_hosts_after_import:
+            print(f"\n  Enabled hosts NOT found in destination after import "
+                  f"[{len(self.missing_hosts_after_import)}]:")
+            for name in self.missing_hosts_after_import:
+                print(f"    - {name}  [MISSING in destination]")
 
         # Skipped templates detail list
         if "templates" in types_run and self.skipped_templates:
