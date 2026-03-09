@@ -370,10 +370,14 @@ class ZabbixMigrator:
     def __init__(self, source_url: str, dest_url: str,
                  username: str, password: str, cia_name: str,
                  skip_existing: bool = False,
-                 dashboard_filter: Optional[str] = None):
+                 dashboard_filter: Optional[str] = None,
+                 host_filter: Optional[str] = None,
+                 debug_json: bool = False):
         self.cia_name         = cia_name
         self.skip_existing    = skip_existing
         self.dashboard_filter = dashboard_filter
+        self.host_filter      = host_filter
+        self.debug_json       = debug_json
         self._source_url      = source_url  # kept for raw API calls
         self._dest_url        = dest_url   # kept for raw API calls (bypass pyzabbix)
 
@@ -382,6 +386,10 @@ class ZabbixMigrator:
             t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": []}
             for t in MIGRATION_ORDER
         }
+        # Source/destination object counts for final report
+        # Each entry: {"src_total": int, "src_enabled": int, "src_disabled": int,
+        #              "dst_total": int, "dst_enabled": int, "dst_disabled": int}
+        self.counts: Dict[str, Dict] = {t: {} for t in MIGRATION_ORDER}
         # Hosts disabled in source — tracked separately for final report
         self.disabled_hosts: List[str] = []
         # Hosts that were enabled in source but absent in destination after import
@@ -443,6 +451,14 @@ class ZabbixMigrator:
         tpl_by_id  = {t["templateid"]: t for t in all_templates}
         total      = len(all_templates)
         print(f"  [Templates] Found {total} templates total.")
+
+        # Record source count; fetch dest count for comparison
+        self.counts["templates"]["src_total"] = total
+        try:
+            dst_count = int(self.dest.template.get(countOutput=True))
+            self.counts["templates"]["dst_total"] = dst_count
+        except Exception:
+            self.counts["templates"]["dst_total"] = -1
 
         # ── 2. Fetch all ENABLED hosts with their directly linked templates ──
         try:
@@ -529,6 +545,11 @@ class ZabbixMigrator:
             self.results["templates"]["migrated"] += len(needed_list)
             self.results["templates"]["skipped"]  += len(not_needed)
             print(f"  [Templates] Successfully imported {len(needed_list)} templates.")
+            try:
+                self.counts["templates"]["dst_total"] = int(
+                    self.dest.template.get(countOutput=True))
+            except Exception:
+                pass
         except Exception as exc:
             self._fail("templates", "configuration.import failed", exc)
 
@@ -575,6 +596,31 @@ class ZabbixMigrator:
 
         enabled  = [h for h in all_hosts if str(h.get("status", "0")) == "0"]
         disabled = [h for h in all_hosts if str(h.get("status", "0")) != "0"]
+
+        # Record source counts
+        self.counts["hosts"]["src_total"]    = len(all_hosts)
+        self.counts["hosts"]["src_enabled"]  = len(enabled)
+        self.counts["hosts"]["src_disabled"] = len(disabled)
+
+        # Fetch destination counts now (before import, for a baseline)
+        try:
+            dst_all  = self.dest.host.get(output=["status"], countOutput=True)
+            dst_ena  = self.dest.host.get(filter={"status": "0"}, output=["status"], countOutput=True)
+            self.counts["hosts"]["dst_total"]    = int(dst_all)
+            self.counts["hosts"]["dst_enabled"]  = int(dst_ena)
+            self.counts["hosts"]["dst_disabled"] = int(dst_all) - int(dst_ena)
+        except Exception:
+            self.counts["hosts"]["dst_total"] = -1
+
+        # --host filter: restrict to a single host by name
+        if self.host_filter:
+            enabled = [h for h in enabled if h["name"] == self.host_filter]
+            disabled = []
+            if not enabled:
+                print(f"  [Hosts] Host '{self.host_filter}' not found "
+                      f"(or is disabled) in source.")
+                return
+            print(f"  [Hosts] Filtered to single host: '{self.host_filter}'.")
 
         print(f"  [Hosts] Source — total: {len(all_hosts)}, "
               f"enabled: {len(enabled)}, disabled: {len(disabled)}.")
@@ -648,8 +694,12 @@ class ZabbixMigrator:
         # ── Post-import verification ─────────────────────────────────────────
         print("  [Hosts] Verifying destination...")
         try:
-            dest_hosts = self.dest.host.get(output=["name"])
-            dest_names = {h["name"] for h in dest_hosts}
+            dest_hosts  = self.dest.host.get(output=["name", "status"])
+            dest_names  = {h["name"] for h in dest_hosts}
+            dst_enabled = sum(1 for h in dest_hosts if str(h.get("status","0")) == "0")
+            self.counts["hosts"]["dst_total"]    = len(dest_hosts)
+            self.counts["hosts"]["dst_enabled"]  = dst_enabled
+            self.counts["hosts"]["dst_disabled"] = len(dest_hosts) - dst_enabled
         except Exception as exc:
             print(f"  [Hosts] Warning: could not verify destination: {exc}")
             dest_names = None
@@ -708,6 +758,12 @@ class ZabbixMigrator:
 
         print(f"  [Maps] Found {len(maps)} maps.")
 
+        self.counts["maps"]["src_total"] = len(maps)
+        try:
+            self.counts["maps"]["dst_total"] = int(self.dest.map.get(countOutput=True))
+        except Exception:
+            self.counts["maps"]["dst_total"] = -1
+
         # Maps can reference host groups — ensure they exist
         self._ensure_host_groups_for_maps()
 
@@ -744,6 +800,10 @@ class ZabbixMigrator:
             count = len(maps)
             self.results["maps"]["migrated"] += count
             print(f"  [Maps] Successfully imported {count} maps.")
+            try:
+                self.counts["maps"]["dst_total"] = int(self.dest.map.get(countOutput=True))
+            except Exception:
+                pass
         except Exception as exc:
             self._fail("maps", "configuration.import failed", exc)
 
@@ -783,6 +843,13 @@ class ZabbixMigrator:
             return
 
         print(f"  [Dashboards] Found {len(dashboards)} dashboards.")
+
+        self.counts["dashboards"]["src_total"] = len(dashboards)
+        try:
+            self.counts["dashboards"]["dst_total"] = int(
+                self.dest.dashboard.get(countOutput=True))
+        except Exception:
+            self.counts["dashboards"]["dst_total"] = -1
 
         # Filter to a specific dashboard if requested
         if self.dashboard_filter:
@@ -1516,6 +1583,9 @@ class ZabbixMigrator:
                   getattr(self.dest, "_ZabbixAPI__auth", None)
         api_url = self._dest_url.rstrip("/") + "/api_jsonrpc.php"
 
+        source_str = source if isinstance(source, str) \
+                     else json.dumps(self._sanitize(source))
+
         payload = {
             "jsonrpc": "2.0",
             "method":  "configuration.import",
@@ -1523,11 +1593,40 @@ class ZabbixMigrator:
             "auth":    str(token) if token is not None else None,
             "params":  {
                 "format": fmt,
-                "source": source if isinstance(source, str)
-                          else json.dumps(self._sanitize(source)),
+                "source": source_str,
                 "rules":  rules,
             }
         }
+
+        # --debug-json: walk the entire payload and report any non-serializable type
+        if self.debug_json:
+            def _find_bad(obj, path="root"):
+                try:
+                    json.dumps(obj)
+                    return          # this branch is fine
+                except TypeError:
+                    pass
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        _find_bad(v, f"{path}.{k}")
+                elif isinstance(obj, (list, tuple)):
+                    for i, v in enumerate(obj):
+                        _find_bad(v, f"{path}[{i}]")
+                else:
+                    print(f"  [DEBUG-JSON] Non-serializable at {path}: "
+                          f"type={type(obj).__name__!r}  value={repr(obj)[:120]}")
+
+            print("  [DEBUG-JSON] Inspecting payload for non-serializable types...")
+            _find_bad(payload)
+
+            dump_path = os.path.join(BASE_DIR, "debug_payload.json")
+            try:
+                sanitized = self._sanitize(payload)
+                with open(dump_path, "w", encoding="utf-8") as _f:
+                    json.dump(sanitized, _f, indent=2)
+                print(f"  [DEBUG-JSON] Sanitized payload written to: {dump_path}")
+            except Exception as _e:
+                print(f"  [DEBUG-JSON] Could not write payload: {_e}")
 
         raw_body = json.dumps(self._sanitize(payload))
         resp = _requests.post(
@@ -1583,10 +1682,31 @@ class ZabbixMigrator:
         """Print per-type statistics to console only. All detail is in the log file."""
         for t in types_run:
             r = self.results[t]
-            print(f"  [{t.capitalize():12}] "
+            c = self.counts.get(t, {})
+
+            # Source line
+            if t == "hosts":
+                src_line = (f"  [{'Source':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('src_total', '?'):5}  "
+                            f"Enabled: {c.get('src_enabled', '?'):5}  "
+                            f"Disabled: {c.get('src_disabled', '?'):5}")
+                dst_line = (f"  [{'Dest':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('dst_total', '?'):5}  "
+                            f"Enabled: {c.get('dst_enabled', '?'):5}  "
+                            f"Disabled: {c.get('dst_disabled', '?'):5}")
+            else:
+                src_line = (f"  [{'Source':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('src_total', '?'):5}")
+                dst_line = (f"  [{'Dest':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('dst_total', '?'):5}")
+
+            print(src_line)
+            print(dst_line)
+            print(f"  [{'Migration':8}] [{t.capitalize():12}] "
                   f"Migrated: {r['migrated']:4}  "
                   f"Skipped: {r['skipped']:4}  "
                   f"Failed: {r['failed']:4}")
+            print()
 
 
 # ---------------------------------------------------------------------------
@@ -1681,12 +1801,23 @@ Config files (same directory as this script):
         help="(dashboards only) Migrate a single dashboard by exact name"
     )
     parser.add_argument(
+        "--host", default=None, metavar="NAME",
+        help="(hosts only) Migrate a single host by exact name"
+    )
+    parser.add_argument(
         "--skip-existing", action="store_true",
         help="Skip objects that already exist in destination (applies to all types)"
     )
     parser.add_argument(
         "--debug", action="store_true",
         help="Enable verbose debug logging"
+    )
+    parser.add_argument(
+        "--debug-json", action="store_true",
+        help=(
+            "Dump the raw JSON payload sent to the API into debug_payload.json "
+            "before each import call — useful to diagnose serialization errors"
+        )
     )
     args = parser.parse_args()
 
@@ -1778,6 +1909,7 @@ Config files (same directory as this script):
         t: {"migrated": 0, "skipped": 0, "failed": 0}
         for t in MIGRATION_ORDER
     }
+    global_counts: Dict[str, Dict] = {t: {} for t in MIGRATION_ORDER}
 
     mlog = MigrationLog(
         env=args.env,
@@ -1807,6 +1939,8 @@ Config files (same directory as this script):
                 cia_name=cia_name,
                 skip_existing=args.skip_existing,
                 dashboard_filter=args.dashboard,
+                host_filter=args.host,
+                debug_json=args.debug_json,
             )
 
             for mtype in types_to_run:
@@ -1833,6 +1967,10 @@ Config files (same directory as this script):
                 for t in types_to_run:
                     for k in ("migrated", "skipped", "failed"):
                         global_results[t][k] += migrator.results[t][k]
+                    # Aggregate source/dest counts (sum totals across CIAs)
+                    for k, v in migrator.counts.get(t, {}).items():
+                        if isinstance(v, int) and v >= 0:
+                            global_counts[t][k] = global_counts[t].get(k, 0) + v
                 migrator.logout()
 
     # Global summary — console: stats only
@@ -1840,11 +1978,27 @@ Config files (same directory as this script):
     print("  Global Summary")
     print("=" * 70)
     for t in types_to_run:
-        r = global_results[t]
-        print(f"  [{t.capitalize():12}] "
+        r  = global_results[t]
+        gc = global_counts[t]
+        if t == "hosts":
+            print(f"  [Source   ] [{t.capitalize():12}] "
+                  f"Total: {gc.get('src_total','?'):5}  "
+                  f"Enabled: {gc.get('src_enabled','?'):5}  "
+                  f"Disabled: {gc.get('src_disabled','?'):5}")
+            print(f"  [Dest     ] [{t.capitalize():12}] "
+                  f"Total: {gc.get('dst_total','?'):5}  "
+                  f"Enabled: {gc.get('dst_enabled','?'):5}  "
+                  f"Disabled: {gc.get('dst_disabled','?'):5}")
+        else:
+            print(f"  [Source   ] [{t.capitalize():12}] "
+                  f"Total: {gc.get('src_total','?'):5}")
+            print(f"  [Dest     ] [{t.capitalize():12}] "
+                  f"Total: {gc.get('dst_total','?'):5}")
+        print(f"  [Migration] [{t.capitalize():12}] "
               f"Migrated: {r['migrated']:4}  "
               f"Skipped: {r['skipped']:4}  "
               f"Failed: {r['failed']:4}")
+        print()
     print("=" * 70)
 
     # Always flush full detail to log file
