@@ -583,11 +583,8 @@ class ZabbixMigrator:
             except Exception as exc:
                 print(f"  [Templates] Warning: could not check existing templates: {exc}")
 
-        TPLCHUNK = 30
-        n_chunks = (len(needed_list) + TPLCHUNK - 1) // TPLCHUNK
         print(f"  [Templates] Will import {len(needed_list)} template(s) "
-              f"in dependency-ordered chunks of up to {TPLCHUNK} "
-              f"({n_chunks} chunk(s)).")
+              f"individually (2-pass: topo-order + cross-ref retry).")
 
         # ── 5. Ensure template groups exist before import ────────────────────
         self._ensure_template_groups_for_templates()
