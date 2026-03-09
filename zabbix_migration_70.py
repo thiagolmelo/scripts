@@ -46,12 +46,43 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import re
+
 import yaml
 from zabbix_utils import ZabbixAPI
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# Pre-quoting regexes for Zabbix 6.4 → 7.0 map YAML.
+#
+# Zabbix 6.4 exports these values UNQUOTED; PyYAML 1.1 then corrupts them:
+#
+# 1. HEX COLORS ("000000", "007700", etc.)
+#    PyYAML 1.1 treats /^0[0-7]+$/ strings as octal integers and pure-decimal
+#    strings as decimal integers.  After safe_load+dump they become plain ints
+#    (0, 4032, …) which Zabbix 7.0 rejects as "a character string is expected".
+#    Matches both "  key: value" and "  - key: value" (YAML seq first field).
+#
+# 2. BOOLEAN-LIKE STRINGS ("NO", "YES")
+#    PyYAML 1.1 parses bare NO/YES as Python False/True.  After dump they
+#    become "false"/"true" which Zabbix 7.0 rejects for string fields.
+_COLOR_FIX_RE = re.compile(
+    r'^(\s*(?:-\s+)?\w*color\s*:\s*)([0-9A-Fa-f]{6})\s*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+_BOOL_FIX_RE = re.compile(
+    r'^(\s*(?:-\s+)?\w+\s*:\s*)(YES|NO)\s*$',
+    re.MULTILINE,
+)
+
+
+def _prequote_zabbix_yaml(text: str) -> str:
+    """Quote values that PyYAML 1.1 would corrupt in Zabbix 6.4 YAML."""
+    text = _COLOR_FIX_RE.sub(lambda m: m.group(1) + "'" + m.group(2) + "'", text)
+    text = _BOOL_FIX_RE.sub(lambda m: m.group(1) + "'" + m.group(2) + "'", text)
+    return text
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1135,23 +1166,59 @@ class ZabbixMigrator:
             if exported is None:
                 continue
 
-            # Patch: inject "elements: []" on any selement missing the key
+            # ── 6.4 → 7.0 schema patch ───────────────────────────────────────
+            # Two classes of problems fixed here:
+            #
+            # 1. MISSING ARRAY FIELDS
+            #    Zabbix 6.4 exporter omits array fields when empty; 7.0 import
+            #    validator requires them present (even as []).
+            #    Fields patched:
+            #      selement: elements, urls, tags
+            #      map:      links, shapes, lines (new in 7.0), urls
+            #
+            # 2. HEX COLOR CORRUPTION (PyYAML 1.1 integer parsing)
+            #    6.4 exports color values unquoted: "border_color: 000000".
+            #    PyYAML 1.1 treats all-digit hex strings as integers:
+            #      000000 → int 0, 336699 → int 336699 (decimal, not hex!)
+            #    After safe_load+dump these become "0" / "336699" plain ints
+            #    and Zabbix 7.0 rejects them as non-string.
+            #    Fix: pre-quote all *color* values matching [0-9A-Fa-f]{6}
+            #    using _prequote_zabbix_yaml() BEFORE safe_load.
             try:
+                exported = _prequote_zabbix_yaml(exported)
                 export_data = yaml.safe_load(exported)
-                root    = export_data.get("zabbix_export", export_data)
-                patched = 0
+                root = export_data.get("zabbix_export", export_data)
+                patch_log = []
+
                 for smap in root.get("maps", []):
+                    # Map-level array fields
+                    for fld in ("links", "shapes", "lines", "urls"):
+                        if fld not in smap:
+                            smap[fld] = []
+                            patch_log.append(f"map.{fld}")
+
+                    # Selement-level array fields
                     for sel in smap.get("selements", []):
-                        if "elements" not in sel:
-                            sel["elements"] = []
-                            patched += 1
-                if patched:
+                        for fld in ("elements", "urls", "tags"):
+                            if fld not in sel:
+                                sel[fld] = []
+                                patch_log.append(f"selement.{fld}")
+
+                if patch_log:
                     exported = yaml.dump(export_data, allow_unicode=True,
                                          default_flow_style=False)
-                    logger.debug("Map '%s': patched %d selement(s) missing 'elements'.",
-                                 map_name, patched)
+                    summary = ", ".join(
+                        f"{v}×{k}" for k, v in
+                        sorted(
+                            {f: patch_log.count(f) for f in set(patch_log)}.items(),
+                            key=lambda x: -x[1]
+                        )
+                    )
+                    logger.debug("Map '%s': injected missing fields: %s",
+                                 map_name, summary)
             except Exception as exc:
-                logger.debug("Map '%s': schema patch failed (non-fatal): %s", map_name, exc)
+                logger.debug("Map '%s': schema patch failed (non-fatal): %s",
+                             map_name, exc)
 
             # Import
             for attempt in range(2):
