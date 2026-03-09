@@ -583,8 +583,11 @@ class ZabbixMigrator:
             except Exception as exc:
                 print(f"  [Templates] Warning: could not check existing templates: {exc}")
 
+        TPLCHUNK = 30
+        n_chunks = (len(needed_list) + TPLCHUNK - 1) // TPLCHUNK
         print(f"  [Templates] Will import {len(needed_list)} template(s) "
-              f"(single batch to preserve nested dependencies).")
+              f"in dependency-ordered chunks of up to {TPLCHUNK} "
+              f"({n_chunks} chunk(s)).")
 
         # ── 5. Ensure template groups exist before import ────────────────────
         self._ensure_template_groups_for_templates()
@@ -603,23 +606,94 @@ class ZabbixMigrator:
             self._fail("templates", "configuration.export failed", exc)
             return
 
-        # ── 7. Import into destination (single call = no ordering issues) ────
+        # ── 7. Parse exported JSON, topological-sort, import in chunks ───────
+        # Splitting avoids gateway timeouts: each chunk is ~30 templates.
+        # Topological order guarantees parents are imported before children.
         try:
-            self._raw_import(
-                fmt="json",
-                source=exported,
-                rules=TEMPLATE_IMPORT_RULES
-            )
-            self.results["templates"]["migrated"] += len(needed_list)
-            self.results["templates"]["skipped"]  += len(not_needed)
-            print(f"  [Templates] Successfully imported {len(needed_list)} templates.")
-            try:
-                self.counts["templates"]["dst_total"] = int(
-                    self.dest.template.get(countOutput=True))
-            except Exception:
-                pass
+            export_data = json.loads(exported)
         except Exception as exc:
-            self._fail("templates", "configuration.import failed", exc)
+            self._fail("templates", "failed to parse exported JSON", exc)
+            return
+
+        root        = export_data.get("zabbix_export", export_data)
+        tpl_list    = root.get("templates", [])
+        common_keys = {k: v for k, v in root.items() if k != "templates"}
+
+        # Build name -> template map and dependency graph from exported data
+        tpl_by_name = {t["template"]: t for t in tpl_list}
+        deps = {
+            name: {p["name"] for p in t.get("templates", [])}
+            for name, t in tpl_by_name.items()
+        }
+
+        # Kahn's algorithm for topological sort
+        in_degree = {n: 0 for n in tpl_by_name}
+        children  = {n: [] for n in tpl_by_name}
+        for name, parents in deps.items():
+            for p in parents:
+                if p in tpl_by_name:
+                    in_degree[name] += 1
+                    children[p].append(name)
+
+        queue   = [n for n, d in in_degree.items() if d == 0]
+        ordered = []
+        while queue:
+            n = queue.pop(0)
+            ordered.append(n)
+            for child in children[n]:
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+        remaining = [n for n in tpl_by_name if n not in ordered]
+        ordered.extend(remaining)
+
+        SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
+                          "invalid token", "session expired")
+        ok_count   = 0
+        fail_count = 0
+
+        for chunk_start in range(0, len(ordered), TPLCHUNK):
+            chunk_names = ordered[chunk_start:chunk_start + TPLCHUNK]
+            chunk_idx   = chunk_start // TPLCHUNK + 1
+            chunk_tpls  = [tpl_by_name[n] for n in chunk_names if n in tpl_by_name]
+
+            chunk_export = {"zabbix_export": dict(common_keys, templates=chunk_tpls)}
+            chunk_src    = json.dumps(chunk_export)
+
+            for attempt in range(2):
+                try:
+                    self._raw_import(fmt="json", source=chunk_src,
+                                     rules=TEMPLATE_IMPORT_RULES)
+                    ok_count += len(chunk_tpls)
+                    break
+                except Exception as exc:
+                    if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
+                        print(f"  [Templates] Session expired (chunk {chunk_idx}) "
+                              f"-- reconnecting...")
+                        self._reconnect()
+                    else:
+                        fail_count += len(chunk_tpls)
+                        for n in chunk_names:
+                            self.results["templates"]["errors"].append(
+                                {"name": n, "reason": str(exc)})
+                        print(f"  [Templates] Chunk {chunk_idx}/{n_chunks} FAILED: {exc}")
+                        break
+
+            if chunk_idx % 5 == 0 or chunk_idx == n_chunks:
+                print(f"  [Templates] Progress: {chunk_idx}/{n_chunks} chunks "
+                      f"({ok_count} imported so far)...")
+
+        self.results["templates"]["migrated"] += ok_count
+        self.results["templates"]["failed"]   += fail_count
+        self.results["templates"]["skipped"]  += len(not_needed)
+
+        if ok_count:
+            print(f"  [Templates] Done: {ok_count} imported, {fail_count} failed.")
+        try:
+            self.counts["templates"]["dst_total"] = int(
+                self.dest.template.get(countOutput=True))
+        except Exception:
+            pass
 
     def _ensure_template_groups_for_templates(self):
         """Create any missing template groups in destination before template import."""
