@@ -547,6 +547,13 @@ class ZabbixMigrator:
         self._ensure_template_groups_for_templates()
 
         # ── 6. Export all needed templates in ONE call ───────────────────────
+        # Refresh session — group creation above may have taken long enough
+        # to expire the token before we reach the export call.
+        try:
+            self._reconnect()
+        except Exception as exc:
+            print(f"  [Templates] Warning: reconnect before export failed: {exc}")
+
         try:
             exported = self._raw_export("templates", list(needed_ids))
         except Exception as exc:
@@ -847,6 +854,11 @@ class ZabbixMigrator:
             return
 
         mids = [m["sysmapid"] for m in maps]
+        try:
+            self._reconnect()
+        except Exception as exc:
+            print(f"  [Maps] Warning: reconnect before export failed: {exc}")
+
         try:
             exported = self._raw_export("maps", mids)
         except Exception as exc:
