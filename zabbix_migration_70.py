@@ -102,6 +102,27 @@ TEMPLATE_IMPORT_RULES = {
     "httptests":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
 }
 
+# Same as TEMPLATE_IMPORT_RULES but with templateDashboards disabled.
+# Used in the first of the two-step template import:
+#   Step 1 (this): create the template, its items, graphs, triggers, etc.
+#   Step 2 (full): now that graphs exist, import again with templateDashboards
+#                  so dashboard widgets that reference those graphs can resolve.
+# Zabbix 7.0 processes template dashboards before top-level graphs during a
+# single import call, so a one-shot import fails with "Cannot find graph …
+# used in dashboard".  The two-step approach avoids this ordering issue.
+TEMPLATE_IMPORT_RULES_NO_DASHBOARDS = {
+    "template_groups":    {"createMissing": True,  "updateExisting": False},
+    "templates":          {"createMissing": True,  "updateExisting": True},
+    "templateDashboards": {"createMissing": False, "updateExisting": False, "deleteMissing": False},
+    "templateLinkage":    {"createMissing": True,  "deleteMissing": False},
+    "items":              {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "triggers":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "graphs":             {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "discoveryRules":     {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "valueMaps":          {"createMissing": True,  "updateExisting": False},
+    "httptests":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+}
+
 HOST_IMPORT_RULES = {
     # Zabbix 7.0 API uses snake_case for group rules, camelCase for the rest.
     # host_groups pre-created by _ensure_host_groups_for_hosts(), but including
@@ -675,29 +696,45 @@ class ZabbixMigrator:
                     logger.debug("Template '%s' export FAILED: %s", name, msg)
                     return False
 
-            # Import into destination
-            for attempt in range(2):
-                try:
-                    self._raw_import(fmt="json", source=exported,
-                                     rules=TEMPLATE_IMPORT_RULES)
-                    ok_count += 1
-                    logger.debug("Template '%s' imported OK.", name)
-                    return True
-                except Exception as exc:
-                    msg = str(exc)
-                    if attempt == 0 and any(s in msg.lower() for s in SESSION_ERRORS):
-                        self._reconnect()
-                        continue
-                    if not is_retry and CROSS_REF_ERR in msg.lower():
-                        deferred.append(name)
-                        logger.debug("Template '%s' deferred (cross-ref): %s", name, msg)
-                        return False
-                    hard_failures.append((name, msg))
-                    self.results["templates"]["errors"].append(
-                        {"name": name, "reason": msg})
-                    logger.debug("Template '%s' FAILED: %s", name, msg)
-                    return False
-            return False
+            # Import into destination — TWO STEPS to work around Zabbix 7.0
+            # import ordering: it resolves template-dashboard graph references
+            # before creating top-level graphs, so a one-shot import fails with
+            # "Cannot find graph … used in dashboard".
+            # Step 1: import everything EXCEPT template dashboards (items + graphs first).
+            # Step 2: re-import with dashboards enabled (graphs now exist, refs resolve).
+            for step, rules in [
+                (1, TEMPLATE_IMPORT_RULES_NO_DASHBOARDS),
+                (2, TEMPLATE_IMPORT_RULES),
+            ]:
+                for attempt in range(2):
+                    try:
+                        self._raw_import(fmt="json", source=exported, rules=rules)
+                        break  # step succeeded
+                    except Exception as exc:
+                        msg = str(exc)
+                        if attempt == 0 and any(s in msg.lower() for s in SESSION_ERRORS):
+                            self._reconnect()
+                            continue
+                        # Only propagate errors on step 2 (step 1 partial failures
+                        # are expected when the template has no dashboards at all).
+                        if step == 2:
+                            if not is_retry and CROSS_REF_ERR in msg.lower():
+                                deferred.append(name)
+                                logger.debug("Template '%s' deferred (cross-ref): %s", name, msg)
+                                return False
+                            hard_failures.append((name, msg))
+                            self.results["templates"]["errors"].append(
+                                {"name": name, "reason": msg})
+                            logger.debug("Template '%s' FAILED (step 2): %s", name, msg)
+                            return False
+                        # Step 1 failed — log at debug and continue to step 2
+                        # (step 2 is idempotent and will still create any missing objects).
+                        logger.debug("Template '%s' step 1 non-fatal: %s", name, msg)
+                        break
+
+            ok_count += 1
+            logger.debug("Template '%s' imported OK.", name)
+            return True
 
         # ── Pass 1: topo order ────────────────────────────────────────────────
         print(f"  [Templates] Importing {len(ordered)} templates "
