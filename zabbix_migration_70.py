@@ -416,20 +416,31 @@ class ZabbixMigrator:
 
     @staticmethod
     def _raw_login(url: str, username: str, password: str) -> str:
-        """Authenticate via raw HTTP and return the session token string."""
+        """
+        Authenticate via raw HTTP and return the session token string.
+        Tries 'username' (Zabbix 7.0) first, falls back to 'user' (Zabbix 6.x).
+        """
         import requests as _requests
         api_url = url.rstrip("/") + "/api_jsonrpc.php"
-        payload = json.dumps({
-            "jsonrpc": "2.0", "method": "user.login", "id": 1,
-            "params": {"username": username, "password": password}
-        })
-        resp = _requests.post(api_url, data=payload,
-                              headers={"Content-Type": "application/json"}, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            raise Exception(data["error"].get("data") or data["error"].get("message"))
-        return data["result"]
+
+        for user_key in ("username", "user"):
+            payload = json.dumps({
+                "jsonrpc": "2.0", "method": "user.login", "id": 1,
+                "params": {user_key: username, "password": password}
+            })
+            resp = _requests.post(api_url, data=payload,
+                                  headers={"Content-Type": "application/json"}, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                err_msg = data["error"].get("data") or data["error"].get("message", "")
+                # If the param name was wrong, try the other key
+                if "username" in err_msg.lower() or "user" in err_msg.lower():
+                    continue
+                raise Exception(err_msg)
+            return data["result"]
+
+        raise Exception(f"user.login failed on {url} with both 'username' and 'user' params")
 
     def _reconnect(self):
         """Re-login to both source and destination and refresh raw tokens."""
