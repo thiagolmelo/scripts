@@ -828,12 +828,13 @@ class ZabbixMigrator:
         #   2 = host prototype (defined inside a template/host LLD rule)
         #   4 = discovered host (auto-created at runtime by LLD)
         # We only want to migrate plain hosts (flags=0).
-        # Filtering at API level avoids fetching thousands of LLD-created hosts.
+        # We request flags in the output and filter client-side (belt-and-suspenders)
+        # because passing filter={"flags":"0"} via pyzabbix keyword args can be
+        # unreliable — "filter" is a Python builtin and some versions mangle it.
         print("  [Hosts] Fetching host list from source (plain hosts only, flags=0)...")
         try:
             all_hosts = self.source.host.get(
-                output=["hostid", "name", "status"],
-                filter={"flags": "0"},      # 0 = plain/manually-created host only
+                output=["hostid", "name", "status", "flags"],
             )
         except Exception as exc:
             self._fail("hosts", "host.get failed", exc)
@@ -841,6 +842,22 @@ class ZabbixMigrator:
 
         if not all_hosts:
             print("  [Hosts] No hosts found.")
+            return
+
+        # Client-side filter: keep only flags=0 (plain/manually-created hosts).
+        # flags=2: host prototypes (LLD-defined, live inside discovery rules).
+        # flags=4: discovered hosts (auto-created at runtime by LLD).
+        # Neither should be migrated — they are recreated automatically when the
+        # templates and their LLD rules are in place on the destination.
+        lld_hosts = [h for h in all_hosts if str(h.get("flags", "0")) != "0"]
+        if lld_hosts:
+            print(f"  [Hosts] Excluding {len(lld_hosts)} LLD-managed host(s) "
+                  f"(flags≠0: host prototypes + discovered hosts).")
+            logger.debug("Excluded LLD hosts: %s", [h["name"] for h in lld_hosts])
+        all_hosts = [h for h in all_hosts if str(h.get("flags", "0")) == "0"]
+
+        if not all_hosts:
+            print("  [Hosts] No plain hosts found after LLD exclusion.")
             return
 
         enabled  = [h for h in all_hosts if str(h.get("status", "0")) == "0"]
