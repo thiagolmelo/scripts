@@ -410,19 +410,43 @@ class ZabbixMigrator:
         self.dest.login(user=username, password=password)
         logger.debug("Destination login OK.")
 
+        # Store raw tokens for _raw_export/_raw_import — independent of pyzabbix internals
+        self._src_token  = self._raw_login(self._source_url, username, password)
+        self._dest_token = self._raw_login(self._dest_url,   username, password)
+
+    @staticmethod
+    def _raw_login(url: str, username: str, password: str) -> str:
+        """Authenticate via raw HTTP and return the session token string."""
+        import requests as _requests
+        api_url = url.rstrip("/") + "/api_jsonrpc.php"
+        payload = json.dumps({
+            "jsonrpc": "2.0", "method": "user.login", "id": 1,
+            "params": {"username": username, "password": password}
+        })
+        resp = _requests.post(api_url, data=payload,
+                              headers={"Content-Type": "application/json"}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(data["error"].get("data") or data["error"].get("message"))
+        return data["result"]
+
     def _reconnect(self):
-        """Re-login to both source and destination after session expiry."""
+        """Re-login to both source and destination and refresh raw tokens."""
         logger.debug("Re-connecting to source and destination...")
+        self._src_token  = self._raw_login(self._source_url, self._username, self._password)
+        self._dest_token = self._raw_login(self._dest_url,   self._username, self._password)
+        # Keep pyzabbix session in sync too (for .host.get etc.)
         try:
-            self.source.login(user=self._username, password=self._password)
-        except Exception:
             self.source = ZabbixAPI(url=self._source_url)
             self.source.login(user=self._username, password=self._password)
+        except Exception as exc:
+            logger.debug("pyzabbix source re-login failed: %s", exc)
         try:
-            self.dest.login(user=self._username, password=self._password)
-        except Exception:
             self.dest = ZabbixAPI(url=self._dest_url)
             self.dest.login(user=self._username, password=self._password)
+        except Exception as exc:
+            logger.debug("pyzabbix dest re-login failed: %s", exc)
         logger.debug("Re-connected OK.")
 
     def logout(self):
@@ -1587,15 +1611,14 @@ class ZabbixMigrator:
         """
         import requests as _requests
 
-        token   = getattr(self.source, "auth", None) or \
-                  getattr(self.source, "_ZabbixAPI__auth", None)
+        token   = self._src_token
         api_url = self._source_url.rstrip("/") + "/api_jsonrpc.php"
 
         payload = json.dumps(self._sanitize({
             "jsonrpc": "2.0",
             "method":  "configuration.export",
             "id":      1,
-            "auth":    str(token) if token is not None else None,
+            "auth":    token,
             "params":  {
                 "format":  "json",
                 "options": {object_type: ids}
@@ -1653,8 +1676,7 @@ class ZabbixMigrator:
         """
         import requests as _requests
 
-        token   = getattr(self.dest, "auth", None) or \
-                  getattr(self.dest, "_ZabbixAPI__auth", None)
+        token   = self._dest_token
         api_url = self._dest_url.rstrip("/") + "/api_jsonrpc.php"
 
         source_str = source if isinstance(source, str) \
@@ -1664,7 +1686,7 @@ class ZabbixMigrator:
             "jsonrpc": "2.0",
             "method":  "configuration.import",
             "id":      1,
-            "auth":    str(token) if token is not None else None,
+            "auth":    token,
             "params":  {
                 "format": fmt,
                 "source": source_str,
