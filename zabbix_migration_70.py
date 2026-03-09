@@ -670,62 +670,81 @@ class ZabbixMigrator:
         if not enabled:
             print("  [Hosts] No new hosts to import after skip-existing filter.")
             return
-        hids = [h["hostid"] for h in enabled]
-        try:
-            all_exported = self._raw_export("hosts", hids)
-        except Exception as exc:
-            self._fail("hosts", "configuration.export failed", exc)
-            return
 
-        # ── Attempt 1: batch import ──────────────────────────────────────────
-        print(f"  [Hosts] Importing {len(enabled)} hosts (batch)...")
-        batch_ok = False
-        try:
-            self._raw_import(fmt="json", source=all_exported, rules=HOST_IMPORT_RULES)
-            batch_ok = True
-            print(f"  [Hosts] Batch import succeeded.")
-        except Exception as batch_exc:
-            print(f"  [Hosts] Batch import failed: {batch_exc}")
-            print(f"  [Hosts] Falling back to per-host import...")
+        # ── Chunked export + import ──────────────────────────────────────────
+        # Export/import in chunks to avoid session timeout on large sets.
+        CHUNK_SIZE  = 100
+        SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
+                          "invalid token", "session expired")
+        total_hosts = len(enabled)
+        ok_count    = 0
+        chunks      = [enabled[i:i+CHUNK_SIZE]
+                       for i in range(0, total_hosts, CHUNK_SIZE)]
 
-        # ── Attempt 2: per-host fallback ─────────────────────────────────────
-        if not batch_ok:
-            ok_count    = 0
-            SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
-                              "invalid token", "session expired")
+        print(f"  [Hosts] Importing {total_hosts} hosts "
+              f"in {len(chunks)} chunk(s) of up to {CHUNK_SIZE}...")
 
-            for idx, host in enumerate(enabled, 1):
+        for chunk_idx, chunk in enumerate(chunks, 1):
+            chunk_ids = [h["hostid"] for h in chunk]
+
+            # --- export chunk ---
+            for attempt in range(2):
                 try:
-                    exported = self._raw_export("hosts", [host["hostid"]])
-                    self._raw_import(fmt="json", source=exported, rules=HOST_IMPORT_RULES)
-                    ok_count += 1
+                    chunk_exported = self._raw_export("hosts", chunk_ids)
+                    break
                 except Exception as exc:
-                    reason = str(exc).lower()
+                    if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
+                        print(f"  [Hosts] Session expired during export "
+                              f"(chunk {chunk_idx}/{len(chunks)}) — reconnecting...")
+                        self._reconnect()
+                    else:
+                        # Record every host in this chunk as failed
+                        for h in chunk:
+                            self.results["hosts"]["errors"].append({
+                                "name": h["name"], "reason": str(exc)})
+                            self.results["hosts"]["failed"] += 1
+                        chunk_exported = None
+                        break
 
-                    # Session expired — reconnect and retry once
-                    if any(s in reason for s in SESSION_ERRORS):
-                        print(f"  [Hosts] Session expired at host #{idx} "
-                              f"({host['name']}) — reconnecting...")
-                        try:
-                            self._reconnect()
-                            exported = self._raw_export("hosts", [host["hostid"]])
-                            self._raw_import(fmt="json", source=exported,
-                                             rules=HOST_IMPORT_RULES)
-                            ok_count += 1
-                            continue          # retry succeeded — skip error recording
-                        except Exception as retry_exc:
-                            exc = retry_exc   # fall through to error recording
+            if chunk_exported is None:
+                continue
 
-                    self.results["hosts"]["errors"].append({
-                        "name": host["name"],
-                        "reason": str(exc)
-                    })
-                    self.results["hosts"]["failed"] += 1
-                    logger.debug("Host '%s' failed: %s", host["name"], exc)
+            # --- import chunk ---
+            for attempt in range(2):
+                try:
+                    self._raw_import(fmt="json", source=chunk_exported,
+                                     rules=HOST_IMPORT_RULES)
+                    ok_count += len(chunk)
+                    break
+                except Exception as exc:
+                    if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
+                        print(f"  [Hosts] Session expired during import "
+                              f"(chunk {chunk_idx}/{len(chunks)}) — reconnecting...")
+                        self._reconnect()
+                    else:
+                        # Chunk import failed — fall back to per-host for this chunk
+                        for h in chunk:
+                            for h_attempt in range(2):
+                                try:
+                                    h_exp = self._raw_export("hosts", [h["hostid"]])
+                                    self._raw_import(fmt="json", source=h_exp,
+                                                     rules=HOST_IMPORT_RULES)
+                                    ok_count += 1
+                                    break
+                                except Exception as h_exc:
+                                    if h_attempt == 0 and any(
+                                            s in str(h_exc).lower() for s in SESSION_ERRORS):
+                                        self._reconnect()
+                                    else:
+                                        self.results["hosts"]["errors"].append({
+                                            "name": h["name"], "reason": str(h_exc)})
+                                        self.results["hosts"]["failed"] += 1
+                                        break
+                        break
 
-            print(f"  [Hosts] Per-host import done: "
-                  f"{ok_count} OK, {self.results['hosts']['failed']} failed "
-                  f"(see log for details).")
+            if chunk_idx % 10 == 0 or chunk_idx == len(chunks):
+                print(f"  [Hosts] Progress: {chunk_idx}/{len(chunks)} chunks  "
+                      f"({ok_count} OK so far)...")
 
         # ── Post-import verification ─────────────────────────────────────────
         print("  [Hosts] Verifying destination...")
