@@ -616,21 +616,37 @@ class ZabbixMigrator:
         tpl_list    = root.get("templates", [])
         common_keys = {k: v for k, v in root.items() if k != "templates"}
 
-        # Build name -> template map and dependency graph from exported data
+        # Build name -> template map and full dependency graph from exported data.
+        # Dependencies come from TWO sources:
+        #   1. parentTemplates (inheritance): t["templates"] list
+        #   2. Cross-template graph item refs: graph_items where item["host"] != name
         tpl_by_name = {t["template"]: t for t in tpl_list}
-        deps = {
-            name: {p["name"] for p in t.get("templates", [])}
-            for name, t in tpl_by_name.items()
-        }
+        all_tpl_names = set(tpl_by_name.keys())
+
+        deps: Dict[str, set] = {name: set() for name in tpl_by_name}
+
+        for name, t in tpl_by_name.items():
+            # 1. Inheritance deps
+            for p in t.get("templates", []):
+                pname = p.get("name", "")
+                if pname in all_tpl_names and pname != name:
+                    deps[name].add(pname)
+
+            # 2. Graph item cross-refs: graphs whose items live on OTHER templates
+            for graph in t.get("graphs", []):
+                for gi in graph.get("graph_items", []):
+                    ref_host = gi.get("item", {}).get("host", "")
+                    if ref_host in all_tpl_names and ref_host != name:
+                        # This template's graph needs ref_host to be present first
+                        deps[name].add(ref_host)
 
         # Kahn's algorithm for topological sort
         in_degree = {n: 0 for n in tpl_by_name}
-        children  = {n: [] for n in tpl_by_name}
+        children: Dict[str, List[str]] = {n: [] for n in tpl_by_name}
         for name, parents in deps.items():
             for p in parents:
-                if p in tpl_by_name:
-                    in_degree[name] += 1
-                    children[p].append(name)
+                in_degree[name] += 1
+                children[p].append(name)
 
         queue   = [n for n, d in in_degree.items() if d == 0]
         ordered = []
@@ -641,6 +657,7 @@ class ZabbixMigrator:
                 in_degree[child] -= 1
                 if in_degree[child] == 0:
                     queue.append(child)
+        # Append any remaining (cycles — rare but safe fallback)
         remaining = [n for n in tpl_by_name if n not in ordered]
         ordered.extend(remaining)
 
@@ -667,19 +684,25 @@ class ZabbixMigrator:
                     self._raw_import(fmt="json", source=src,
                                      rules=TEMPLATE_IMPORT_RULES)
                     ok_count += 1
+                    logger.debug("Template '%s' imported OK.", name)
                     return True
                 except Exception as exc:
                     msg = str(exc)
                     if attempt == 0 and any(s in msg.lower() for s in SESSION_ERRORS):
                         self._reconnect()
                         continue
+                    # Cross-ref error on first pass: defer to pass 2 (dependency
+                    # template may not be in dest yet despite topo ordering, e.g.
+                    # it failed itself or has a cycle).
                     if not is_retry and CROSS_REF_ERR in msg.lower():
                         deferred.append(name)
+                        logger.debug("Template '%s' deferred (cross-ref): %s", name, msg)
                         return False
+                    # All other errors: skip this template, report it, continue
                     hard_failures.append((name, msg))
                     self.results["templates"]["errors"].append(
                         {"name": name, "reason": msg})
-                    logger.debug("Template '%s' failed: %s", name, msg)
+                    logger.debug("Template '%s' FAILED: %s", name, msg)
                     return False
             return False
 
