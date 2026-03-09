@@ -1109,6 +1109,26 @@ class ZabbixMigrator:
             self._fail("maps", "configuration.export failed", exc)
             return
 
+        # ── Zabbix 6.4 → 7.0 schema fix: inject missing "elements" tag ────────
+        # Zabbix 7.0 requires every selement to have an "elements" key even when
+        # empty (image/shape elements, type=4/5 have no linked object).
+        # The 6.4 exporter — both JSON and YAML — omits the key entirely when
+        # the list is empty.  Parse and patch before import.
+        try:
+            export_data = yaml.safe_load(exported)
+            root = export_data.get("zabbix_export", export_data)
+            patched = 0
+            for smap in root.get("maps", []):
+                for sel in smap.get("selements", []):
+                    if "elements" not in sel:
+                        sel["elements"] = []
+                        patched += 1
+            if patched:
+                exported = yaml.dump(export_data, allow_unicode=True, default_flow_style=False)
+                logger.debug("Maps schema patch: added empty 'elements' to %d selement(s).", patched)
+        except Exception as exc:
+            logger.debug("Maps schema patch failed (non-fatal): %s", exc)
+
         try:
             self._raw_import(
                 fmt="yaml",
