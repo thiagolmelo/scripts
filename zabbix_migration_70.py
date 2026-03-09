@@ -397,6 +397,9 @@ class ZabbixMigrator:
         # Templates skipped (not linked to any active host, directly or indirectly)
         self.skipped_templates: List[str] = []
 
+        self._username = username
+        self._password = password
+
         logger.debug("Connecting to source: %s", source_url)
         self.source = ZabbixAPI(url=source_url)
         self.source.login(user=username, password=password)
@@ -406,6 +409,21 @@ class ZabbixMigrator:
         self.dest = ZabbixAPI(url=dest_url)
         self.dest.login(user=username, password=password)
         logger.debug("Destination login OK.")
+
+    def _reconnect(self):
+        """Re-login to both source and destination after session expiry."""
+        logger.debug("Re-connecting to source and destination...")
+        try:
+            self.source.login(user=self._username, password=self._password)
+        except Exception:
+            self.source = ZabbixAPI(url=self._source_url)
+            self.source.login(user=self._username, password=self._password)
+        try:
+            self.dest.login(user=self._username, password=self._password)
+        except Exception:
+            self.dest = ZabbixAPI(url=self._dest_url)
+            self.dest.login(user=self._username, password=self._password)
+        logger.debug("Re-connected OK.")
 
     def logout(self):
         """Gracefully logout from both APIs."""
@@ -672,20 +690,38 @@ class ZabbixMigrator:
 
         # ── Attempt 2: per-host fallback ─────────────────────────────────────
         if not batch_ok:
-            ok_count = 0
-            for host in enabled:
+            ok_count    = 0
+            SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
+                              "invalid token", "session expired")
+
+            for idx, host in enumerate(enabled, 1):
                 try:
                     exported = self._raw_export("hosts", [host["hostid"]])
                     self._raw_import(fmt="json", source=exported, rules=HOST_IMPORT_RULES)
                     ok_count += 1
                 except Exception as exc:
-                    reason = str(exc)
+                    reason = str(exc).lower()
+
+                    # Session expired — reconnect and retry once
+                    if any(s in reason for s in SESSION_ERRORS):
+                        print(f"  [Hosts] Session expired at host #{idx} "
+                              f"({host['name']}) — reconnecting...")
+                        try:
+                            self._reconnect()
+                            exported = self._raw_export("hosts", [host["hostid"]])
+                            self._raw_import(fmt="json", source=exported,
+                                             rules=HOST_IMPORT_RULES)
+                            ok_count += 1
+                            continue          # retry succeeded — skip error recording
+                        except Exception as retry_exc:
+                            exc = retry_exc   # fall through to error recording
+
                     self.results["hosts"]["errors"].append({
                         "name": host["name"],
-                        "reason": reason
+                        "reason": str(exc)
                     })
                     self.results["hosts"]["failed"] += 1
-                    logger.debug("Host '%s' failed: %s", host["name"], reason)
+                    logger.debug("Host '%s' failed: %s", host["name"], exc)
 
             print(f"  [Hosts] Per-host import done: "
                   f"{ok_count} OK, {self.results['hosts']['failed']} failed "
