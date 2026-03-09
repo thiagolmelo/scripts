@@ -821,10 +821,13 @@ class ZabbixMigrator:
           3. Disabled hosts are skipped silently — detail goes to log only.
           4. After import, verify counts in destination.
         """
+        EXCLUDED_GROUP = "Discovered hosts"
+
         print("  [Hosts] Fetching host list from source...")
         try:
             all_hosts = self.source.host.get(
-                output=["hostid", "name", "status"]
+                output=["hostid", "name", "status"],
+                selectGroups=["name"]       # needed to filter out discovered hosts
             )
         except Exception as exc:
             self._fail("hosts", "host.get failed", exc)
@@ -833,6 +836,19 @@ class ZabbixMigrator:
         if not all_hosts:
             print("  [Hosts] No hosts found.")
             return
+
+        # Exclude hosts that belong to "Discovered hosts" — these are created
+        # automatically by Zabbix network discovery and should not be migrated.
+        discovered = [
+            h for h in all_hosts
+            if any(g["name"] == EXCLUDED_GROUP for g in h.get("groups", []))
+        ]
+        if discovered:
+            print(f"  [Hosts] Excluding {len(discovered)} host(s) "
+                  f"from group '{EXCLUDED_GROUP}' (auto-discovered, not migrated).")
+            logger.debug("Excluded discovered hosts: %s",
+                         [h["name"] for h in discovered])
+        all_hosts = [h for h in all_hosts if h not in discovered]
 
         enabled  = [h for h in all_hosts if str(h.get("status", "0")) == "0"]
         disabled = [h for h in all_hosts if str(h.get("status", "0")) != "0"]
