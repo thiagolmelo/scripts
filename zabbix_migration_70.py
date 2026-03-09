@@ -649,46 +649,73 @@ class ZabbixMigrator:
 
         SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
                           "invalid token", "session expired")
-        ok_count   = 0
-        fail_count = 0
+        # Cross-template graph ref error: template has a graph referencing an
+        # item on another template not yet imported.  These are retried in a
+        # second pass after everything else is in destination.
+        CROSS_REF_ERR  = "cannot find item"
 
-        for chunk_start in range(0, len(ordered), TPLCHUNK):
-            chunk_names = ordered[chunk_start:chunk_start + TPLCHUNK]
-            chunk_idx   = chunk_start // TPLCHUNK + 1
-            chunk_tpls  = [tpl_by_name[n] for n in chunk_names if n in tpl_by_name]
+        ok_count      = 0
+        deferred      : List[str] = []   # names deferred to second pass
+        hard_failures : List[tuple] = [] # (name, reason) — not retryable
 
-            chunk_export = {"zabbix_export": dict(common_keys, templates=chunk_tpls)}
-            chunk_src    = json.dumps(chunk_export)
-
+        def _import_one(name: str, is_retry: bool = False) -> bool:
+            """Import a single template. Returns True on success."""
+            nonlocal ok_count
+            tpl = tpl_by_name.get(name)
+            if not tpl:
+                return True
+            src = json.dumps({"zabbix_export": dict(common_keys, templates=[tpl])})
             for attempt in range(2):
                 try:
-                    self._raw_import(fmt="json", source=chunk_src,
+                    self._raw_import(fmt="json", source=src,
                                      rules=TEMPLATE_IMPORT_RULES)
-                    ok_count += len(chunk_tpls)
-                    break
+                    ok_count += 1
+                    return True
                 except Exception as exc:
-                    if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
-                        print(f"  [Templates] Session expired (chunk {chunk_idx}) "
-                              f"-- reconnecting...")
+                    msg = str(exc)
+                    if attempt == 0 and any(s in msg.lower() for s in SESSION_ERRORS):
                         self._reconnect()
-                    else:
-                        fail_count += len(chunk_tpls)
-                        for n in chunk_names:
-                            self.results["templates"]["errors"].append(
-                                {"name": n, "reason": str(exc)})
-                        print(f"  [Templates] Chunk {chunk_idx}/{n_chunks} FAILED: {exc}")
-                        break
+                        continue
+                    if not is_retry and CROSS_REF_ERR in msg.lower():
+                        deferred.append(name)
+                        return False
+                    hard_failures.append((name, msg))
+                    self.results["templates"]["errors"].append(
+                        {"name": name, "reason": msg})
+                    logger.debug("Template '%s' failed: %s", name, msg)
+                    return False
+            return False
 
-            if chunk_idx % 5 == 0 or chunk_idx == n_chunks:
-                print(f"  [Templates] Progress: {chunk_idx}/{n_chunks} chunks "
-                      f"({ok_count} imported so far)...")
+        # ── Pass 1: import each template individually, in topo order ─────────
+        print(f"  [Templates] Pass 1: importing {len(ordered)} templates individually...")
+        for i, name in enumerate(ordered, 1):
+            _import_one(name)
+            if i % 50 == 0 or i == len(ordered):
+                print(f"  [Templates] Pass 1 progress: {i}/{len(ordered)} "
+                      f"({ok_count} OK, {len(deferred)} deferred, "
+                      f"{len(hard_failures)} failed)...")
+
+        # ── Pass 2: retry deferred (cross-ref) templates ─────────────────────
+        if deferred:
+            print(f"  [Templates] Pass 2: retrying {len(deferred)} deferred template(s)...")
+            still_deferred = list(deferred)
+            deferred.clear()
+            for name in still_deferred:
+                _import_one(name, is_retry=True)
+            if deferred:
+                # Still failing after retry — treat as hard failures
+                for name in deferred:
+                    hard_failures.append((name, "cross-ref unresolved after pass 2"))
+                    self.results["templates"]["errors"].append(
+                        {"name": name, "reason": "cross-ref unresolved after pass 2"})
+            print(f"  [Templates] Pass 2 done: {ok_count} total OK, "
+                  f"{len(hard_failures)} total failed.")
 
         self.results["templates"]["migrated"] += ok_count
-        self.results["templates"]["failed"]   += fail_count
+        self.results["templates"]["failed"]   += len(hard_failures)
         self.results["templates"]["skipped"]  += len(not_needed)
 
-        if ok_count:
-            print(f"  [Templates] Done: {ok_count} imported, {fail_count} failed.")
+        print(f"  [Templates] Done: {ok_count} imported, {len(hard_failures)} failed.")
         try:
             self.counts["templates"]["dst_total"] = int(
                 self.dest.template.get(countOutput=True))
