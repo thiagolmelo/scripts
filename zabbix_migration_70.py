@@ -87,20 +87,28 @@ GRID_SCALE = 1.5
 
 # Configuration import rules
 TEMPLATE_IMPORT_RULES = {
-    "templateGroups":  {"createMissing": True,  "updateExisting": False},
-    "templates":       {"createMissing": True,  "updateExisting": True},
-    "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "graphs":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "discoveryRules":  {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "valueMaps":       {"createMissing": True,  "updateExisting": False},
-    "httptests":       {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    # Zabbix 7.0 API uses snake_case for group rules, camelCase for the rest.
+    # template_groups pre-created by _ensure_template_groups_for_templates(),
+    # but including it here lets the import create any that were missed.
+    "template_groups":    {"createMissing": True,  "updateExisting": False},
+    "templates":          {"createMissing": True,  "updateExisting": True},
+    "templateDashboards": {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "templateLinkage":    {"createMissing": True,  "deleteMissing": False},
+    "items":              {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "triggers":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "graphs":             {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "discoveryRules":     {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "valueMaps":          {"createMissing": True,  "updateExisting": False},
+    "httptests":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
 }
 
 HOST_IMPORT_RULES = {
-    # Note: host groups are pre-created by _ensure_host_groups_for_hosts()
-    # before import, so no "groups" rule is needed here.
+    # Zabbix 7.0 API uses snake_case for group rules, camelCase for the rest.
+    # host_groups pre-created by _ensure_host_groups_for_hosts(), but including
+    # it here lets the import create any that were missed.
+    "host_groups":     {"createMissing": True,  "updateExisting": False},
     "hosts":           {"createMissing": True,  "updateExisting": True},
+    "templateLinkage": {"createMissing": True,  "deleteMissing": False},
     "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "graphs":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
