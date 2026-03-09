@@ -589,71 +589,30 @@ class ZabbixMigrator:
         # ── 5. Ensure template groups exist before import ────────────────────
         self._ensure_template_groups_for_templates()
 
-        # ── 6. Export all needed templates in ONE call ───────────────────────
-        # Refresh session — group creation above may have taken long enough
-        # to expire the token before we reach the export call.
-        try:
-            self._reconnect()
-        except Exception as exc:
-            print(f"  [Templates] Warning: reconnect before export failed: {exc}")
+        # ── 6. Topological sort using parentTemplates from template.get ────────
+        # We derive the import order directly from the already-fetched needed_list
+        # (which has parentTemplates).  No need to parse the batch export for this.
+        tpl_id_to_name = {t["templateid"]: t["name"] for t in needed_list}
+        all_needed_names = set(tpl_id_to_name.values())
 
-        try:
-            exported = self._raw_export("templates", list(needed_ids))
-        except Exception as exc:
-            self._fail("templates", "configuration.export failed", exc)
-            return
-
-        # ── 7. Parse exported JSON, topological-sort, import in chunks ───────
-        # Splitting avoids gateway timeouts: each chunk is ~30 templates.
-        # Topological order guarantees parents are imported before children.
-        try:
-            export_data = json.loads(exported)
-        except Exception as exc:
-            self._fail("templates", "failed to parse exported JSON", exc)
-            return
-
-        root        = export_data.get("zabbix_export", export_data)
-        tpl_list    = root.get("templates", [])
-        # Only carry metadata (version, date, groups) into per-template payloads.
-        # Do NOT include top-level "graphs", "triggers", etc. — those are cross-
-        # template objects that Zabbix exports at the root level when they reference
-        # items from multiple templates.  Injecting them into every individual
-        # template import causes spurious "cannot find item" errors on templates
-        # that don't own those graphs at all (e.g. TPL.BIIS.IIS getting blamed for
-        # GRA.MIN.PRD.ZBX-MYSQL.InnoDB Stats).  Each template's OWN graphs/triggers
-        # are already nested inside its template object.
-        _METADATA_ONLY = {"version", "date", "groups", "template_groups"}
-        common_keys = {k: v for k, v in root.items()
-                       if k != "templates" and k in _METADATA_ONLY}
-
-        # Build name -> template map and full dependency graph from exported data.
-        # Dependencies come from TWO sources:
-        #   1. parentTemplates (inheritance): t["templates"] list
-        #   2. Cross-template graph item refs: graph_items where item["host"] != name
-        tpl_by_name = {t["template"]: t for t in tpl_list}
-        all_tpl_names = set(tpl_by_name.keys())
-
-        deps: Dict[str, set] = {name: set() for name in tpl_by_name}
-
-        for name, t in tpl_by_name.items():
-            # Inheritance deps only — parentTemplates must be imported first.
-            # Cross-template graph refs no longer need special handling: top-level
-            # graphs are excluded from per-template payloads (see common_keys above).
-            for p in t.get("templates", []):
-                pname = p.get("name", "")
-                if pname in all_tpl_names and pname != name:
+        deps: Dict[str, set] = {t["name"]: set() for t in needed_list}
+        for t in needed_list:
+            name = t["name"]
+            for p in t.get("parentTemplates", []):
+                pname = tpl_id_to_name.get(p["templateid"], "")
+                if pname and pname in all_needed_names and pname != name:
                     deps[name].add(pname)
 
         # Kahn's algorithm for topological sort
-        in_degree = {n: 0 for n in tpl_by_name}
-        children: Dict[str, List[str]] = {n: [] for n in tpl_by_name}
+        in_degree: Dict[str, int] = {n: 0 for n in deps}
+        children:  Dict[str, List[str]] = {n: [] for n in deps}
         for name, parents in deps.items():
             for p in parents:
                 in_degree[name] += 1
                 children[p].append(name)
 
         queue   = [n for n, d in in_degree.items() if d == 0]
-        ordered = []
+        ordered: List[str] = []
         while queue:
             n = queue.pop(0)
             ordered.append(n)
@@ -661,31 +620,65 @@ class ZabbixMigrator:
                 in_degree[child] -= 1
                 if in_degree[child] == 0:
                     queue.append(child)
-        # Append any remaining (cycles — rare but safe fallback)
-        remaining = [n for n in tpl_by_name if n not in ordered]
+        # Append any remaining (cycles — uncommon but safe fallback)
+        remaining = [n for n in deps if n not in ordered]
         ordered.extend(remaining)
 
+        # name → templateid lookup for export calls
+        tpl_name_to_id = {t["name"]: t["templateid"] for t in needed_list}
+
+        # ── 7. Export + import each template individually, in topo order ────────
+        # KEY DESIGN: one configuration.export call per template.
+        # A batch export of N templates produces a top-level "graphs" array
+        # containing cross-template graphs (graphs whose items span multiple
+        # templates).  If we split the batch JSON and feed each slice to
+        # configuration.import, those cross-template graphs end up in EVERY
+        # template's payload — including templates that own zero graphs — causing
+        # spurious "cannot find item" errors.
+        # Exporting each template alone avoids this entirely: Zabbix only returns
+        # what belongs to that specific template.
         SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
                           "invalid token", "session expired")
-        # Cross-template graph ref error: template has a graph referencing an
-        # item on another template not yet imported.  These are retried in a
-        # second pass after everything else is in destination.
         CROSS_REF_ERR  = "cannot find item"
 
         ok_count      = 0
-        deferred      : List[str] = []   # names deferred to second pass
-        hard_failures : List[tuple] = [] # (name, reason) — not retryable
+        deferred      : List[str] = []
+        hard_failures : List[tuple] = []
 
-        def _import_one(name: str, is_retry: bool = False) -> bool:
-            """Import a single template. Returns True on success."""
+        # Reconnect once before the loop — group creation above may have
+        # been slow enough to let the session expire.
+        try:
+            self._reconnect()
+        except Exception as exc:
+            print(f"  [Templates] Warning: reconnect before import loop failed: {exc}")
+
+        def _export_and_import_one(name: str, is_retry: bool = False) -> bool:
+            """Export one template from source, import it into destination."""
             nonlocal ok_count
-            tpl = tpl_by_name.get(name)
-            if not tpl:
+            tid = tpl_name_to_id.get(name)
+            if not tid:
                 return True
-            src = json.dumps({"zabbix_export": dict(common_keys, templates=[tpl])})
+
+            # Export this single template from source
             for attempt in range(2):
                 try:
-                    self._raw_import(fmt="json", source=src,
+                    exported = self._raw_export("templates", [tid])
+                    break
+                except Exception as exc:
+                    msg = str(exc)
+                    if attempt == 0 and any(s in msg.lower() for s in SESSION_ERRORS):
+                        self._reconnect()
+                        continue
+                    hard_failures.append((name, f"export failed: {msg}"))
+                    self.results["templates"]["errors"].append(
+                        {"name": name, "reason": f"export failed: {msg}"})
+                    logger.debug("Template '%s' export FAILED: %s", name, msg)
+                    return False
+
+            # Import into destination
+            for attempt in range(2):
+                try:
+                    self._raw_import(fmt="json", source=exported,
                                      rules=TEMPLATE_IMPORT_RULES)
                     ok_count += 1
                     logger.debug("Template '%s' imported OK.", name)
@@ -695,14 +688,10 @@ class ZabbixMigrator:
                     if attempt == 0 and any(s in msg.lower() for s in SESSION_ERRORS):
                         self._reconnect()
                         continue
-                    # Cross-ref error on first pass: defer to pass 2 (dependency
-                    # template may not be in dest yet despite topo ordering, e.g.
-                    # it failed itself or has a cycle).
                     if not is_retry and CROSS_REF_ERR in msg.lower():
                         deferred.append(name)
                         logger.debug("Template '%s' deferred (cross-ref): %s", name, msg)
                         return False
-                    # All other errors: skip this template, report it, continue
                     hard_failures.append((name, msg))
                     self.results["templates"]["errors"].append(
                         {"name": name, "reason": msg})
@@ -710,24 +699,24 @@ class ZabbixMigrator:
                     return False
             return False
 
-        # ── Pass 1: import each template individually, in topo order ─────────
-        print(f"  [Templates] Pass 1: importing {len(ordered)} templates individually...")
+        # ── Pass 1: topo order ────────────────────────────────────────────────
+        print(f"  [Templates] Importing {len(ordered)} templates "
+              f"individually (1 export+import per template)...")
         for i, name in enumerate(ordered, 1):
-            _import_one(name)
+            _export_and_import_one(name)
             if i % 50 == 0 or i == len(ordered):
-                print(f"  [Templates] Pass 1 progress: {i}/{len(ordered)} "
+                print(f"  [Templates] Progress: {i}/{len(ordered)} "
                       f"({ok_count} OK, {len(deferred)} deferred, "
                       f"{len(hard_failures)} failed)...")
 
-        # ── Pass 2: retry deferred (cross-ref) templates ─────────────────────
+        # ── Pass 2: retry deferred (cross-ref) ───────────────────────────────
         if deferred:
             print(f"  [Templates] Pass 2: retrying {len(deferred)} deferred template(s)...")
             still_deferred = list(deferred)
             deferred.clear()
             for name in still_deferred:
-                _import_one(name, is_retry=True)
+                _export_and_import_one(name, is_retry=True)
             if deferred:
-                # Still failing after retry — treat as hard failures
                 for name in deferred:
                     hard_failures.append((name, "cross-ref unresolved after pass 2"))
                     self.results["templates"]["errors"].append(
