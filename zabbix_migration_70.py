@@ -127,15 +127,21 @@ HOST_IMPORT_RULES = {
     # Zabbix 7.0 API uses snake_case for group rules, camelCase for the rest.
     # host_groups pre-created by _ensure_host_groups_for_hosts(), but including
     # it here lets the import create any that were missed.
+    #
+    # items/triggers/graphs/discoveryRules are intentionally DISABLED:
+    # we only import the host skeleton (interfaces, groups, macros) and its
+    # template linkages.  Zabbix automatically propagates all template-owned
+    # objects when the linkage is created.  Directly-created objects (no
+    # templateid) are not recreated — they belong to the source host only.
     "host_groups":     {"createMissing": True,  "updateExisting": False},
     "hosts":           {"createMissing": True,  "updateExisting": True},
     "templateLinkage": {"createMissing": True,  "deleteMissing": False},
-    "items":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "triggers":        {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "graphs":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "discoveryRules":  {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "valueMaps":       {"createMissing": True,  "updateExisting": False},
-    "httptests":       {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "items":           {"createMissing": False, "updateExisting": False, "deleteMissing": False},
+    "triggers":        {"createMissing": False, "updateExisting": False, "deleteMissing": False},
+    "graphs":          {"createMissing": False, "updateExisting": False, "deleteMissing": False},
+    "discoveryRules":  {"createMissing": False, "updateExisting": False, "deleteMissing": False},
+    "valueMaps":       {"createMissing": False, "updateExisting": False},
+    "httptests":       {"createMissing": False, "updateExisting": False, "deleteMissing": False},
 }
 
 MAP_IMPORT_RULES = {
@@ -188,6 +194,18 @@ class MigrationLog:
                 f"Skipped: {r['skipped']:4}  "
                 f"Failed: {r['failed']:4}"
             )
+
+            # List every successfully migrated object
+            if r.get("names"):
+                lines.append("")
+                lines.append(f"  Migrated {t} [{len(r['names'])}]:")
+                for obj_name in r["names"]:
+                    lines.append(f"    + {obj_name}")
+
+            # List every error
+            if r["errors"]:
+                lines.append("")
+                lines.append(f"  Failed {t} [{len(r['errors'])}]:")
             for err in r["errors"]:
                 name   = err.get("name", "")
                 reason = err.get("reason", "")
@@ -412,7 +430,7 @@ class ZabbixMigrator:
 
         # Per-type result counters
         self.results: Dict[str, Dict] = {
-            t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": []}
+            t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": [], "names": []}
             for t in MIGRATION_ORDER
         }
         # Source/destination object counts for final report
@@ -663,6 +681,7 @@ class ZabbixMigrator:
         CROSS_REF_ERR  = "cannot find item"
 
         ok_count      = 0
+        ok_names      : List[str] = []   # names of successfully imported templates
         deferred      : List[str] = []
         hard_failures : List[tuple] = []
 
@@ -675,7 +694,7 @@ class ZabbixMigrator:
 
         def _export_and_import_one(name: str, is_retry: bool = False) -> bool:
             """Export one template from source, import it into destination."""
-            nonlocal ok_count
+            nonlocal ok_count, ok_names
             tid = tpl_name_to_id.get(name)
             if not tid:
                 return True
@@ -733,6 +752,7 @@ class ZabbixMigrator:
                         break
 
             ok_count += 1
+            ok_names.append(name)
             logger.debug("Template '%s' imported OK.", name)
             return True
 
@@ -762,6 +782,7 @@ class ZabbixMigrator:
                   f"{len(hard_failures)} total failed.")
 
         self.results["templates"]["migrated"] += ok_count
+        self.results["templates"]["names"].extend(ok_names)
         self.results["templates"]["failed"]   += len(hard_failures)
         self.results["templates"]["skipped"]  += len(not_needed)
 
@@ -970,9 +991,11 @@ class ZabbixMigrator:
         enabled_names = {h["name"] for h in enabled}
 
         if dest_names is not None:
-            missing_after = sorted(enabled_names - dest_names)
-            confirmed     = len(enabled_names) - len(missing_after)
+            missing_after  = sorted(enabled_names - dest_names)
+            confirmed_names = sorted(enabled_names - set(missing_after))
+            confirmed       = len(confirmed_names)
             self.results["hosts"]["migrated"] += confirmed
+            self.results["hosts"]["names"].extend(confirmed_names)
             print(f"  [Hosts] Destination — confirmed: {confirmed}, "
                   f"missing: {len(missing_after)}.")
             if missing_after:
@@ -988,6 +1011,7 @@ class ZabbixMigrator:
                         self.results["hosts"]["failed"] += 1
         else:
             self.results["hosts"]["migrated"] += len(enabled)
+            self.results["hosts"]["names"].extend(sorted(h["name"] for h in enabled))
 
     def _ensure_host_groups_for_hosts(self):
         """Create any missing host groups in destination before host import."""
@@ -1067,6 +1091,7 @@ class ZabbixMigrator:
             )
             count = len(maps)
             self.results["maps"]["migrated"] += count
+            self.results["maps"]["names"].extend(sorted(m["name"] for m in maps))
             print(f"  [Maps] Successfully imported {count} maps.")
             try:
                 self.counts["maps"]["dst_total"] = int(self.dest.map.get(countOutput=True))
@@ -1173,6 +1198,7 @@ class ZabbixMigrator:
             print("    - Creating dashboard...")
             self._create_dashboard(resolved, owner_userid, extra_groups)
             self.results["dashboards"]["migrated"] += 1
+            self.results["dashboards"]["names"].append(name)
 
         except Exception as exc:
             print(f"    x Error: {exc}")
