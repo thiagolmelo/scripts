@@ -671,6 +671,13 @@ class ZabbixMigrator:
             print("  [Hosts] No new hosts to import after skip-existing filter.")
             return
 
+        # Refresh sessions — group sync + skip-existing queries may have been
+        # slow enough to expire the source or destination session token.
+        try:
+            self._reconnect()
+        except Exception as exc:
+            print(f"  [Hosts] Warning: reconnect before import failed: {exc}")
+
         # ── Chunked export + import ──────────────────────────────────────────
         # Export/import in chunks to avoid session timeout on large sets.
         CHUNK_SIZE  = 100
@@ -1703,9 +1710,50 @@ class ZabbixMigrator:
             self, src_groups: List[Dict], name_key: str,
             getter, creator, label: str):
         """
-        For every group in src_groups, create it in destination if absent.
-        getter(name) -> list   creator(name) -> result
+        Ensure every group from src_groups exists in destination.
+        Uses a single bulk fetch of all dest groups instead of one call per group,
+        to avoid session timeouts on large group lists.
+
+        getter(name) is still accepted for API compatibility but is NOT called
+        in a loop — it is only used as a fallback if the bulk path fails.
+        creator(name) -> result
         """
+        # ── bulk approach: fetch all dest groups in one call then diff ───────
+        try:
+            # Derive the dest API object from the creator's closure isn't
+            # possible generically, so we call getter once with a sentinel to
+            # get the result type, then fall back to the loop if bulk fails.
+            # Instead, use the dest api directly via the label heuristic.
+            if "template group" in label:
+                dest_all = self.dest.templategroup.get(output=["name"])
+            elif "host group" in label:
+                dest_all = self.dest.hostgroup.get(output=["name"])
+            else:
+                raise ValueError("unknown label — use per-group fallback")
+
+            dest_names = {g["name"] for g in dest_all}
+            missing    = [g[name_key] for g in src_groups
+                          if g[name_key] not in dest_names]
+
+            created = 0
+            for name in missing:
+                try:
+                    creator(name)
+                    created += 1
+                    logger.debug("Created %s '%s' in destination.", label, name)
+                except Exception as exc:
+                    logger.debug("Could not create %s '%s': %s", label, name, exc)
+
+            if created:
+                print(f"    Created {created} missing {label}(s) in destination "
+                      f"({len(dest_names)} already existed).")
+            return
+
+        except Exception as bulk_exc:
+            logger.debug("Bulk group check failed (%s), falling back to per-group: %s",
+                         label, bulk_exc)
+
+        # ── per-group fallback (original behaviour) ───────────────────────────
         created = skipped = 0
         for grp in src_groups:
             name = grp[name_key]
