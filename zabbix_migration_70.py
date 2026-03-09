@@ -727,7 +727,7 @@ class ZabbixMigrator:
             ]:
                 for attempt in range(2):
                     try:
-                        self._raw_import(fmt="json", source=exported, rules=rules)
+                        self._raw_import(fmt="yaml", source=exported, rules=rules)
                         break  # step succeeded
                     except Exception as exc:
                         msg = str(exc)
@@ -967,7 +967,7 @@ class ZabbixMigrator:
             # --- import chunk ---
             for attempt in range(2):
                 try:
-                    self._raw_import(fmt="json", source=chunk_exported,
+                    self._raw_import(fmt="yaml", source=chunk_exported,
                                      rules=HOST_IMPORT_RULES)
                     ok_count += len(chunk)
                     break
@@ -982,7 +982,7 @@ class ZabbixMigrator:
                             for h_attempt in range(2):
                                 try:
                                     h_exp = self._raw_export("hosts", [h["hostid"]])
-                                    self._raw_import(fmt="json", source=h_exp,
+                                    self._raw_import(fmt="yaml", source=h_exp,
                                                      rules=HOST_IMPORT_RULES)
                                     ok_count += 1
                                     break
@@ -1111,7 +1111,7 @@ class ZabbixMigrator:
 
         try:
             self._raw_import(
-                fmt="json",
+                fmt="yaml",
                 source=exported,
                 rules=MAP_IMPORT_RULES
             )
@@ -1823,13 +1823,19 @@ class ZabbixMigrator:
     # Generic helpers
     # =======================================================================
 
-    def _raw_export(self, object_type: str, ids: List[str]) -> str:
+    def _raw_export(self, object_type: str, ids: List[str],
+                    fmt: str = "yaml") -> str:
         """
         Call configuration.export via raw HTTP POST on the SOURCE instance,
-        bypassing pyzabbix so the result is always a plain JSON string.
+        bypassing pyzabbix so the result is always a plain string.
 
         object_type: 'templates', 'hosts', or 'maps'
         ids:         list of id strings to export
+        fmt:         export format — 'yaml' (default) or 'json'.
+                     YAML is preferred throughout: the 6.4 JSON exporter silently
+                     omits empty arrays (e.g. selement.elements, host interfaces)
+                     that Zabbix 7.0 requires, causing import schema errors.
+                     The YAML exporter always writes empty collections explicitly.
         """
         import requests as _requests
 
@@ -1842,7 +1848,7 @@ class ZabbixMigrator:
             "id":      1,
             "auth":    token,
             "params":  {
-                "format":  "json",
+                "format":  fmt,
                 "options": {object_type: ids}
             }
         }))
@@ -1858,7 +1864,7 @@ class ZabbixMigrator:
         if "error" in data:
             raise Exception(data["error"].get("data") or data["error"].get("message", str(data["error"])))
         result = data.get("result", "")
-        # result is already a JSON string when format="json"
+        # result is a plain string for both json and yaml formats
         if isinstance(result, str):
             return result
         return json.dumps(result)
