@@ -1087,11 +1087,67 @@ class ZabbixMigrator:
     # 3. MAPS
     # =======================================================================
 
+    def _topo_sort_maps(self, maps: list) -> list:
+        """Return maps in dependency order (referenced maps first).
+
+        A map that contains a selement of elementtype=1 (map element) depends
+        on the referenced map. We topo-sort within the set of maps being
+        imported so that a sub-map is always imported before the parent that
+        references it. Maps already present in the destination are treated as
+        already resolved and skipped in the dep-graph.
+        """
+        mid_to_map = {m["sysmapid"]: m for m in maps}
+        import_mids = set(mid_to_map)
+
+        # Build dep graph: mid -> set of mids it needs (within import_mids only)
+        deps: dict[str, set] = {m["sysmapid"]: set() for m in maps}
+        for m in maps:
+            for sel in m.get("_selements", []):
+                if str(sel.get("elementtype")) == "1":   # elementtype 1 = map
+                    for el in sel.get("elements", []):
+                        ref = str(el.get("sysmapid", ""))
+                        if ref and ref in import_mids and ref != m["sysmapid"]:
+                            deps[m["sysmapid"]].add(ref)
+
+        # DFS topo-sort
+        ordered: list = []
+        visited: set = set()
+        in_stack: set = set()
+
+        def visit(mid: str):
+            if mid in visited:
+                return
+            if mid in in_stack:
+                # Circular reference — break the cycle silently
+                return
+            in_stack.add(mid)
+            for dep in deps.get(mid, set()):
+                visit(dep)
+            in_stack.discard(mid)
+            visited.add(mid)
+            if mid in mid_to_map:
+                ordered.append(mid_to_map[mid])
+
+        for m in maps:
+            visit(m["sysmapid"])
+
+        return ordered
+
     def migrate_maps(self):
         """Export all network maps from source and import to destination."""
         print("  [Maps] Fetching map list from source...")
         try:
-            maps = self.source.map.get(output=["sysmapid", "name"])
+            # selectSelements is needed for topo-sort (inter-map dependencies).
+            raw_maps = self.source.map.get(
+                output=["sysmapid", "name"],
+                selectSelements=["selementid", "elementtype", "elements"],
+            )
+            # Store selement data under a private key; keep main fields clean.
+            maps = []
+            for m in raw_maps:
+                entry = {"sysmapid": m["sysmapid"], "name": m["name"],
+                         "_selements": m.get("selements", [])}
+                maps.append(entry)
         except Exception as exc:
             self._fail("maps", "map.get failed", exc)
             return
@@ -1127,6 +1183,14 @@ class ZabbixMigrator:
         if not maps:
             print("  [Maps] No new maps to import after skip-existing filter.")
             return
+
+        # ── Topo-sort: import sub-maps before the maps that reference them ────
+        # A map element (elementtype=1) references another map by sysmapid.
+        # If both maps are being imported in this run, the referenced map must
+        # be imported first — otherwise Zabbix 7.0 rejects the parent with
+        # "Cannot find map X used in map Y".
+        maps = self._topo_sort_maps(maps)
+        logger.debug("Maps topo-sort order: %s", [m["name"] for m in maps])
 
         SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
                           "invalid token", "session expired")
@@ -1189,6 +1253,29 @@ class ZabbixMigrator:
                 export_data = yaml.safe_load(exported)
                 root = export_data.get("zabbix_export", export_data)
                 patch_log = []
+
+                # Post-load safety net: if any color field survived as int
+                # (pre-quote regex missed it), convert to 6-digit decimal string.
+                # NOTE: this CANNOT fix octal-corrupted colors (e.g. 000255
+                # becomes int 173 which cannot be recovered); those MUST be
+                # caught by _prequote_zabbix_yaml() before safe_load.
+                # This handles the remaining case: pure-decimal ints like
+                # 336699 that parse identically in decimal.
+                _COLOR_FIELDS = {"color", "border_color", "fill_color", "font_color"}
+
+                def _fix_int_colors(obj):
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            if k in _COLOR_FIELDS and isinstance(v, int):
+                                obj[k] = f"{v:06d}"
+                                patch_log.append(f"color:{k}")
+                            else:
+                                _fix_int_colors(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            _fix_int_colors(item)
+
+                _fix_int_colors(root)
 
                 for smap in root.get("maps", []):
                     # Map-level array fields
