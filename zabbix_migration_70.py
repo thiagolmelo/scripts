@@ -614,7 +614,17 @@ class ZabbixMigrator:
 
         root        = export_data.get("zabbix_export", export_data)
         tpl_list    = root.get("templates", [])
-        common_keys = {k: v for k, v in root.items() if k != "templates"}
+        # Only carry metadata (version, date, groups) into per-template payloads.
+        # Do NOT include top-level "graphs", "triggers", etc. — those are cross-
+        # template objects that Zabbix exports at the root level when they reference
+        # items from multiple templates.  Injecting them into every individual
+        # template import causes spurious "cannot find item" errors on templates
+        # that don't own those graphs at all (e.g. TPL.BIIS.IIS getting blamed for
+        # GRA.MIN.PRD.ZBX-MYSQL.InnoDB Stats).  Each template's OWN graphs/triggers
+        # are already nested inside its template object.
+        _METADATA_ONLY = {"version", "date", "groups", "template_groups"}
+        common_keys = {k: v for k, v in root.items()
+                       if k != "templates" and k in _METADATA_ONLY}
 
         # Build name -> template map and full dependency graph from exported data.
         # Dependencies come from TWO sources:
@@ -626,19 +636,13 @@ class ZabbixMigrator:
         deps: Dict[str, set] = {name: set() for name in tpl_by_name}
 
         for name, t in tpl_by_name.items():
-            # 1. Inheritance deps
+            # Inheritance deps only — parentTemplates must be imported first.
+            # Cross-template graph refs no longer need special handling: top-level
+            # graphs are excluded from per-template payloads (see common_keys above).
             for p in t.get("templates", []):
                 pname = p.get("name", "")
                 if pname in all_tpl_names and pname != name:
                     deps[name].add(pname)
-
-            # 2. Graph item cross-refs: graphs whose items live on OTHER templates
-            for graph in t.get("graphs", []):
-                for gi in graph.get("graph_items", []):
-                    ref_host = gi.get("item", {}).get("host", "")
-                    if ref_host in all_tpl_names and ref_host != name:
-                        # This template's graph needs ref_host to be present first
-                        deps[name].add(ref_host)
 
         # Kahn's algorithm for topological sort
         in_degree = {n: 0 for n in tpl_by_name}
