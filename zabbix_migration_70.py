@@ -1097,54 +1097,91 @@ class ZabbixMigrator:
             print("  [Maps] No new maps to import after skip-existing filter.")
             return
 
-        mids = [m["sysmapid"] for m in maps]
+        SESSION_ERRORS = ("session terminated", "re-login", "not authorized",
+                          "invalid token", "session expired")
+
         try:
             self._reconnect()
         except Exception as exc:
             print(f"  [Maps] Warning: reconnect before export failed: {exc}")
 
-        try:
-            exported = self._raw_export("maps", mids)
-        except Exception as exc:
-            self._fail("maps", "configuration.export failed", exc)
-            return
+        # ── Per-map export+import ─────────────────────────────────────────────
+        # One map at a time so a single bad map never blocks the rest.
+        # Each exported YAML is patched before import to inject the missing
+        # "elements" key on selements — required by Zabbix 7.0 but omitted by
+        # the 6.4 exporter (both JSON and YAML) when the list is empty.
+        print(f"  [Maps] Importing {len(maps)} maps individually...")
+        ok_count  = 0
+        ok_names  = []
+        fail_maps = []
 
-        # ── Zabbix 6.4 → 7.0 schema fix: inject missing "elements" tag ────────
-        # Zabbix 7.0 requires every selement to have an "elements" key even when
-        # empty (image/shape elements, type=4/5 have no linked object).
-        # The 6.4 exporter — both JSON and YAML — omits the key entirely when
-        # the list is empty.  Parse and patch before import.
-        try:
-            export_data = yaml.safe_load(exported)
-            root = export_data.get("zabbix_export", export_data)
-            patched = 0
-            for smap in root.get("maps", []):
-                for sel in smap.get("selements", []):
-                    if "elements" not in sel:
-                        sel["elements"] = []
-                        patched += 1
-            if patched:
-                exported = yaml.dump(export_data, allow_unicode=True, default_flow_style=False)
-                logger.debug("Maps schema patch: added empty 'elements' to %d selement(s).", patched)
-        except Exception as exc:
-            logger.debug("Maps schema patch failed (non-fatal): %s", exc)
+        for i, m in enumerate(maps, 1):
+            map_name = m["name"]
+            mid      = m["sysmapid"]
 
-        try:
-            self._raw_import(
-                fmt="yaml",
-                source=exported,
-                rules=MAP_IMPORT_RULES
-            )
-            count = len(maps)
-            self.results["maps"]["migrated"] += count
-            self.results["maps"]["names"].extend(sorted(m["name"] for m in maps))
-            print(f"  [Maps] Successfully imported {count} maps.")
+            # Export single map
+            for attempt in range(2):
+                try:
+                    exported = self._raw_export("maps", [mid])
+                    break
+                except Exception as exc:
+                    if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
+                        self._reconnect()
+                        continue
+                    fail_maps.append((map_name, f"export failed: {exc}"))
+                    exported = None
+                    break
+
+            if exported is None:
+                continue
+
+            # Patch: inject "elements: []" on any selement missing the key
             try:
-                self.counts["maps"]["dst_total"] = int(self.dest.map.get(countOutput=True))
-            except Exception:
-                pass
-        except Exception as exc:
-            self._fail("maps", "configuration.import failed", exc)
+                export_data = yaml.safe_load(exported)
+                root    = export_data.get("zabbix_export", export_data)
+                patched = 0
+                for smap in root.get("maps", []):
+                    for sel in smap.get("selements", []):
+                        if "elements" not in sel:
+                            sel["elements"] = []
+                            patched += 1
+                if patched:
+                    exported = yaml.dump(export_data, allow_unicode=True,
+                                         default_flow_style=False)
+                    logger.debug("Map '%s': patched %d selement(s) missing 'elements'.",
+                                 map_name, patched)
+            except Exception as exc:
+                logger.debug("Map '%s': schema patch failed (non-fatal): %s", map_name, exc)
+
+            # Import
+            for attempt in range(2):
+                try:
+                    self._raw_import(fmt="yaml", source=exported, rules=MAP_IMPORT_RULES)
+                    ok_count += 1
+                    ok_names.append(map_name)
+                    break
+                except Exception as exc:
+                    if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
+                        self._reconnect()
+                        continue
+                    fail_maps.append((map_name, str(exc)))
+                    break
+
+            if i % 100 == 0 or i == len(maps):
+                print(f"  [Maps] Progress: {i}/{len(maps)} "
+                      f"({ok_count} OK, {len(fail_maps)} failed)...")
+
+        self.results["maps"]["migrated"] += ok_count
+        self.results["maps"]["names"].extend(ok_names)
+        self.results["maps"]["failed"]   += len(fail_maps)
+        for name, reason in fail_maps:
+            self.results["maps"]["errors"].append({"name": name, "reason": reason})
+
+        print(f"  [Maps] Done: {ok_count} imported, {len(fail_maps)} failed.")
+        try:
+            self.counts["maps"]["dst_total"] = int(self.dest.map.get(countOutput=True))
+        except Exception:
+            pass
 
     def _ensure_host_groups_for_maps(self):
         """Create any missing host groups in destination before map import."""
