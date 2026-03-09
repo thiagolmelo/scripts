@@ -1202,10 +1202,38 @@ class ZabbixMigrator:
 
         # ── Per-map export+import ─────────────────────────────────────────────
         # One map at a time so a single bad map never blocks the rest.
-        # Each exported YAML is patched before import to inject the missing
-        # "elements" key on selements — required by Zabbix 7.0 but omitted by
-        # the 6.4 exporter (both JSON and YAML) when the list is empty.
-        print(f"  [Maps] Importing {len(maps)} maps individually...")
+        #
+        # FORMAT: JSON (not YAML)
+        # ─────────────────────────────────────────────────────────────────────
+        # Zabbix 6.4 YAML export is NOT used for maps because PyYAML 1.1
+        # corrupts hex color values (e.g. "000000" → int 0, "000066" → int 54)
+        # when loading the YAML, and yaml.dump re-serialises them in a way that
+        # Zabbix 7.0's PHP validator rejects ("a character string is expected").
+        # The Zabbix 7.0 FRONTEND can import 6.4 YAML directly because Symfony
+        # YAML (the PHP YAML parser) handles "000000" as a string — but our
+        # Python yaml module does not.
+        #
+        # JSON has no such ambiguity: "font_color": "000000" is always a string.
+        # We export as JSON, fix the structure with the json module (no type
+        # corruption), and import as JSON.  All color values are preserved
+        # exactly as Zabbix stored them.
+        #
+        # Schema fixes applied after json.loads:
+        #   1. MISSING / NULL ARRAYS
+        #      6.4 JSON export omits empty arrays entirely (unlike YAML which
+        #      outputs `{  }`).  Zabbix 7.0 requires the keys to be present.
+        #      Fields ensured:
+        #        map:       links, shapes, lines, urls, selements
+        #        selement:  elements (types 0/1/2/3 only), urls, tags
+        #        link:      linktriggers
+        #   2. ORPHANED SELEMENTS
+        #      Selements of type 0/1/2/3 (host/map/trigger/hostgroup) with an
+        #      empty elements list reference objects deleted in source.
+        #      Zabbix 7.0 rejects them with "elements: cannot be empty" — drop.
+        #   3. BAD URLS
+        #      URL entries with an empty/whitespace url string fail validation
+        #      with "Wrong value for url field" — drop them.
+        print(f"  [Maps] Importing {len(maps)} maps individually (JSON format)...")
         ok_count  = 0
         ok_names  = []
         fail_maps = []
@@ -1214,10 +1242,10 @@ class ZabbixMigrator:
             map_name = m["name"]
             mid      = m["sysmapid"]
 
-            # Export single map
+            # Export single map as JSON
             for attempt in range(2):
                 try:
-                    exported = self._raw_export("maps", [mid])
+                    exported = self._raw_export("maps", [mid], fmt="json")
                     break
                 except Exception as exc:
                     if attempt == 0 and any(s in str(exc).lower() for s in SESSION_ERRORS):
@@ -1230,110 +1258,45 @@ class ZabbixMigrator:
             if exported is None:
                 continue
 
-            # ── 6.4 → 7.0 schema patch ───────────────────────────────────────
-            # Three classes of problems fixed here:
-            #
-            # 1. EMPTY DICT vs EMPTY LIST
-            #    Zabbix 6.4 exporter writes empty arrays as `{  }` (YAML flow
-            #    mapping = empty dict). Zabbix 7.0 import validator requires
-            #    actual lists [].  We must convert {} → [] for all known array
-            #    fields, AND inject the key when it is absent entirely.
-            #    Fields normalised:
-            #      map:       links, shapes, lines, urls, selements
-            #      selement:  elements, urls, tags
-            #      link:      linktriggers
-            #
-            # 2. HEX COLOR CORRUPTION (PyYAML 1.1 integer parsing)
-            #    6.4 exports some color values unquoted: "border_color: 000000".
-            #    PyYAML 1.1 treats all-digit hex strings as integers/octals.
-            #    Fix applied in TWO passes:
-            #      a) _prequote_zabbix_yaml()  BEFORE safe_load  (catches 000000 etc.)
-            #      b) _prequote_zabbix_yaml()  AFTER  yaml.dump  (yaml.dump may drop
-            #         quotes on values like 008800 that it considers safe unquoted)
-            #    The post-dump re-quote is the key fix for the "character string
-            #    expected" errors on border_color / font_color seen in production.
-            #
-            # 3. INT COLORS (belt-and-suspenders)
-            #    If any color survives as a Python int after safe_load, convert
-            #    back to a 6-digit decimal string.  Cannot recover octal-corrupted
-            #    values (e.g. 000255 → 173) — those must be caught by pass (a).
+            # ── 6.4 → 7.0 schema patch (JSON) ────────────────────────────────
             try:
-                # Pass (a): pre-quote before safe_load
-                exported = _prequote_zabbix_yaml(exported)
-                export_data = yaml.safe_load(exported)
+                export_data = json.loads(exported)
                 root = export_data.get("zabbix_export", export_data)
                 patch_log = []
 
-                # Fix 3: int colors — belt-and-suspenders in case pass (a) missed any.
-                #
-                # PyYAML 1.1 parses unquoted hex strings two ways:
-                #   • OCTAL  when string starts with 0 and all digits are 0-7
-                #             e.g. "000000" → int 0,  "000066" → int 54
-                #             max 6-digit octal value:  077777 = 32767 decimal
-                #   • DECIMAL when string starts with 1-9 (no leading zero)
-                #             e.g. "888800" → int 888800
-                #             min 6-digit decimal value: 100000
-                #
-                # Recovery is unambiguous because the two ranges don't overlap
-                # (0-32767 for octal vs 100000-999999 for decimal).
-                # Strings starting with 0 but containing 8/9 are left as strings
-                # by PyYAML (e.g. "008800"), so they never appear as ints here.
-                _COLOR_FIELDS = {"color", "border_color", "fill_color",
-                                 "font_color", "background_color"}
-                _OCTAL_MAX = 0o77777   # = 32767 decimal, max value of 6-char octal string
-
-                def _fix_int_colors(obj):
-                    if isinstance(obj, dict):
-                        for k, v in list(obj.items()):
-                            if k in _COLOR_FIELDS and isinstance(v, int):
-                                # Recover original 6-character hex string
-                                color_str = (f"{v:06o}" if v <= _OCTAL_MAX
-                                             else f"{v:06d}")
-                                obj[k] = color_str
-                                patch_log.append(f"intcolor:{k}={v}→{color_str}")
-                            else:
-                                _fix_int_colors(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            _fix_int_colors(item)
-
-                _fix_int_colors(root)
-
-                # Fix 1: {} → [] for all known array fields at every level
-                def _fix_arrays(obj, fields):
-                    for fld in fields:
-                        val = obj.get(fld)
-                        if val is None:
-                            obj[fld] = []
-                            patch_log.append(f"missing:{fld}")
-                        elif isinstance(val, dict) and not val:
-                            obj[fld] = []
-                            patch_log.append(f"dict→list:{fld}")
+                def _ensure_list(obj, field):
+                    """Ensure field exists and is a list (not None/missing)."""
+                    val = obj.get(field)
+                    if val is None:
+                        obj[field] = []
+                        patch_log.append(f"missing:{field}")
+                    elif not isinstance(val, list):
+                        obj[field] = list(val) if hasattr(val, '__iter__') else []
+                        patch_log.append(f"nonlist:{field}")
 
                 for smap in root.get("maps", []):
-                    _fix_arrays(smap, ("links", "shapes", "lines", "urls",
-                                       "selements"))
+                    _ensure_list(smap, "links")
+                    _ensure_list(smap, "shapes")
+                    _ensure_list(smap, "lines")
+                    _ensure_list(smap, "urls")
+                    _ensure_list(smap, "selements")
+
                     for sel in smap.get("selements", []):
                         etype = str(sel.get("elementtype", "4"))
                         if etype == "4":
-                            # Image selements: `elements` field must be ABSENT.
-                            # Zabbix 7.0 rejects elements:[] with "cannot be empty"
-                            # for image-type selements.  Remove it whether it was
-                            # present in source as {  } or injected by a prior run.
+                            # Image selements: elements field must be ABSENT.
                             if "elements" in sel:
                                 del sel["elements"]
                                 patch_log.append("removed:type4-elements")
                         else:
-                            # Types 0/1/2/3 require a non-empty elements array.
-                            # Normalise missing/empty-dict to [] so the filter below
-                            # can detect and drop orphaned selements.
-                            _fix_arrays(sel, ("elements",))
-                        _fix_arrays(sel, ("urls", "tags"))
-                    for link in smap.get("links", []):
-                        _fix_arrays(link, ("linktriggers",))
+                            _ensure_list(sel, "elements")
+                        _ensure_list(sel, "urls")
+                        _ensure_list(sel, "tags")
 
-                    # Drop orphaned selements: types 0/1/2/3 with empty elements
-                    # reference objects that were deleted in source — skip them.
+                    for link in smap.get("links", []):
+                        _ensure_list(link, "linktriggers")
+
+                    # Drop orphaned selements (type 0/1/2/3 with empty elements)
                     before = len(smap.get("selements", []))
                     smap["selements"] = [
                         sel for sel in smap.get("selements", [])
@@ -1344,34 +1307,27 @@ class ZabbixMigrator:
                     if dropped:
                         patch_log.append(f"dropped:{dropped}×empty-selements")
 
-                    # Drop URL entries with empty/missing url string.
-                    # These fail Zabbix 7.0 validation with "Wrong value for url".
+                    # Drop URL entries with empty/whitespace url string
                     for sel in smap.get("selements", []):
                         before_urls = len(sel.get("urls", []))
                         sel["urls"] = [
                             u for u in sel.get("urls", [])
-                            if u.get("url", "").strip()
+                            if isinstance(u.get("url"), str) and u["url"].strip()
                         ]
                         if len(sel["urls"]) < before_urls:
                             patch_log.append("dropped:bad-url")
+
                     for obj in smap.get("links", []) + [smap]:
                         if "urls" in obj and isinstance(obj["urls"], list):
                             before_urls = len(obj["urls"])
                             obj["urls"] = [
                                 u for u in obj["urls"]
-                                if u.get("url", "").strip()
+                                if isinstance(u.get("url"), str) and u["url"].strip()
                             ]
                             if len(obj["urls"]) < before_urls:
                                 patch_log.append("dropped:bad-url")
 
-                # Always re-dump so the patched Python objects are serialised
-                exported = yaml.dump(export_data, allow_unicode=True,
-                                     default_flow_style=False)
-
-                # Pass (b): re-quote after yaml.dump — yaml.dump may output
-                # unquoted hex strings like `border_color: 008800` that Zabbix
-                # 7.0 rejects as non-string.
-                exported = _prequote_zabbix_yaml(exported)
+                exported = json.dumps(export_data)
 
                 if patch_log:
                     summary = ", ".join(
@@ -1382,17 +1338,17 @@ class ZabbixMigrator:
                         )
                     )
                     logger.debug("Map '%s': patched: %s", map_name, summary)
+
             except Exception as exc:
-                # If the patch fails the original (only pre-quoted) YAML is
-                # used — colours may still fail. Emit a warning so it is visible.
-                logger.warning("Map '%s': schema patch failed, using raw export: %s",
+                # If patch fails, try with raw JSON export as-is
+                logger.warning("Map '%s': JSON patch failed, using raw export: %s",
                                map_name, exc)
                 print(f"  [Maps] WARNING: patch failed for '{map_name}': {exc}")
 
             # Import
             for attempt in range(2):
                 try:
-                    self._raw_import(fmt="yaml", source=exported, rules=MAP_IMPORT_RULES)
+                    self._raw_import(fmt="json", source=exported, rules=MAP_IMPORT_RULES)
                     ok_count += 1
                     ok_names.append(map_name)
                     break
@@ -2125,10 +2081,12 @@ class ZabbixMigrator:
         object_type: 'templates', 'hosts', or 'maps'
         ids:         list of id strings to export
         fmt:         export format — 'yaml' (default) or 'json'.
-                     YAML is preferred throughout: the 6.4 JSON exporter silently
-                     omits empty arrays (e.g. selement.elements, host interfaces)
-                     that Zabbix 7.0 requires, causing import schema errors.
-                     The YAML exporter always writes empty collections explicitly.
+                     Maps use JSON: PyYAML 1.1 corrupts unquoted hex color strings
+                     (e.g. "000000" → int 0) that Zabbix 7.0 rejects as non-string.
+                     JSON has no type ambiguity; colors are always strings.
+                     Templates/hosts use YAML: the 6.4 YAML exporter writes empty
+                     arrays as `{  }` which we fix in the patch pipeline, whereas
+                     the JSON exporter omits empty arrays entirely (harder to detect).
         """
         import requests as _requests
 
