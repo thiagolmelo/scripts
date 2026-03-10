@@ -1458,14 +1458,11 @@ class ZabbixMigrator:
             print("    - Resolving names to destination IDs...")
             resolved, hard_missing, soft_warnings = self._resolve_ids(converted)
 
-            # Soft warnings: shared users/groups not in destination — drop them,
-            # log the warning, but still create the dashboard.
+            # Soft warnings: shared groups not found in destination — drop them,
+            # log quietly, and continue creating the dashboard.
             if soft_warnings:
-                print(f"    ! {len(soft_warnings)} shared user(s)/group(s) not in "
-                      f"destination — dropped (dashboard will still be created):")
                 for w in soft_warnings:
-                    print(f"      ~ {w}")
-                logger.info("[Dashboard '%s'] soft warnings: %s", name, soft_warnings)
+                    logger.info("[Dashboard '%s'] %s", name, w)
 
             # Hard failures: widget data objects missing — skip dashboard.
             if hard_missing:
@@ -1485,13 +1482,6 @@ class ZabbixMigrator:
             self._create_dashboard(resolved, owner_userid, extra_groups)
             self.results["dashboards"]["migrated"] += 1
             self.results["dashboards"]["names"].append(name)
-            if soft_warnings:
-                # Record warnings in the error list as informational (not a failure)
-                self.results["dashboards"]["errors"].append({
-                    "name": name,
-                    "reason": "Created with warnings (some user shares dropped)",
-                    "details": soft_warnings
-                })
 
         except Exception as exc:
             print(f"    x Error: {exc}")
@@ -1624,20 +1614,12 @@ class ZabbixMigrator:
         """Convert every object ID in a dashboard to a portable name."""
         converted = dashboard.copy()
 
-        # Shared users
-        if dashboard.get("users"):
-            converted["users"] = []
-            for user in dashboard["users"]:
-                try:
-                    data = self.source.user.get(
-                        userids=user["userid"], output=["username"])
-                    if data:
-                        converted["users"].append({
-                            "username":   data[0]["username"],
-                            "permission": user["permission"]
-                        })
-                except Exception:
-                    pass
+        # Shared users — intentionally skipped.
+        # Individual user shares are not migrated: the dashboard owner is
+        # normalised to the fallback account, and access is granted via group
+        # shares instead.  This avoids failures caused by users existing in
+        # source but not in destination.
+        converted["users"] = []
 
         # Shared user groups
         if dashboard.get("userGroups"):
@@ -1765,20 +1747,8 @@ class ZabbixMigrator:
         hard_missing: List[str] = []
         soft_warnings: List[str] = []
 
-        # Shared users — drop if not in destination (soft warning only)
-        if dashboard.get("users"):
-            converted["users"] = []
-            for user in dashboard["users"]:
-                data = self.dest.user.get(
-                    filter={"username": user["username"]}, output=["userid"])
-                if data:
-                    converted["users"].append({
-                        "userid":     data[0]["userid"],
-                        "permission": user["permission"]
-                    })
-                else:
-                    soft_warnings.append(
-                        f"Shared user not in destination (dropped): '{user['username']}'")
+        # Shared users — always empty (dropped at resolve_names stage).
+        converted["users"] = []
 
         # Shared user groups — drop if not in destination (soft warning only)
         if dashboard.get("userGroups"):
@@ -1982,9 +1952,8 @@ class ZabbixMigrator:
             "auto_start":     int(dashboard.get("auto_start", 1)),
         }
 
-        # Merge existing shared users
-        if dashboard.get("users"):
-            clean["users"] = dashboard["users"]
+        # Individual user shares are intentionally not migrated (dropped at
+        # resolve_names stage).  Access is granted via group shares only.
 
         # Merge existing shared groups + groups added for fallback owner
         all_groups = list(dashboard.get("userGroups") or [])
