@@ -1456,17 +1456,28 @@ class ZabbixMigrator:
             converted = self._resolve_names(dashboard)
 
             print("    - Resolving names to destination IDs...")
-            resolved, missing = self._resolve_ids(converted)
+            resolved, hard_missing, soft_warnings = self._resolve_ids(converted)
 
-            if missing:
-                print(f"    x Skipped -- {len(missing)} missing objects in destination:")
-                for obj in missing:
+            # Soft warnings: shared users/groups not in destination — drop them,
+            # log the warning, but still create the dashboard.
+            if soft_warnings:
+                print(f"    ! {len(soft_warnings)} shared user(s)/group(s) not in "
+                      f"destination — dropped (dashboard will still be created):")
+                for w in soft_warnings:
+                    print(f"      ~ {w}")
+                logger.info("[Dashboard '%s'] soft warnings: %s", name, soft_warnings)
+
+            # Hard failures: widget data objects missing — skip dashboard.
+            if hard_missing:
+                print(f"    x Skipped -- {len(hard_missing)} missing widget objects "
+                      f"in destination:")
+                for obj in hard_missing:
                     print(f"      - {obj}")
                 self.results["dashboards"]["failed"] += 1
                 self.results["dashboards"]["errors"].append({
                     "name": name,
-                    "reason": "Missing objects in destination",
-                    "details": missing
+                    "reason": "Missing widget objects in destination",
+                    "details": hard_missing
                 })
                 return
 
@@ -1474,6 +1485,13 @@ class ZabbixMigrator:
             self._create_dashboard(resolved, owner_userid, extra_groups)
             self.results["dashboards"]["migrated"] += 1
             self.results["dashboards"]["names"].append(name)
+            if soft_warnings:
+                # Record warnings in the error list as informational (not a failure)
+                self.results["dashboards"]["errors"].append({
+                    "name": name,
+                    "reason": "Created with warnings (some user shares dropped)",
+                    "details": soft_warnings
+                })
 
         except Exception as exc:
             print(f"    x Error: {exc}")
@@ -1732,12 +1750,22 @@ class ZabbixMigrator:
     # Dashboard: name/ID resolution (phase 2 — destination side)
     # -----------------------------------------------------------------------
 
-    def _resolve_ids(self, dashboard: Dict) -> Tuple[Dict, List[str]]:
-        """Convert portable names back to IDs valid in the destination."""
-        converted = dashboard.copy()
-        missing: List[str] = []
+    def _resolve_ids(self, dashboard: Dict) -> Tuple[Dict, List[str], List[str]]:
+        """Convert portable names back to IDs valid in the destination.
 
-        # Shared users
+        Returns:
+            (converted_dashboard, hard_missing, soft_warnings)
+
+            hard_missing  - widget data objects (hosts, items, graphs, maps…)
+                            not found in destination; block dashboard creation.
+            soft_warnings - individual shared users/groups not found in
+                            destination; dropped silently, dashboard still created.
+        """
+        converted = dashboard.copy()
+        hard_missing: List[str] = []
+        soft_warnings: List[str] = []
+
+        # Shared users — drop if not in destination (soft warning only)
         if dashboard.get("users"):
             converted["users"] = []
             for user in dashboard["users"]:
@@ -1749,9 +1777,10 @@ class ZabbixMigrator:
                         "permission": user["permission"]
                     })
                 else:
-                    missing.append(f"Shared user: '{user['username']}'")
+                    soft_warnings.append(
+                        f"Shared user not in destination (dropped): '{user['username']}'")
 
-        # Shared user groups
+        # Shared user groups — drop if not in destination (soft warning only)
         if dashboard.get("userGroups"):
             converted["userGroups"] = []
             for group in dashboard["userGroups"]:
@@ -1763,9 +1792,10 @@ class ZabbixMigrator:
                         "permission": group["permission"]
                     })
                 else:
-                    missing.append(f"Shared user group: '{group['name']}'")
+                    soft_warnings.append(
+                        f"Shared group not in destination (dropped): '{group['name']}'")
 
-        # Pages and widgets
+        # Pages and widgets — missing data objects are hard failures
         if dashboard.get("pages"):
             converted["pages"] = []
             for page in dashboard["pages"]:
@@ -1775,10 +1805,10 @@ class ZabbixMigrator:
                     for widget in page["widgets"]:
                         w, w_miss = self._widget_names_to_ids(widget)
                         cp["widgets"].append(w)
-                        missing.extend(w_miss)
+                        hard_missing.extend(w_miss)
                 converted["pages"].append(cp)
 
-        return converted, missing
+        return converted, hard_missing, soft_warnings
 
     def _widget_names_to_ids(self, widget: Dict) -> Tuple[Dict, List[str]]:
         """Resolve portable names to destination IDs. Drop _INACCESSIBLE fields."""
