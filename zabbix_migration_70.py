@@ -2325,6 +2325,465 @@ class ZabbixMigrator:
 
 
 # ---------------------------------------------------------------------------
+# Migration health-check comparator
+# ---------------------------------------------------------------------------
+
+# Item type IDs that exist in 6.4 but were unified in 7.0
+_ITEM_TYPE_NAMES = {
+    0:  "Zabbix agent",
+    1:  "SNMPv1",           # 6.4 only — maps to type 20 in 7.0
+    2:  "Zabbix trapper",
+    3:  "Simple check",
+    4:  "SNMPv2c",          # 6.4 only — maps to type 20 in 7.0
+    5:  "Zabbix internal",
+    6:  "SNMPv3",           # 6.4 only — maps to type 20 in 7.0
+    7:  "Zabbix agent (active)",
+    9:  "Web item",
+    10: "External check",
+    11: "Database monitor",
+    12: "IPMI agent",
+    13: "SSH agent",
+    14: "Telnet agent",
+    15: "Calculated",
+    16: "JMX agent",
+    17: "SNMP trap",
+    18: "Dependent",
+    19: "HTTP agent",
+    20: "SNMP (unified)",   # 7.0 only — replaces 1+4+6 from 6.4
+    21: "Script",
+}
+
+# Groups of (src_types, dst_types, label) for cross-version comparison.
+# Types 1/4/6 in 6.4 → type 20 in 7.0 (SNMP was split into three, then unified).
+_ITEM_TYPE_GROUPS = [
+    ((0,),    (0,),   "Zabbix agent"),
+    ((1,4,6), (20,),  "SNMP (v1+v2c+v3 → unified)"),
+    ((7,),    (7,),   "Zabbix agent (active)"),
+    ((2,),    (2,),   "Zabbix trapper"),
+    ((17,),   (17,),  "SNMP trap"),
+    ((5,),    (5,),   "Zabbix internal"),
+    ((3,),    (3,),   "Simple check"),
+    ((15,),   (15,),  "Calculated"),
+    ((18,),   (18,),  "Dependent"),
+    ((19,),   (19,),  "HTTP agent"),
+    ((21,),   (21,),  "Script"),
+    ((9,),    (9,),   "Web item"),
+    ((10,),   (10,),  "External check"),
+    ((11,),   (11,),  "Database monitor"),
+    ((12,),   (12,),  "IPMI agent"),
+    ((13,),   (13,),  "SSH agent"),
+    ((14,),   (14,),  "Telnet agent"),
+    ((16,),   (16,),  "JMX agent"),
+]
+
+
+class ZabbixComparator:
+    """
+    Collects monitoring statistics from two Zabbix instances (source 6.4 and
+    destination 7.0) and prints a side-by-side comparison to validate that a
+    migration is complete.
+
+    Usage:
+        comp = ZabbixComparator(src_api, dst_api, cia_name)
+        comp.run()
+    """
+
+    # ── colour helpers for terminal output ──────────────────────────────────
+    _RED    = "\033[91m"
+    _YEL    = "\033[93m"
+    _GRN    = "\033[92m"
+    _RST    = "\033[0m"
+
+    def __init__(self, src_api, dst_api, cia_name: str):
+        self.src  = src_api
+        self.dst  = dst_api
+        self.cia  = cia_name
+        self._warnings: List[str] = []
+
+    # ── public entry point ───────────────────────────────────────────────────
+
+    def run(self):
+        print(f"\n{'═' * 74}")
+        print(f"  Migration Health Check — CIA: {self.cia}")
+        print(f"{'═' * 74}")
+
+        sections = [
+            ("HOSTS",              self._section_hosts),
+            ("TEMPLATES",          self._section_templates),
+            ("ITEMS",              self._section_items),
+            ("ITEM TYPES",         self._section_item_types),
+            ("TRIGGERS",           self._section_triggers),
+            ("DISCOVERY RULES",    self._section_discovery_rules),
+            ("GRAPHS (custom)",    self._section_graphs),
+            ("HOST GROUPS",        self._section_host_groups),
+            ("MAPS",               self._section_maps),
+            ("DASHBOARDS",         self._section_dashboards),
+            ("PROXIES",            self._section_proxies),
+            ("USER GROUPS",        self._section_user_groups),
+        ]
+
+        for title, fn in sections:
+            print(f"\n  {'─' * 72}")
+            print(f"  {title}")
+            print(f"  {'─' * 72}")
+            try:
+                rows = fn()
+                self._print_table(rows)
+            except Exception as exc:
+                print(f"  [ERROR fetching {title}: {exc}]")
+
+        if self._warnings:
+            print(f"\n  {'═' * 72}")
+            print(f"  ⚠  DISCREPANCIES  ({len(self._warnings)} found)")
+            print(f"  {'═' * 72}")
+            for w in self._warnings:
+                print(f"  {self._YEL}!{self._RST}  {w}")
+
+        print(f"\n{'═' * 74}")
+
+    # ── table rendering ──────────────────────────────────────────────────────
+
+    def _print_table(self, rows: List[Tuple]):
+        """
+        rows: list of (label, src_val, dst_val) or (label,) for separators.
+        src_val / dst_val may be int or str.
+        """
+        COL_LBL = 44
+        COL_VAL = 9
+
+        hdr = (f"  {'Metric':<{COL_LBL}}  "
+               f"{'Source':>{COL_VAL}}  {'Dest':>{COL_VAL}}  {'Diff':>{COL_VAL}}")
+        print(hdr)
+        print(f"  {'·' * (COL_LBL + COL_VAL * 3 + 8)}")
+
+        for row in rows:
+            if len(row) == 1:
+                # section sub-header / blank
+                print(f"  {row[0]}")
+                continue
+
+            label, src_v, dst_v = row
+
+            # Numeric diff + colour
+            if isinstance(src_v, int) and isinstance(dst_v, int):
+                diff = dst_v - src_v
+                if diff == 0:
+                    diff_str = f"{'=':>{COL_VAL}}"
+                    colour   = self._GRN
+                elif diff > 0:
+                    diff_str = f"{'+' + str(diff):>{COL_VAL}}"
+                    colour   = self._YEL   # more in dest — may be fine (disabled hosts)
+                else:
+                    diff_str = f"{str(diff):>{COL_VAL}}"
+                    colour   = self._RED
+                    self._warnings.append(f"{label}: src={src_v} dst={dst_v} (Δ{diff})")
+                src_s = f"{src_v:>{COL_VAL}}"
+                dst_s = f"{dst_v:>{COL_VAL}}"
+                print(f"  {label:<{COL_LBL}}  {src_s}  {dst_s}  {colour}{diff_str}{self._RST}")
+            else:
+                # String values (e.g. version info)
+                match = "  =" if str(src_v) == str(dst_v) else "  ≠"
+                print(f"  {label:<{COL_LBL}}  {str(src_v):>{COL_VAL}}  {str(dst_v):>{COL_VAL}}  {match}")
+
+    # ── stat-collection helpers ──────────────────────────────────────────────
+
+    def _cnt(self, api, method: str, **kwargs) -> int:
+        """Call <method> with countOutput=True and return the integer result."""
+        fn = api
+        for part in method.split("."):
+            fn = getattr(fn, part)
+        result = fn(countOutput=True, **kwargs)
+        return int(result)
+
+    # ── individual sections ──────────────────────────────────────────────────
+
+    def _section_hosts(self) -> List[Tuple]:
+        rows = []
+        # Note: we count only non-LLD-discovered hosts (flags=0).
+        # Discovered hosts (flags=4) are LLD prototypes — not migrated.
+        for label, kwargs in [
+            ("Enabled",                      dict(filter={"status": 0, "flags": 0})),
+            ("Disabled",                     dict(filter={"status": 1, "flags": 0})),
+            ("  ↳ Enabled — via proxy",      dict(filter={"status": 0, "flags": 0},
+                                                   monitored_hosts=True,
+                                                   proxyids=True)),
+            ("  ↳ Enabled — direct (no proxy)",
+                                              dict(filter={"status": 0, "flags": 0,
+                                                           "proxyid": "0"})),
+            ("  ↳ Enabled — with templates", dict(filter={"status": 0, "flags": 0},
+                                                   templated_hosts=True)),
+            ("  ↳ Enabled — no templates",   None),   # computed below
+            ("Discovered by LLD (flags=4)",  dict(filter={"flags": 4})),
+        ]:
+            if kwargs is None:
+                continue    # placeholder; fill below
+            # proxy filter quirk: proxyids=True is not valid; use a different approach
+            rows.append((label, None, None))  # will replace
+
+        # Re-fetch cleanly
+        rows = []
+
+        s_en   = self._cnt(self.src, "host.get", filter={"status": "0", "flags": "0"})
+        d_en   = self._cnt(self.dst, "host.get", filter={"status": "0", "flags": "0"})
+        s_dis  = self._cnt(self.src, "host.get", filter={"status": "1", "flags": "0"})
+        d_dis  = self._cnt(self.dst, "host.get", filter={"status": "1", "flags": "0"})
+
+        # With templates
+        s_wtpl = self._cnt(self.src, "host.get",
+                           filter={"status": "0", "flags": "0"}, templated_hosts=True)
+        d_wtpl = self._cnt(self.dst, "host.get",
+                           filter={"status": "0", "flags": "0"}, templated_hosts=True)
+
+        # No templates = enabled − with-templates
+        s_ntpl = max(0, s_en - s_wtpl)
+        d_ntpl = max(0, d_en - d_wtpl)
+
+        # LLD discovered
+        s_lld  = self._cnt(self.src, "host.get", filter={"flags": "4"})
+        d_lld  = self._cnt(self.dst, "host.get", filter={"flags": "4"})
+
+        rows += [
+            ("Total (enabled)",                    s_en,   d_en),
+            ("Total (disabled)",                   s_dis,  d_dis),
+            ("  ↳ Enabled — with template(s)",     s_wtpl, d_wtpl),
+            ("  ↳ Enabled — no templates",         s_ntpl, d_ntpl),
+            ("Discovered by LLD (not migrated)",   s_lld,  d_lld),
+        ]
+
+        # Try to split by proxy / direct (proxy monitoring)
+        try:
+            # Get list of proxy IDs on source
+            src_proxies = self.src.proxy.get(output=["proxyid"])
+            if src_proxies:
+                src_proxy_ids = [p["proxyid"] for p in src_proxies]
+                s_proxy = self._cnt(self.src, "host.get",
+                                    filter={"status": "0", "flags": "0"},
+                                    proxyids=src_proxy_ids)
+            else:
+                s_proxy = 0
+            dst_proxies = self.dst.proxy.get(output=["proxyid"])
+            if dst_proxies:
+                dst_proxy_ids = [p["proxyid"] for p in dst_proxies]
+                d_proxy = self._cnt(self.dst, "host.get",
+                                    filter={"status": "0", "flags": "0"},
+                                    proxyids=dst_proxy_ids)
+            else:
+                d_proxy = 0
+            rows += [
+                ("  ↳ Enabled — monitored via proxy",  s_proxy, d_proxy),
+                ("  ↳ Enabled — direct (no proxy)",    s_en - s_proxy, d_en - d_proxy),
+            ]
+        except Exception:
+            pass  # proxy info not critical
+
+        return rows
+
+    def _section_templates(self) -> List[Tuple]:
+        s_total = self._cnt(self.src, "template.get")
+        d_total = self._cnt(self.dst, "template.get")
+
+        # Templates linked to at least one host
+        src_tpls = self.src.template.get(output=["templateid"])
+        dst_tpls = self.dst.template.get(output=["templateid"])
+
+        s_linked = sum(
+            1 for t in src_tpls
+            if int(self.src.host.get(countOutput=True, templateids=t["templateid"],
+                                     filter={"flags": "0"})) > 0
+        ) if src_tpls else 0
+
+        d_linked = sum(
+            1 for t in dst_tpls
+            if int(self.dst.host.get(countOutput=True, templateids=t["templateid"],
+                                     filter={"flags": "0"})) > 0
+        ) if dst_tpls else 0
+
+        return [
+            ("Total",                      s_total,            d_total),
+            ("  ↳ Linked to ≥1 host",     s_linked,           d_linked),
+            ("  ↳ Unlinked (orphan)",      s_total - s_linked, d_total - d_linked),
+        ]
+
+    def _section_items(self) -> List[Tuple]:
+        # Scope: items on non-LLD-discovered regular hosts (flags=0 host)
+        # Item flags: 0=regular, 4=discovered by LLD; 2=prototype (not counted here)
+        base = dict(host_flags=["0"])
+
+        # Total enabled/disabled
+        s_en  = self._cnt(self.src, "item.get", filter={"status": "0", "flags": "0"},
+                          **base)
+        d_en  = self._cnt(self.dst, "item.get", filter={"status": "0", "flags": "0"},
+                          **base)
+        s_dis = self._cnt(self.src, "item.get", filter={"status": "1", "flags": "0"},
+                          **base)
+        d_dis = self._cnt(self.dst, "item.get", filter={"status": "1", "flags": "0"},
+                          **base)
+
+        # Unsupported (state=1); only enabled items can be unsupported
+        s_uns = self._cnt(self.src, "item.get",
+                          filter={"status": "0", "flags": "0", "state": "1"}, **base)
+        d_uns = self._cnt(self.dst, "item.get",
+                          filter={"status": "0", "flags": "0", "state": "1"}, **base)
+
+        # LLD-discovered items (flags=4) — informational
+        s_lld = self._cnt(self.src, "item.get", filter={"flags": "4"}, **base)
+        d_lld = self._cnt(self.dst, "item.get", filter={"flags": "4"}, **base)
+
+        # Templated vs direct
+        # "inherited" items come from templates (templateid != 0)
+        # We approximate: fetch with templated=True filter
+        s_tpl = self._cnt(self.src, "item.get",
+                          filter={"status": "0", "flags": "0"}, templated=True, **base)
+        d_tpl = self._cnt(self.dst, "item.get",
+                          filter={"status": "0", "flags": "0"}, templated=True, **base)
+
+        return [
+            ("Regular items — enabled",          s_en,  d_en),
+            ("Regular items — disabled",         s_dis, d_dis),
+            ("  ↳ Enabled — unsupported",        s_uns, d_uns),
+            ("  ↳ Enabled — from templates",     s_tpl, d_tpl),
+            ("  ↳ Enabled — direct (no tpl)",    s_en - s_tpl, d_en - d_tpl),
+            ("LLD-discovered items (all states)", s_lld, d_lld),
+        ]
+
+    def _section_item_types(self) -> List[Tuple]:
+        """Break down enabled regular items by monitoring type."""
+        rows = [("  (enabled regular items on non-LLD hosts)",)]
+        base = dict(host_flags=["0"], filter={"status": "0", "flags": "0"})
+
+        for src_types, dst_types, label in _ITEM_TYPE_GROUPS:
+            try:
+                s_cnt = sum(
+                    self._cnt(self.src, "item.get", filter={"status": "0", "flags": "0",
+                                                            "type": str(t)},
+                              host_flags=["0"])
+                    for t in src_types
+                )
+                d_cnt = sum(
+                    self._cnt(self.dst, "item.get", filter={"status": "0", "flags": "0",
+                                                            "type": str(t)},
+                              host_flags=["0"])
+                    for t in dst_types
+                )
+                if s_cnt > 0 or d_cnt > 0:
+                    rows.append((f"  {label}", s_cnt, d_cnt))
+            except Exception:
+                rows.append((f"  {label}", "?", "?"))
+
+        return rows
+
+    def _section_triggers(self) -> List[Tuple]:
+        # Only triggers on non-template hosts; flags=0 = plain (not discovered)
+        s_en   = self._cnt(self.src, "trigger.get",
+                           filter={"status": "0", "flags": "0"}, only_true=False)
+        d_en   = self._cnt(self.dst, "trigger.get",
+                           filter={"status": "0", "flags": "0"}, only_true=False)
+        s_dis  = self._cnt(self.src, "trigger.get",
+                           filter={"status": "1", "flags": "0"}, only_true=False)
+        d_dis  = self._cnt(self.dst, "trigger.get",
+                           filter={"status": "1", "flags": "0"}, only_true=False)
+        # In PROBLEM state (value=1, status=0)
+        s_prob = self._cnt(self.src, "trigger.get",
+                           filter={"status": "0", "value": "1", "flags": "0"},
+                           only_true=False)
+        d_prob = self._cnt(self.dst, "trigger.get",
+                           filter={"status": "0", "value": "1", "flags": "0"},
+                           only_true=False)
+        # LLD-discovered triggers
+        s_lld  = self._cnt(self.src, "trigger.get", filter={"flags": "4"}, only_true=False)
+        d_lld  = self._cnt(self.dst, "trigger.get", filter={"flags": "4"}, only_true=False)
+
+        return [
+            ("Enabled (regular)",         s_en,   d_en),
+            ("Disabled (regular)",        s_dis,  d_dis),
+            ("  ↳ Currently in PROBLEM",  s_prob, d_prob),
+            ("LLD-discovered triggers",   s_lld,  d_lld),
+        ]
+
+    def _section_discovery_rules(self) -> List[Tuple]:
+        # LLD rules live as items with flags=1
+        s_en  = self._cnt(self.src, "discoveryrule.get", filter={"status": "0"})
+        d_en  = self._cnt(self.dst, "discoveryrule.get", filter={"status": "0"})
+        s_dis = self._cnt(self.src, "discoveryrule.get", filter={"status": "1"})
+        d_dis = self._cnt(self.dst, "discoveryrule.get", filter={"status": "1"})
+        s_uns = self._cnt(self.src, "discoveryrule.get",
+                          filter={"status": "0", "state": "1"})
+        d_uns = self._cnt(self.dst, "discoveryrule.get",
+                          filter={"status": "0", "state": "1"})
+        return [
+            ("Enabled",                      s_en,  d_en),
+            ("Disabled",                     s_dis, d_dis),
+            ("  ↳ Enabled — unsupported",    s_uns, d_uns),
+        ]
+
+    def _section_graphs(self) -> List[Tuple]:
+        # Custom graphs (flags=0); excludes template graphs and LLD prototypes
+        s_tot = self._cnt(self.src, "graph.get", filter={"flags": "0"})
+        d_tot = self._cnt(self.dst, "graph.get", filter={"flags": "0"})
+        return [("Custom graphs (flags=0)", s_tot, d_tot)]
+
+    def _section_host_groups(self) -> List[Tuple]:
+        s_tot  = self._cnt(self.src, "hostgroup.get", real_hosts=True)
+        d_tot  = self._cnt(self.dst, "hostgroup.get", real_hosts=True)
+
+        # Non-empty: groups containing at least one enabled host
+        src_grps = self.src.hostgroup.get(output=["groupid"], real_hosts=True)
+        dst_grps = self.dst.hostgroup.get(output=["groupid"], real_hosts=True)
+
+        s_nonempty = sum(
+            1 for g in src_grps
+            if int(self.src.host.get(countOutput=True, groupids=g["groupid"],
+                                     filter={"status": "0", "flags": "0"})) > 0
+        )
+        d_nonempty = sum(
+            1 for g in dst_grps
+            if int(self.dst.host.get(countOutput=True, groupids=g["groupid"],
+                                     filter={"status": "0", "flags": "0"})) > 0
+        )
+        return [
+            ("Total (real-host groups)",  s_tot,              d_tot),
+            ("  ↳ Non-empty",             s_nonempty,         d_nonempty),
+            ("  ↳ Empty",                 s_tot - s_nonempty, d_tot - d_nonempty),
+        ]
+
+    def _section_maps(self) -> List[Tuple]:
+        s_tot = self._cnt(self.src, "map.get")
+        d_tot = self._cnt(self.dst, "map.get")
+        return [("Total", s_tot, d_tot)]
+
+    def _section_dashboards(self) -> List[Tuple]:
+        s_tot = self._cnt(self.src, "dashboard.get")
+        d_tot = self._cnt(self.dst, "dashboard.get")
+        return [("Total", s_tot, d_tot)]
+
+    def _section_proxies(self) -> List[Tuple]:
+        # Proxy mode: 5=active (in 6.4), 6=passive (in 6.4)
+        # In 7.0: operating_mode 0=active, 1=passive
+        try:
+            s_act = self._cnt(self.src, "proxy.get", filter={"status": "5"})
+            s_pas = self._cnt(self.src, "proxy.get", filter={"status": "6"})
+        except Exception:
+            s_act = self._cnt(self.src, "proxy.get")
+            s_pas = 0
+        try:
+            d_act = self._cnt(self.dst, "proxy.get", filter={"operating_mode": "0"})
+            d_pas = self._cnt(self.dst, "proxy.get", filter={"operating_mode": "1"})
+        except Exception:
+            d_act = self._cnt(self.dst, "proxy.get")
+            d_pas = 0
+
+        return [
+            ("Active proxies",  s_act, d_act),
+            ("Passive proxies", s_pas, d_pas),
+        ]
+
+    def _section_user_groups(self) -> List[Tuple]:
+        s_tot = self._cnt(self.src, "usergroup.get")
+        d_tot = self._cnt(self.dst, "usergroup.get")
+        return [("Total", s_tot, d_tot)]
+
+
+# ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
 
@@ -2380,6 +2839,12 @@ Examples:
   # Full migration with debug output
   python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --debug
 
+  # Health-check only: compare source vs destination stats (no migration)
+  python zabbix_migration_70.py --env ppr --cia biz01 --compare
+
+  # Migrate everything then immediately run the health-check
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --compare
+
 Config files (same directory as this script):
   zabbix_credential.yml          username / password
   zabbix_instances_ppr.yml       CIA source/destination URLs for PPR
@@ -2424,6 +2889,14 @@ Config files (same directory as this script):
         help="Skip objects that already exist in destination (applies to all types)"
     )
     parser.add_argument(
+        "--compare", action="store_true",
+        help=(
+            "Run a migration health-check: fetch monitoring stats from both source "
+            "and destination and print a side-by-side comparison. "
+            "Can be combined with --migrate or used standalone."
+        )
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Enable verbose debug logging"
     )
@@ -2455,8 +2928,8 @@ Config files (same directory as this script):
         if not args.migrate:
             sys.exit(0)
 
-    # ── Validate migration args (only needed when --migrate is used) ─────────
-    if args.migrate:
+    # ── Validate migration/compare args ─────────────────────────────────────
+    if args.migrate or args.compare:
         missing = []
         if not args.env:
             missing.append("--env")
@@ -2465,20 +2938,20 @@ Config files (same directory as this script):
         if missing:
             print(
                 f"ERROR: {' and '.join(missing)} "
-                f"{'is' if len(missing) == 1 else 'are'} required when --migrate is used.",
+                f"{'is' if len(missing) == 1 else 'are'} required when --migrate or --compare is used.",
                 file=sys.stderr
             )
             sys.exit(1)
     else:
-        # Neither --pull-repository nor --migrate was given
+        # Neither --pull-repository nor --migrate nor --compare was given
         if args.pull_repository is None:
             parser.print_help()
             sys.exit(1)
         sys.exit(0)
 
     # Determine which migration types to run (in canonical order)
-    types_to_run = parse_migrate_types(args.migrate)
-    if not types_to_run:
+    types_to_run = parse_migrate_types(args.migrate) if args.migrate else []
+    if args.migrate and not types_to_run:
         print("ERROR: no valid migration types specified.", file=sys.stderr)
         sys.exit(1)
 
@@ -2512,7 +2985,12 @@ Config files (same directory as this script):
     # Header
     print("\n" + "=" * 70)
     print(f"  Zabbix Migration 6.4 -> 7.0")
-    print(f"  env={args.env}  cia={args.cia}  migrate={' '.join(types_to_run)}")
+    print(f"  env={args.env}  cia={args.cia}", end="")
+    if types_to_run:
+        print(f"  migrate={' '.join(types_to_run)}", end="")
+    if args.compare:
+        print(f"  compare=yes", end="")
+    print()
     if args.dashboard:
         print(f"  dashboard filter='{args.dashboard}'")
     if args.skip_existing:
@@ -2569,6 +3047,15 @@ Config files (same directory as this script):
                 elif mtype == "dashboards":
                     migrator.migrate_dashboards()
 
+            # Run comparison after migration (or standalone when no --migrate given)
+            if args.compare:
+                comp = ZabbixComparator(
+                    src_api=migrator.source,
+                    dst_api=migrator.dest,
+                    cia_name=cia_name,
+                )
+                comp.run()
+
         except Exception as exc:
             print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
             for t in types_to_run:
@@ -2588,36 +3075,38 @@ Config files (same directory as this script):
                             global_counts[t][k] = global_counts[t].get(k, 0) + v
                 migrator.logout()
 
-    # Global summary — console: stats only
-    print("\n" + "=" * 70)
-    print("  Global Summary")
-    print("=" * 70)
-    for t in types_to_run:
-        r  = global_results[t]
-        gc = global_counts[t]
-        if t == "hosts":
-            print(f"  [Source   ] [{t.capitalize():12}] "
-                  f"Total: {gc.get('src_total','?'):5}  "
-                  f"Enabled: {gc.get('src_enabled','?'):5}  "
-                  f"Disabled: {gc.get('src_disabled','?'):5}")
-            print(f"  [Dest     ] [{t.capitalize():12}] "
-                  f"Total: {gc.get('dst_total','?'):5}  "
-                  f"Enabled: {gc.get('dst_enabled','?'):5}  "
-                  f"Disabled: {gc.get('dst_disabled','?'):5}")
-        else:
-            print(f"  [Source   ] [{t.capitalize():12}] "
-                  f"Total: {gc.get('src_total','?'):5}")
-            print(f"  [Dest     ] [{t.capitalize():12}] "
-                  f"Total: {gc.get('dst_total','?'):5}")
-        print(f"  [Migration] [{t.capitalize():12}] "
-              f"Migrated: {r['migrated']:4}  "
-              f"Skipped: {r['skipped']:4}  "
-              f"Failed: {r['failed']:4}")
-        print()
-    print("=" * 70)
+    # Global migration summary — only if migration was actually run
+    if types_to_run:
+        print("\n" + "=" * 70)
+        print("  Global Summary")
+        print("=" * 70)
+        for t in types_to_run:
+            r  = global_results[t]
+            gc = global_counts[t]
+            if t == "hosts":
+                print(f"  [Source   ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('src_total','?'):5}  "
+                      f"Enabled: {gc.get('src_enabled','?'):5}  "
+                      f"Disabled: {gc.get('src_disabled','?'):5}")
+                print(f"  [Dest     ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('dst_total','?'):5}  "
+                      f"Enabled: {gc.get('dst_enabled','?'):5}  "
+                      f"Disabled: {gc.get('dst_disabled','?'):5}")
+            else:
+                print(f"  [Source   ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('src_total','?'):5}")
+                print(f"  [Dest     ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('dst_total','?'):5}")
+            print(f"  [Migration] [{t.capitalize():12}] "
+                  f"Migrated: {r['migrated']:4}  "
+                  f"Skipped: {r['skipped']:4}  "
+                  f"Failed: {r['failed']:4}")
+            print()
+        print("=" * 70)
 
     # Always flush full detail to log file
-    mlog.write(global_results)
+    if types_to_run:
+        mlog.write(global_results)
 
 
 if __name__ == "__main__":
