@@ -182,7 +182,7 @@ MAP_IMPORT_RULES = {
 
 logger = logging.getLogger(__name__)
 
-LOG_FILE = os.path.join(BASE_DIR, "migration.log")
+LOG_DIR = BASE_DIR   # log files written next to the script
 
 
 # ---------------------------------------------------------------------------
@@ -191,14 +191,19 @@ LOG_FILE = os.path.join(BASE_DIR, "migration.log")
 
 class MigrationLog:
     """
-    Appends structured, timestamped detail to migration.log.
+    Appends structured, timestamped detail to migration_{env}_{cia}.log.
     Console output shows statistics only; this file keeps the full detail
-    for post-run investigation.
+    for post-run investigation.  A separate file per env+cia keeps logs
+    manageable and makes it easy to grep for a specific instance.
     """
 
     def __init__(self, env: str, cia: str, types_run: List[str],
                  dashboard_filter: str = None):
-        self.path       = LOG_FILE
+        # One file per environment + CIA  (e.g. migration_ppr_biz01.log)
+        # When cia="all" the filename becomes migration_ppr_all.log
+        cia_slug   = cia.replace("/", "_").replace(" ", "_")
+        filename   = f"migration_{env}_{cia_slug}.log"
+        self.path  = os.path.join(LOG_DIR, filename)
         self.run_ts     = datetime.now()
         self.env        = env
         self.cia        = cia
@@ -2328,6 +2333,13 @@ class ZabbixMigrator:
 # Migration health-check comparator
 # ---------------------------------------------------------------------------
 
+# All valid section keys (used for --compare argument validation)
+COMPARE_ALL_SECTIONS = [
+    "hosts", "templates", "items", "item-types", "unsup-types",
+    "triggers", "discovery-rules", "unsup-items", "unsup-rules",
+    "graphs", "host-groups", "maps", "dashboards", "proxies", "user-groups",
+]
+
 # Item type IDs that exist in 6.4 but were unified in 7.0
 _ITEM_TYPE_NAMES = {
     0:  "Zabbix agent",
@@ -2385,7 +2397,8 @@ class ZabbixComparator:
 
     Usage:
         comp = ZabbixComparator(src_api, dst_api, cia_name)
-        comp.run()
+        comp.run()                              # all sections
+        comp.run(["hosts", "items"])            # selected sections only
     """
 
     # ── colour helpers for terminal output ──────────────────────────────────
@@ -2402,35 +2415,66 @@ class ZabbixComparator:
 
     # ── public entry point ───────────────────────────────────────────────────
 
-    def run(self):
-        print(f"\n{'═' * 74}")
-        print(f"  Migration Health Check — CIA: {self.cia}")
-        print(f"{'═' * 74}")
+    def run(self, sections: Optional[List[str]] = None):
+        """
+        sections: list of section keys from COMPARE_ALL_SECTIONS, or None = all.
+        Report sections (unsup-items, unsup-rules) print directly; they have no
+        src/dst table.
+        """
+        if sections is None or sections == []:
+            sections = COMPARE_ALL_SECTIONS
 
-        sections = [
-            ("HOSTS",              self._section_hosts),
-            ("TEMPLATES",          self._section_templates),
-            ("ITEMS",              self._section_items),
-            ("ITEM TYPES",         self._section_item_types),
-            ("TRIGGERS",           self._section_triggers),
-            ("DISCOVERY RULES",    self._section_discovery_rules),
-            ("GRAPHS (custom)",    self._section_graphs),
-            ("HOST GROUPS",        self._section_host_groups),
-            ("MAPS",               self._section_maps),
-            ("DASHBOARDS",         self._section_dashboards),
-            ("PROXIES",            self._section_proxies),
-            ("USER GROUPS",        self._section_user_groups),
+        # Normalise: lowercase, strip spaces
+        sections = [s.lower().strip() for s in sections]
+        unknown = [s for s in sections if s not in COMPARE_ALL_SECTIONS]
+        if unknown:
+            print(f"  [WARN] Unknown compare section(s): {', '.join(unknown)}")
+            print(f"  Valid sections: {', '.join(COMPARE_ALL_SECTIONS)}")
+            sections = [s for s in sections if s in COMPARE_ALL_SECTIONS]
+
+        # Master list: (key, display-title, method, kind)
+        # kind = "table"  → method returns List[Tuple]; rendered with _print_table
+        # kind = "report" → method prints output itself (no src/dst symmetry needed)
+        all_sections = [
+            ("hosts",           "HOSTS",                          self._section_hosts,                 "table"),
+            ("templates",       "TEMPLATES",                      self._section_templates,             "table"),
+            ("items",           "ITEMS",                          self._section_items,                 "table"),
+            ("item-types",      "ITEM TYPES — enabled",           self._section_item_types,            "table"),
+            ("unsup-types",     "ITEM TYPES — unsupported",       self._section_unsupported_item_types,"table"),
+            ("triggers",        "TRIGGERS",                       self._section_triggers,              "table"),
+            ("discovery-rules", "DISCOVERY RULES",                self._section_discovery_rules,       "table"),
+            ("unsup-items",     "TOP UNSUPPORTED ITEMS (by tpl)", self._report_top_unsupported_items,  "report"),
+            ("unsup-rules",     "TOP UNSUPPORTED DISC. RULES",    self._report_top_unsupported_rules,  "report"),
+            ("graphs",          "GRAPHS (custom)",                self._section_graphs,                "table"),
+            ("host-groups",     "HOST GROUPS",                    self._section_host_groups,           "table"),
+            ("maps",            "MAPS",                           self._section_maps,                  "table"),
+            ("dashboards",      "DASHBOARDS",                     self._section_dashboards,            "table"),
+            ("proxies",         "PROXIES",                        self._section_proxies,               "table"),
+            ("user-groups",     "USER GROUPS",                    self._section_user_groups,           "table"),
         ]
 
-        for title, fn in sections:
+        print(f"\n{'═' * 74}")
+        print(f"  Migration Health Check — CIA: {self.cia}")
+        active_keys = ", ".join(sections) if len(sections) < len(COMPARE_ALL_SECTIONS) else "all"
+        print(f"  Sections: {active_keys}")
+        print(f"{'═' * 74}")
+
+        for key, title, fn, kind in all_sections:
+            if key not in sections:
+                continue
             print(f"\n  {'─' * 72}")
             print(f"  {title}")
             print(f"  {'─' * 72}")
             try:
-                rows = fn()
-                self._print_table(rows)
+                if kind == "table":
+                    rows = fn()
+                    self._print_table(rows)
+                else:
+                    fn()   # prints directly
             except Exception as exc:
-                print(f"  [ERROR fetching {title}: {exc}]")
+                import traceback
+                print(f"  [ERROR in {title}: {exc}]")
+                print(traceback.format_exc())
 
         if self._warnings:
             print(f"\n  {'═' * 72}")
@@ -2446,9 +2490,10 @@ class ZabbixComparator:
     def _print_table(self, rows: List[Tuple]):
         """
         rows: list of (label, src_val, dst_val) or (label,) for separators.
-        src_val / dst_val may be int or str.
+        Negative diff is always red + added to warnings.
+        Positive diff is yellow (informational; may be expected).
         """
-        COL_LBL = 44
+        COL_LBL = 46
         COL_VAL = 9
 
         hdr = (f"  {'Metric':<{COL_LBL}}  "
@@ -2458,13 +2503,11 @@ class ZabbixComparator:
 
         for row in rows:
             if len(row) == 1:
-                # section sub-header / blank
                 print(f"  {row[0]}")
                 continue
 
             label, src_v, dst_v = row
 
-            # Numeric diff + colour
             if isinstance(src_v, int) and isinstance(dst_v, int):
                 diff = dst_v - src_v
                 if diff == 0:
@@ -2472,18 +2515,17 @@ class ZabbixComparator:
                     colour   = self._GRN
                 elif diff > 0:
                     diff_str = f"{'+' + str(diff):>{COL_VAL}}"
-                    colour   = self._YEL   # more in dest — may be fine (disabled hosts)
+                    colour   = self._YEL
                 else:
                     diff_str = f"{str(diff):>{COL_VAL}}"
                     colour   = self._RED
                     self._warnings.append(f"{label}: src={src_v} dst={dst_v} (Δ{diff})")
-                src_s = f"{src_v:>{COL_VAL}}"
-                dst_s = f"{dst_v:>{COL_VAL}}"
-                print(f"  {label:<{COL_LBL}}  {src_s}  {dst_s}  {colour}{diff_str}{self._RST}")
+                print(f"  {label:<{COL_LBL}}  {src_v:>{COL_VAL}}  {dst_v:>{COL_VAL}}  "
+                      f"{colour}{diff_str}{self._RST}")
             else:
-                # String values (e.g. version info)
-                match = "  =" if str(src_v) == str(dst_v) else "  ≠"
-                print(f"  {label:<{COL_LBL}}  {str(src_v):>{COL_VAL}}  {str(dst_v):>{COL_VAL}}  {match}")
+                match = "=" if str(src_v) == str(dst_v) else "≠"
+                print(f"  {label:<{COL_LBL}}  {str(src_v):>{COL_VAL}}  {str(dst_v):>{COL_VAL}}  "
+                      f"  {match}")
 
     # ── stat-collection helpers ──────────────────────────────────────────────
 
@@ -2495,86 +2537,112 @@ class ZabbixComparator:
         result = fn(countOutput=True, **kwargs)
         return int(result)
 
+    @staticmethod
+    def _build_transitively_used_templates(api) -> set:
+        """
+        Return the set of templateids that are 'in use', defined as:
+          - directly linked to ≥1 regular host (flags=0), OR
+          - are an ancestor (parent/grandparent/…) of any such template.
+
+        This avoids counting nested/shared parent templates as orphans simply
+        because no host links to them directly.
+        """
+        # Fetch all templates with their parent template links
+        all_tpls = api.template.get(
+            output=["templateid"],
+            selectParentTemplates=["templateid"]
+        )
+        # Map: templateid → list of parent templateids (templates it inherits from)
+        tpl_parents: Dict[str, List[str]] = {
+            t["templateid"]: [p["templateid"] for p in t.get("parentTemplates", [])]
+            for t in all_tpls
+        }
+
+        # Seed: templates that are directly linked to at least one regular host
+        linked_tpls = api.template.get(
+            output=["templateid"],
+            filter={},
+            real_hosts=True          # only templates used by real hosts
+        )
+        used: set = {t["templateid"] for t in linked_tpls}
+
+        # Walk upward: if template T is used, all its parents are also used
+        queue = list(used)
+        while queue:
+            tid = queue.pop()
+            for parent_id in tpl_parents.get(tid, []):
+                if parent_id not in used:
+                    used.add(parent_id)
+                    queue.append(parent_id)
+
+        return used
+
     # ── individual sections ──────────────────────────────────────────────────
 
     def _section_hosts(self) -> List[Tuple]:
-        rows = []
-        # Note: we count only non-LLD-discovered hosts (flags=0).
-        # Discovered hosts (flags=4) are LLD prototypes — not migrated.
-        for label, kwargs in [
-            ("Enabled",                      dict(filter={"status": 0, "flags": 0})),
-            ("Disabled",                     dict(filter={"status": 1, "flags": 0})),
-            ("  ↳ Enabled — via proxy",      dict(filter={"status": 0, "flags": 0},
-                                                   monitored_hosts=True,
-                                                   proxyids=True)),
-            ("  ↳ Enabled — direct (no proxy)",
-                                              dict(filter={"status": 0, "flags": 0,
-                                                           "proxyid": "0"})),
-            ("  ↳ Enabled — with templates", dict(filter={"status": 0, "flags": 0},
-                                                   templated_hosts=True)),
-            ("  ↳ Enabled — no templates",   None),   # computed below
-            ("Discovered by LLD (flags=4)",  dict(filter={"flags": 4})),
-        ]:
-            if kwargs is None:
-                continue    # placeholder; fill below
-            # proxy filter quirk: proxyids=True is not valid; use a different approach
-            rows.append((label, None, None))  # will replace
+        """
+        Counts regular hosts (flags=0) only.
+        Direct/proxy split:
+          - Source (6.4): proxyid=0 means no proxy
+          - Dest   (7.0): proxyid=0 AND proxy_groupid=0 means truly server-direct
+            (Zabbix 7.0 introduced proxy groups; hosts in a proxy group have
+             proxyid=0 but proxy_groupid≠0 — they'd be wrongly counted as "direct"
+             if we only filter on proxyid)
+        """
+        s_en  = self._cnt(self.src, "host.get", filter={"status": "0", "flags": "0"})
+        d_en  = self._cnt(self.dst, "host.get", filter={"status": "0", "flags": "0"})
+        s_dis = self._cnt(self.src, "host.get", filter={"status": "1", "flags": "0"})
+        d_dis = self._cnt(self.dst, "host.get", filter={"status": "1", "flags": "0"})
 
-        # Re-fetch cleanly
-        rows = []
-
-        s_en   = self._cnt(self.src, "host.get", filter={"status": "0", "flags": "0"})
-        d_en   = self._cnt(self.dst, "host.get", filter={"status": "0", "flags": "0"})
-        s_dis  = self._cnt(self.src, "host.get", filter={"status": "1", "flags": "0"})
-        d_dis  = self._cnt(self.dst, "host.get", filter={"status": "1", "flags": "0"})
-
-        # With templates
         s_wtpl = self._cnt(self.src, "host.get",
                            filter={"status": "0", "flags": "0"}, templated_hosts=True)
         d_wtpl = self._cnt(self.dst, "host.get",
                            filter={"status": "0", "flags": "0"}, templated_hosts=True)
-
-        # No templates = enabled − with-templates
-        s_ntpl = max(0, s_en - s_wtpl)
-        d_ntpl = max(0, d_en - d_wtpl)
-
-        # LLD discovered
         s_lld  = self._cnt(self.src, "host.get", filter={"flags": "4"})
         d_lld  = self._cnt(self.dst, "host.get", filter={"flags": "4"})
 
-        rows += [
-            ("Total (enabled)",                    s_en,   d_en),
-            ("Total (disabled)",                   s_dis,  d_dis),
-            ("  ↳ Enabled — with template(s)",     s_wtpl, d_wtpl),
-            ("  ↳ Enabled — no templates",         s_ntpl, d_ntpl),
-            ("Discovered by LLD (not migrated)",   s_lld,  d_lld),
+        rows = [
+            ("Total (enabled)",                    s_en,             d_en),
+            ("Total (disabled)",                   s_dis,            d_dis),
+            ("  ↳ Enabled — with template(s)",     s_wtpl,           d_wtpl),
+            ("  ↳ Enabled — no templates",         max(0,s_en-s_wtpl), max(0,d_en-d_wtpl)),
+            ("Discovered by LLD (not migrated)",   s_lld,            d_lld),
         ]
 
-        # Try to split by proxy / direct (proxy monitoring)
+        # Proxy breakdown
         try:
-            # Get list of proxy IDs on source
-            src_proxies = self.src.proxy.get(output=["proxyid"])
-            if src_proxies:
-                src_proxy_ids = [p["proxyid"] for p in src_proxies]
-                s_proxy = self._cnt(self.src, "host.get",
-                                    filter={"status": "0", "flags": "0"},
-                                    proxyids=src_proxy_ids)
-            else:
-                s_proxy = 0
-            dst_proxies = self.dst.proxy.get(output=["proxyid"])
-            if dst_proxies:
-                dst_proxy_ids = [p["proxyid"] for p in dst_proxies]
-                d_proxy = self._cnt(self.dst, "host.get",
-                                    filter={"status": "0", "flags": "0"},
-                                    proxyids=dst_proxy_ids)
-            else:
-                d_proxy = 0
+            src_proxy_ids = [p["proxyid"]
+                             for p in self.src.proxy.get(output=["proxyid"])]
+            s_proxy = (self._cnt(self.src, "host.get",
+                                 filter={"status": "0", "flags": "0"},
+                                 proxyids=src_proxy_ids)
+                       if src_proxy_ids else 0)
+
+            dst_proxy_ids = [p["proxyid"]
+                             for p in self.dst.proxy.get(output=["proxyid"])]
+            d_proxy = (self._cnt(self.dst, "host.get",
+                                 filter={"status": "0", "flags": "0"},
+                                 proxyids=dst_proxy_ids)
+                       if dst_proxy_ids else 0)
+
+            # Source 6.4: direct = proxyid=0
+            s_direct = self._cnt(self.src, "host.get",
+                                 filter={"status": "0", "flags": "0", "proxyid": "0"})
+            # Dest 7.0: direct = proxyid=0 AND proxy_groupid=0
+            # (proxy_groupid field exists only in 7.0; ignored on 6.4 side)
+            try:
+                d_direct = self._cnt(self.dst, "host.get",
+                                     filter={"status": "0", "flags": "0",
+                                             "proxyid": "0", "proxy_groupid": "0"})
+            except Exception:
+                d_direct = s_en - d_proxy  # fallback
+
             rows += [
-                ("  ↳ Enabled — monitored via proxy",  s_proxy, d_proxy),
-                ("  ↳ Enabled — direct (no proxy)",    s_en - s_proxy, d_en - d_proxy),
+                ("  ↳ Enabled — monitored via proxy",   s_proxy,  d_proxy),
+                ("  ↳ Enabled — direct (server only)",  s_direct, d_direct),
             ]
         except Exception:
-            pass  # proxy info not critical
+            pass  # proxy info is informational; don't fail the whole section
 
         return rows
 
@@ -2582,86 +2650,65 @@ class ZabbixComparator:
         s_total = self._cnt(self.src, "template.get")
         d_total = self._cnt(self.dst, "template.get")
 
-        # Templates linked to at least one host
-        src_tpls = self.src.template.get(output=["templateid"])
-        dst_tpls = self.dst.template.get(output=["templateid"])
+        # "In use" = linked to host directly OR as an ancestor of a linked template
+        s_used  = self._build_transitively_used_templates(self.src)
+        d_used  = self._build_transitively_used_templates(self.dst)
 
-        s_linked = sum(
-            1 for t in src_tpls
-            if int(self.src.host.get(countOutput=True, templateids=t["templateid"],
-                                     filter={"flags": "0"})) > 0
-        ) if src_tpls else 0
+        s_linked_direct = self._cnt(self.src, "template.get", real_hosts=True)
+        d_linked_direct = self._cnt(self.dst, "template.get", real_hosts=True)
 
-        d_linked = sum(
-            1 for t in dst_tpls
-            if int(self.dst.host.get(countOutput=True, templateids=t["templateid"],
-                                     filter={"flags": "0"})) > 0
-        ) if dst_tpls else 0
+        s_used_cnt   = len(s_used)
+        d_used_cnt   = len(d_used)
+        s_orphan_cnt = s_total - s_used_cnt
+        d_orphan_cnt = d_total - d_used_cnt
 
         return [
-            ("Total",                      s_total,            d_total),
-            ("  ↳ Linked to ≥1 host",     s_linked,           d_linked),
-            ("  ↳ Unlinked (orphan)",      s_total - s_linked, d_total - d_linked),
+            ("Total",                                  s_total,         d_total),
+            ("  ↳ Directly linked to ≥1 host",        s_linked_direct, d_linked_direct),
+            ("  ↳ Used (direct + nested ancestors)",   s_used_cnt,      d_used_cnt),
+            ("  ↳ True orphan (not used anywhere)",    s_orphan_cnt,    d_orphan_cnt),
         ]
 
     def _section_items(self) -> List[Tuple]:
-        # Scope: items on non-LLD-discovered regular hosts (flags=0 host)
-        # Item flags: 0=regular, 4=discovered by LLD; 2=prototype (not counted here)
+        """Regular items (flags=0) on non-LLD hosts."""
         base = dict(host_flags=["0"])
-
-        # Total enabled/disabled
-        s_en  = self._cnt(self.src, "item.get", filter={"status": "0", "flags": "0"},
-                          **base)
-        d_en  = self._cnt(self.dst, "item.get", filter={"status": "0", "flags": "0"},
-                          **base)
-        s_dis = self._cnt(self.src, "item.get", filter={"status": "1", "flags": "0"},
-                          **base)
-        d_dis = self._cnt(self.dst, "item.get", filter={"status": "1", "flags": "0"},
-                          **base)
-
-        # Unsupported (state=1); only enabled items can be unsupported
+        s_en  = self._cnt(self.src, "item.get", filter={"status":"0","flags":"0"}, **base)
+        d_en  = self._cnt(self.dst, "item.get", filter={"status":"0","flags":"0"}, **base)
+        s_dis = self._cnt(self.src, "item.get", filter={"status":"1","flags":"0"}, **base)
+        d_dis = self._cnt(self.dst, "item.get", filter={"status":"1","flags":"0"}, **base)
         s_uns = self._cnt(self.src, "item.get",
-                          filter={"status": "0", "flags": "0", "state": "1"}, **base)
+                          filter={"status":"0","flags":"0","state":"1"}, **base)
         d_uns = self._cnt(self.dst, "item.get",
-                          filter={"status": "0", "flags": "0", "state": "1"}, **base)
-
-        # LLD-discovered items (flags=4) — informational
-        s_lld = self._cnt(self.src, "item.get", filter={"flags": "4"}, **base)
-        d_lld = self._cnt(self.dst, "item.get", filter={"flags": "4"}, **base)
-
-        # Templated vs direct
-        # "inherited" items come from templates (templateid != 0)
-        # We approximate: fetch with templated=True filter
+                          filter={"status":"0","flags":"0","state":"1"}, **base)
+        s_lld = self._cnt(self.src, "item.get", filter={"flags":"4"}, **base)
+        d_lld = self._cnt(self.dst, "item.get", filter={"flags":"4"}, **base)
         s_tpl = self._cnt(self.src, "item.get",
-                          filter={"status": "0", "flags": "0"}, templated=True, **base)
+                          filter={"status":"0","flags":"0"}, templated=True, **base)
         d_tpl = self._cnt(self.dst, "item.get",
-                          filter={"status": "0", "flags": "0"}, templated=True, **base)
-
+                          filter={"status":"0","flags":"0"}, templated=True, **base)
         return [
-            ("Regular items — enabled",          s_en,  d_en),
-            ("Regular items — disabled",         s_dis, d_dis),
-            ("  ↳ Enabled — unsupported",        s_uns, d_uns),
-            ("  ↳ Enabled — from templates",     s_tpl, d_tpl),
-            ("  ↳ Enabled — direct (no tpl)",    s_en - s_tpl, d_en - d_tpl),
-            ("LLD-discovered items (all states)", s_lld, d_lld),
+            ("Regular items — enabled",             s_en,           d_en),
+            ("Regular items — disabled",            s_dis,          d_dis),
+            ("  ↳ Enabled — unsupported",           s_uns,          d_uns),
+            ("  ↳ Enabled — from templates",        s_tpl,          d_tpl),
+            ("  ↳ Enabled — direct (no template)",  s_en - s_tpl,   d_en - d_tpl),
+            ("LLD-discovered items (all states)",   s_lld,          d_lld),
         ]
 
     def _section_item_types(self) -> List[Tuple]:
-        """Break down enabled regular items by monitoring type."""
-        rows = [("  (enabled regular items on non-LLD hosts)",)]
-        base = dict(host_flags=["0"], filter={"status": "0", "flags": "0"})
-
+        """Break down ENABLED regular items by monitoring type."""
+        rows = [("  (enabled regular items, non-LLD hosts)",)]
         for src_types, dst_types, label in _ITEM_TYPE_GROUPS:
             try:
                 s_cnt = sum(
-                    self._cnt(self.src, "item.get", filter={"status": "0", "flags": "0",
-                                                            "type": str(t)},
+                    self._cnt(self.src, "item.get",
+                              filter={"status":"0","flags":"0","type":str(t)},
                               host_flags=["0"])
                     for t in src_types
                 )
                 d_cnt = sum(
-                    self._cnt(self.dst, "item.get", filter={"status": "0", "flags": "0",
-                                                            "type": str(t)},
+                    self._cnt(self.dst, "item.get",
+                              filter={"status":"0","flags":"0","type":str(t)},
                               host_flags=["0"])
                     for t in dst_types
                 )
@@ -2669,30 +2716,48 @@ class ZabbixComparator:
                     rows.append((f"  {label}", s_cnt, d_cnt))
             except Exception:
                 rows.append((f"  {label}", "?", "?"))
+        return rows
 
+    def _section_unsupported_item_types(self) -> List[Tuple]:
+        """Break down UNSUPPORTED items (state=1) by monitoring type."""
+        rows = [("  (unsupported items, non-LLD hosts)",)]
+        for src_types, dst_types, label in _ITEM_TYPE_GROUPS:
+            try:
+                s_cnt = sum(
+                    self._cnt(self.src, "item.get",
+                              filter={"status":"0","flags":"0","state":"1","type":str(t)},
+                              host_flags=["0"])
+                    for t in src_types
+                )
+                d_cnt = sum(
+                    self._cnt(self.dst, "item.get",
+                              filter={"status":"0","flags":"0","state":"1","type":str(t)},
+                              host_flags=["0"])
+                    for t in dst_types
+                )
+                if s_cnt > 0 or d_cnt > 0:
+                    rows.append((f"  {label}", s_cnt, d_cnt))
+            except Exception:
+                rows.append((f"  {label}", "?", "?"))
         return rows
 
     def _section_triggers(self) -> List[Tuple]:
-        # Only triggers on non-template hosts; flags=0 = plain (not discovered)
         s_en   = self._cnt(self.src, "trigger.get",
-                           filter={"status": "0", "flags": "0"}, only_true=False)
+                           filter={"status":"0","flags":"0"}, only_true=False)
         d_en   = self._cnt(self.dst, "trigger.get",
-                           filter={"status": "0", "flags": "0"}, only_true=False)
+                           filter={"status":"0","flags":"0"}, only_true=False)
         s_dis  = self._cnt(self.src, "trigger.get",
-                           filter={"status": "1", "flags": "0"}, only_true=False)
+                           filter={"status":"1","flags":"0"}, only_true=False)
         d_dis  = self._cnt(self.dst, "trigger.get",
-                           filter={"status": "1", "flags": "0"}, only_true=False)
-        # In PROBLEM state (value=1, status=0)
+                           filter={"status":"1","flags":"0"}, only_true=False)
         s_prob = self._cnt(self.src, "trigger.get",
-                           filter={"status": "0", "value": "1", "flags": "0"},
-                           only_true=False)
+                           filter={"status":"0","value":"1","flags":"0"}, only_true=False)
         d_prob = self._cnt(self.dst, "trigger.get",
-                           filter={"status": "0", "value": "1", "flags": "0"},
-                           only_true=False)
-        # LLD-discovered triggers
-        s_lld  = self._cnt(self.src, "trigger.get", filter={"flags": "4"}, only_true=False)
-        d_lld  = self._cnt(self.dst, "trigger.get", filter={"flags": "4"}, only_true=False)
-
+                           filter={"status":"0","value":"1","flags":"0"}, only_true=False)
+        s_lld  = self._cnt(self.src, "trigger.get",
+                           filter={"flags":"4"}, only_true=False)
+        d_lld  = self._cnt(self.dst, "trigger.get",
+                           filter={"flags":"4"}, only_true=False)
         return [
             ("Enabled (regular)",         s_en,   d_en),
             ("Disabled (regular)",        s_dis,  d_dis),
@@ -2701,86 +2766,160 @@ class ZabbixComparator:
         ]
 
     def _section_discovery_rules(self) -> List[Tuple]:
-        # LLD rules live as items with flags=1
-        s_en  = self._cnt(self.src, "discoveryrule.get", filter={"status": "0"})
-        d_en  = self._cnt(self.dst, "discoveryrule.get", filter={"status": "0"})
-        s_dis = self._cnt(self.src, "discoveryrule.get", filter={"status": "1"})
-        d_dis = self._cnt(self.dst, "discoveryrule.get", filter={"status": "1"})
+        s_en  = self._cnt(self.src, "discoveryrule.get", filter={"status":"0"})
+        d_en  = self._cnt(self.dst, "discoveryrule.get", filter={"status":"0"})
+        s_dis = self._cnt(self.src, "discoveryrule.get", filter={"status":"1"})
+        d_dis = self._cnt(self.dst, "discoveryrule.get", filter={"status":"1"})
         s_uns = self._cnt(self.src, "discoveryrule.get",
-                          filter={"status": "0", "state": "1"})
+                          filter={"status":"0","state":"1"})
         d_uns = self._cnt(self.dst, "discoveryrule.get",
-                          filter={"status": "0", "state": "1"})
+                          filter={"status":"0","state":"1"})
         return [
-            ("Enabled",                      s_en,  d_en),
-            ("Disabled",                     s_dis, d_dis),
-            ("  ↳ Enabled — unsupported",    s_uns, d_uns),
+            ("Enabled",                   s_en,  d_en),
+            ("Disabled",                  s_dis, d_dis),
+            ("  ↳ Enabled — unsupported", s_uns, d_uns),
         ]
 
     def _section_graphs(self) -> List[Tuple]:
-        # Custom graphs (flags=0); excludes template graphs and LLD prototypes
-        s_tot = self._cnt(self.src, "graph.get", filter={"flags": "0"})
-        d_tot = self._cnt(self.dst, "graph.get", filter={"flags": "0"})
+        s_tot = self._cnt(self.src, "graph.get", filter={"flags":"0"})
+        d_tot = self._cnt(self.dst, "graph.get", filter={"flags":"0"})
         return [("Custom graphs (flags=0)", s_tot, d_tot)]
 
     def _section_host_groups(self) -> List[Tuple]:
         s_tot  = self._cnt(self.src, "hostgroup.get", real_hosts=True)
         d_tot  = self._cnt(self.dst, "hostgroup.get", real_hosts=True)
-
-        # Non-empty: groups containing at least one enabled host
         src_grps = self.src.hostgroup.get(output=["groupid"], real_hosts=True)
         dst_grps = self.dst.hostgroup.get(output=["groupid"], real_hosts=True)
-
         s_nonempty = sum(
             1 for g in src_grps
             if int(self.src.host.get(countOutput=True, groupids=g["groupid"],
-                                     filter={"status": "0", "flags": "0"})) > 0
+                                     filter={"status":"0","flags":"0"})) > 0
         )
         d_nonempty = sum(
             1 for g in dst_grps
             if int(self.dst.host.get(countOutput=True, groupids=g["groupid"],
-                                     filter={"status": "0", "flags": "0"})) > 0
+                                     filter={"status":"0","flags":"0"})) > 0
         )
         return [
-            ("Total (real-host groups)",  s_tot,              d_tot),
-            ("  ↳ Non-empty",             s_nonempty,         d_nonempty),
-            ("  ↳ Empty",                 s_tot - s_nonempty, d_tot - d_nonempty),
+            ("Total (real-host groups)", s_tot,              d_tot),
+            ("  ↳ Non-empty",           s_nonempty,         d_nonempty),
+            ("  ↳ Empty",               s_tot-s_nonempty,   d_tot-d_nonempty),
         ]
 
     def _section_maps(self) -> List[Tuple]:
-        s_tot = self._cnt(self.src, "map.get")
-        d_tot = self._cnt(self.dst, "map.get")
-        return [("Total", s_tot, d_tot)]
+        return [("Total", self._cnt(self.src,"map.get"), self._cnt(self.dst,"map.get"))]
 
     def _section_dashboards(self) -> List[Tuple]:
-        s_tot = self._cnt(self.src, "dashboard.get")
-        d_tot = self._cnt(self.dst, "dashboard.get")
-        return [("Total", s_tot, d_tot)]
+        return [("Total", self._cnt(self.src,"dashboard.get"), self._cnt(self.dst,"dashboard.get"))]
 
     def _section_proxies(self) -> List[Tuple]:
-        # Proxy mode: 5=active (in 6.4), 6=passive (in 6.4)
-        # In 7.0: operating_mode 0=active, 1=passive
         try:
-            s_act = self._cnt(self.src, "proxy.get", filter={"status": "5"})
-            s_pas = self._cnt(self.src, "proxy.get", filter={"status": "6"})
+            s_act = self._cnt(self.src, "proxy.get", filter={"status":"5"})
+            s_pas = self._cnt(self.src, "proxy.get", filter={"status":"6"})
         except Exception:
-            s_act = self._cnt(self.src, "proxy.get")
-            s_pas = 0
+            s_act = self._cnt(self.src, "proxy.get"); s_pas = 0
         try:
-            d_act = self._cnt(self.dst, "proxy.get", filter={"operating_mode": "0"})
-            d_pas = self._cnt(self.dst, "proxy.get", filter={"operating_mode": "1"})
+            d_act = self._cnt(self.dst, "proxy.get", filter={"operating_mode":"0"})
+            d_pas = self._cnt(self.dst, "proxy.get", filter={"operating_mode":"1"})
         except Exception:
-            d_act = self._cnt(self.dst, "proxy.get")
-            d_pas = 0
-
-        return [
-            ("Active proxies",  s_act, d_act),
-            ("Passive proxies", s_pas, d_pas),
-        ]
+            d_act = self._cnt(self.dst, "proxy.get"); d_pas = 0
+        return [("Active proxies", s_act, d_act), ("Passive proxies", s_pas, d_pas)]
 
     def _section_user_groups(self) -> List[Tuple]:
-        s_tot = self._cnt(self.src, "usergroup.get")
-        d_tot = self._cnt(self.dst, "usergroup.get")
-        return [("Total", s_tot, d_tot)]
+        return [("Total", self._cnt(self.src,"usergroup.get"),
+                          self._cnt(self.dst,"usergroup.get"))]
+
+    # ── report sections (print directly, no src/dst table) ──────────────────
+
+    def _report_top_unsupported(self, fetch_fn_name: str,
+                                 label_singular: str,
+                                 top_n: int = 5):
+        """
+        Generic top-N unsupported object report, shown for both src and dst.
+        fetch_fn_name: 'item.get' or 'discoveryrule.get'
+        """
+        from collections import Counter
+
+        COL_T = 52
+        COL_C = 7
+
+        for tag, api in [("Source", self.src), ("Dest  ", self.dst)]:
+            fn = api
+            for part in fetch_fn_name.split("."):
+                fn = getattr(fn, part)
+
+            if fetch_fn_name == "item.get":
+                objects = fn(
+                    output=["name", "templateid"],
+                    filter={"status": "0", "flags": "0", "state": "1"},
+                    host_flags=["0"],
+                    limit=50000
+                )
+            else:  # discoveryrule.get
+                objects = fn(
+                    output=["name", "templateid"],
+                    filter={"status": "0", "state": "1"},
+                    limit=50000
+                )
+
+            total = len(objects)
+            if total == 0:
+                print(f"\n  [{tag}]  No unsupported {label_singular}s found.")
+                continue
+
+            counts: "Counter[str]" = Counter()
+            direct_cnt = 0
+            for obj in objects:
+                tid = obj.get("templateid", "0") or "0"
+                if tid != "0":
+                    counts[tid] += 1
+                else:
+                    direct_cnt += 1
+
+            # Resolve template names for top N
+            top_n_list = counts.most_common(top_n)
+            tids        = [t[0] for t, _ in [(x, None) for x in top_n_list]]
+            # Fix: most_common returns (key, count) tuples
+            top_n_list  = counts.most_common(top_n)
+            tids        = [tid for tid, _ in top_n_list]
+            tpl_names   = {}
+            if tids:
+                tpl_data = api.template.get(output=["name"], templateids=tids)
+                tpl_names = {t["templateid"]: t["name"] for t in tpl_data}
+
+            print(f"\n  [{tag}]  Total unsupported {label_singular}s: {total}"
+                  f"  (from templates: {total - direct_cnt}, direct: {direct_cnt})")
+            print(f"  {'─' * (COL_T + COL_C + 6)}")
+            print(f"  {'Template':<{COL_T}}  {'Count':>{COL_C}}")
+            print(f"  {'·' * (COL_T + COL_C + 4)}")
+            for tid, cnt in top_n_list:
+                tname = tpl_names.get(tid, f"<templateid {tid}>")
+                # Truncate long template names
+                if len(tname) > COL_T - 2:
+                    tname = tname[:COL_T - 5] + "..."
+                print(f"  {tname:<{COL_T}}  {cnt:>{COL_C}}")
+            if direct_cnt > 0:
+                print(f"  {'(direct — no template)':<{COL_T}}  {direct_cnt:>{COL_C}}")
+
+            # Bonus: also show the top 5 most-common item/rule *names* (what is broken)
+            name_counts: "Counter[str]" = Counter(
+                obj["name"] for obj in objects
+                if (obj.get("templateid") or "0") != "0"
+            )
+            top_names = name_counts.most_common(top_n)
+            if top_names:
+                print(f"\n  [{tag}]  Most common unsupported {label_singular} names:")
+                print(f"  {'·' * (COL_T + COL_C + 4)}")
+                for name, cnt in top_names:
+                    if len(name) > COL_T - 2:
+                        name = name[:COL_T - 5] + "..."
+                    print(f"  {name:<{COL_T}}  {cnt:>{COL_C}}")
+
+    def _report_top_unsupported_items(self):
+        self._report_top_unsupported("item.get", "item")
+
+    def _report_top_unsupported_rules(self):
+        self._report_top_unsupported("discoveryrule.get", "discovery rule")
 
 
 # ---------------------------------------------------------------------------
@@ -2889,11 +3028,13 @@ Config files (same directory as this script):
         help="Skip objects that already exist in destination (applies to all types)"
     )
     parser.add_argument(
-        "--compare", action="store_true",
+        "--compare", nargs="*", default=None,
+        metavar="SECTION",
         help=(
-            "Run a migration health-check: fetch monitoring stats from both source "
-            "and destination and print a side-by-side comparison. "
-            "Can be combined with --migrate or used standalone."
+            "Run a migration health-check comparing source vs destination stats. "
+            "Pass no value for all sections, or specify one or more section names. "
+            f"Available: {', '.join(COMPARE_ALL_SECTIONS)}.  "
+            "Examples: --compare   OR   --compare hosts items unsup-items"
         )
     )
     parser.add_argument(
@@ -2929,7 +3070,7 @@ Config files (same directory as this script):
             sys.exit(0)
 
     # ── Validate migration/compare args ─────────────────────────────────────
-    if args.migrate or args.compare:
+    if args.migrate or args.compare is not None:
         missing = []
         if not args.env:
             missing.append("--env")
@@ -2988,8 +3129,9 @@ Config files (same directory as this script):
     print(f"  env={args.env}  cia={args.cia}", end="")
     if types_to_run:
         print(f"  migrate={' '.join(types_to_run)}", end="")
-    if args.compare:
-        print(f"  compare=yes", end="")
+    if args.compare is not None:
+        sections_disp = ", ".join(args.compare) if args.compare else "all"
+        print(f"  compare={sections_disp}", end="")
     print()
     if args.dashboard:
         print(f"  dashboard filter='{args.dashboard}'")
@@ -3048,13 +3190,15 @@ Config files (same directory as this script):
                     migrator.migrate_dashboards()
 
             # Run comparison after migration (or standalone when no --migrate given)
-            if args.compare:
+            if args.compare is not None:
                 comp = ZabbixComparator(
                     src_api=migrator.source,
                     dst_api=migrator.dest,
                     cia_name=cia_name,
                 )
-                comp.run()
+                # args.compare == [] means --compare with no args → all sections
+                # args.compare == ["hosts", ...] → selected sections only
+                comp.run(sections=args.compare if args.compare else None)
 
         except Exception as exc:
             print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
