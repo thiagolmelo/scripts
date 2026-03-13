@@ -367,7 +367,11 @@ class MigrationLog:
 # ---------------------------------------------------------------------------
 
 def load_credentials() -> Dict:
-    """Load Zabbix credentials from zabbix_credential.yml."""
+    """Load Zabbix credentials from zabbix_credential.yml.
+
+    Required keys : username, password
+    Optional keys : pilalert_token  (used for pilalerte owner resolution)
+    """
     path = os.path.join(BASE_DIR, "zabbix_credential.yml")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Credentials file not found: {path}")
@@ -493,15 +497,17 @@ class ZabbixMigrator:
                  dashboard_filter: Optional[str] = None,
                  host_filter: Optional[str] = None,
                  usergroup_filter: Optional[str] = None,
-                 debug_json: bool = False):
+                 debug_json: bool = False,
+                 pilalert_token: str = ""):
         self.cia_name          = cia_name
         self.skip_existing     = skip_existing
         self.dashboard_filter  = dashboard_filter
         self.host_filter       = host_filter
         self.usergroup_filter  = usergroup_filter
-        self.debug_json       = debug_json
-        self._source_url      = source_url  # kept for raw API calls
-        self._dest_url        = dest_url   # kept for raw API calls (bypass pyzabbix)
+        self.debug_json        = debug_json
+        self.pilalert_token    = pilalert_token   # Basic token for pilalerte API
+        self._source_url       = source_url  # kept for raw API calls
+        self._dest_url         = dest_url   # kept for raw API calls (bypass pyzabbix)
 
         # Per-type result counters
         self.results: Dict[str, Dict] = {
@@ -1540,66 +1546,153 @@ class ZabbixMigrator:
 
     def _resolve_dashboard_owner(self, source_userid: str) -> Tuple[str, List[Dict]]:
         """
-        Determine the owner userid and any extra sharing groups for the destination.
+        Determine the owner userid and any extra sharing groups for destination.
 
         Steps:
           1. Look up original owner username in source.
           2. Try to find the same user in destination → use their ID directly.
           3. If not found:
-             a. Use fallback owner FALLBACK_OWNER.
-             b. Get the original user's usergroups in source.
-             c. Find which of those groups exist in destination.
-             d. Return those groups for sharing with Edit (read-write) permission.
+             a. Use fallback owner FALLBACK_OWNER as the technical owner.
+             b. Call pilalerte API to get the user's sun_groups.
+                - Tries the username as-is and its ADM/non-ADM variant.
+             c. Resolve each sun_group to a destination usergroup and add as
+                a Read-Write sharing entry.
+             d. If pilalerte is unavailable or returns nothing, fall back to
+                the user's Zabbix source groups instead.
         """
         extra_groups: List[Dict] = []
 
-        # Get original owner's username
-        src_username = None
+        # ── 1. Resolve username from source ───────────────────────────────────
+        src_username: Optional[str] = None
         if source_userid:
             try:
                 data = self.source.user.get(
-                    userids=source_userid,
-                    output=["username"]
-                )
+                    userids=source_userid, output=["username"])
                 src_username = data[0]["username"] if data else None
             except Exception as exc:
                 logger.debug("Could not get source user %s: %s", source_userid, exc)
 
+        # ── 2. Find user in destination (exact match) ─────────────────────────
         if src_username:
-            # Try to find same user in destination
             try:
                 dest_data = self.dest.user.get(
-                    filter={"username": src_username},
-                    output=["userid"]
-                )
+                    filter={"username": src_username}, output=["userid"])
                 if dest_data:
                     logger.debug("Owner '%s' found in destination.", src_username)
                     return dest_data[0]["userid"], []
             except Exception as exc:
-                logger.debug("Error looking up user '%s' in destination: %s",
+                logger.debug("Error looking up '%s' in destination: %s",
                              src_username, exc)
 
-        # Owner not found in destination — use fallback
+        # ── 3. Owner not in destination — use fallback + resolve sharing ──────
         print(f"    ! Owner '{src_username or source_userid}' not found in destination.")
         print(f"      Using fallback owner: '{FALLBACK_OWNER}'")
 
         fallback_id = self._get_fallback_owner_id()
 
-        # Resolve original user's groups and find which exist in destination
-        if src_username and source_userid:
-            extra_groups = self._resolve_owner_groups_for_sharing(
-                source_userid, src_username
-            )
+        if src_username:
+            # Try pilalerte first
+            extra_groups = self._sharing_from_pilalerte(src_username)
+
+            # If pilalerte gave nothing, fall back to source Zabbix groups
+            if not extra_groups and source_userid:
+                extra_groups = self._resolve_owner_groups_for_sharing(
+                    source_userid, src_username)
 
         return fallback_id, extra_groups
+
+    # ── Pilalerte helpers ──────────────────────────────────────────────────────
+
+    PILALERTE_BASE = "https://pilalerte.prd.mycloud.intrabpce.fr"
+
+    def _pilalerte_sun_groups(self, username: str) -> List[str]:
+        """
+        Query pilalerte for the given username and return all unique sun_group
+        values found in data.team_cia[].
+
+        Also tries the ADM/non-ADM username variant automatically:
+          - "admb0026038"  → also tries "b0026038"
+          - "b0026038"     → also tries "adm" + "b0026038"  (case-insensitive)
+
+        Returns an empty list when pilalert_token is not configured, the user
+        is not found, or any network error occurs.
+        """
+        import requests as _req
+
+        if not self.pilalert_token:
+            logger.debug("pilalert_token not configured — skipping pilalerte lookup.")
+            return []
+
+        headers = {"Authorization": f"Basic {self.pilalert_token}"}
+        base    = self.PILALERTE_BASE.rstrip("/")
+        sun_groups: List[str] = []
+
+        # Build the list of logins to try (original + ADM variant)
+        logins_to_try: List[str] = [username]
+        lower = username.lower()
+        if lower.startswith("adm"):
+            logins_to_try.append(username[3:])          # "admB0026038" → "B0026038"
+        else:
+            logins_to_try.append("adm" + username)      # "B0026038" → "admB0026038"
+
+        seen_logins: set = set()
+        for login in logins_to_try:
+            if login.lower() in seen_logins:
+                continue
+            seen_logins.add(login.lower())
+
+            url = f"{base}/api/user/{login}"
+            try:
+                resp = _req.get(url, headers=headers, timeout=10)
+                if resp.status_code == 404:
+                    logger.debug("pilalerte: user '%s' not found (404).", login)
+                    continue
+                resp.raise_for_status()
+                payload = resp.json()
+                team_cia = (payload.get("data") or {}).get("team_cia") or []
+                for entry in team_cia:
+                    sg = entry.get("sun_group", "").strip()
+                    if sg and sg not in sun_groups:
+                        sun_groups.append(sg)
+                logger.debug("pilalerte: user '%s' → sun_groups %s", login, sun_groups)
+            except Exception as exc:
+                logger.debug("pilalerte request for '%s' failed: %s", login, exc)
+
+        return sun_groups
+
+    def _sharing_from_pilalerte(self, username: str) -> List[Dict]:
+        """
+        Resolve pilalerte sun_groups to destination usergroup IDs and return
+        a list of dashboard sharing entries with Read-Write permission.
+        """
+        sun_groups = self._pilalerte_sun_groups(username)
+        if not sun_groups:
+            return []
+
+        sharing: List[Dict] = []
+        print(f"      pilalerte returned {len(sun_groups)} sun_group(s) for '{username}':")
+        for sg in sun_groups:
+            try:
+                dest_grp = self.dest.usergroup.get(
+                    filter={"name": sg}, output=["usrgrpid"])
+                if dest_grp:
+                    sharing.append({
+                        "usrgrpid":   dest_grp[0]["usrgrpid"],
+                        "permission": PERM_READ_WRITE,
+                    })
+                    print(f"        + '{sg}' → shared with Edit permission")
+                else:
+                    print(f"        - '{sg}' not found in destination — skipped")
+            except Exception as exc:
+                logger.debug("Error resolving sun_group '%s': %s", sg, exc)
+
+        return sharing
 
     def _get_fallback_owner_id(self) -> str:
         """Return the userid of FALLBACK_OWNER in destination, raise if not found."""
         try:
             data = self.dest.user.get(
-                filter={"username": FALLBACK_OWNER},
-                output=["userid"]
-            )
+                filter={"username": FALLBACK_OWNER}, output=["userid"])
             if data:
                 return data[0]["userid"]
         except Exception as exc:
@@ -1612,39 +1705,35 @@ class ZabbixMigrator:
     def _resolve_owner_groups_for_sharing(
             self, source_userid: str, src_username: str) -> List[Dict]:
         """
-        Get the source user's usergroups and return those that also exist in
-        the destination, formatted as dashboard sharing entries with Edit permission.
+        Fallback when pilalerte is unavailable: get the source user's Zabbix
+        usergroups and return those that also exist in destination as Read-Write
+        sharing entries.
         """
         sharing: List[Dict] = []
         try:
-            # Get groups of original user in source
             src_groups = self.source.usergroup.get(
-                userids=source_userid,
-                output=["usrgrpid", "name"]
-            )
+                userids=source_userid, output=["usrgrpid", "name"])
         except Exception as exc:
             logger.debug("Could not get usergroups for '%s': %s", src_username, exc)
             return sharing
 
-        print(f"      Original user '{src_username}' belongs to "
-              f"{len(src_groups)} group(s) in source:")
+        print(f"      (pilalerte unavailable) Resolving source Zabbix groups for "
+              f"'{src_username}' ({len(src_groups)} group(s)):")
 
         for grp in src_groups:
             gname = grp["name"]
             try:
                 dest_grp = self.dest.usergroup.get(
-                    filter={"name": gname},
-                    output=["usrgrpid"]
-                )
+                    filter={"name": gname}, output=["usrgrpid"])
                 if dest_grp:
                     sharing.append({
-                        "usrgrpid":  dest_grp[0]["usrgrpid"],
-                        "permission": PERM_READ_WRITE
+                        "usrgrpid":   dest_grp[0]["usrgrpid"],
+                        "permission": PERM_READ_WRITE,
                     })
-                    print(f"        + Group '{gname}' exists in destination → "
-                          "will share with Edit permission")
+                    print(f"        + '{gname}' exists in destination → "
+                          "shared with Edit permission")
                 else:
-                    print(f"        - Group '{gname}' NOT found in destination → skipped")
+                    print(f"        - '{gname}' NOT found in destination → skipped")
             except Exception as exc:
                 logger.debug("Error resolving group '%s': %s", gname, exc)
 
@@ -3570,6 +3659,7 @@ Config files (same directory as this script):
                 host_filter=args.host,
                 usergroup_filter=args.usergroup,
                 debug_json=args.debug_json,
+                pilalert_token=creds.get("pilalert_token", ""),
             )
 
             for mtype in types_to_run:
