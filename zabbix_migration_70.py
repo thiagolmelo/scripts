@@ -2402,10 +2402,17 @@ class ZabbixMigrator:
             dst_tg_map = {}
 
         # ── 4. Iterate, resolve, create/update ────────────────────────────────
+        # Human-readable permission labels (same values in 6.4 and 7.0)
+        _PERM_LABEL = {"0": "Deny", "1": "None", "2": "Read", "3": "Read-Write"}
+
         ok_count   = 0
         skip_count = 0
         fail_count = 0
         ok_names: List[str] = []
+
+        # Accumulate incomplete rights across all groups for the end-of-run summary.
+        # Structure: [(grp_name, "host"|"template", group_name, perm_str), …]
+        incomplete_rights: List[tuple] = []
 
         for grp in src_groups:
             grp_name = grp["name"]
@@ -2425,11 +2432,12 @@ class ZabbixMigrator:
             # 6.4 source returns these under "rights" (selectRights param).
             # 7.0 destination accepts them under "hostgroup_rights".
             dst_hg_rights: List[Dict] = []
-            missing_hg:    List[str]  = []
+            # Each entry: (group_name, perm_label)
+            missing_hg: List[tuple] = []
 
             for right in (grp.get("rights") or []):
                 src_id = right["id"]
-                perm   = right["permission"]
+                perm   = str(right["permission"])
                 name   = src_hg_map.get(src_id)
                 if not name:
                     logger.debug("Usergroup '%s': unknown source host group id %s",
@@ -2439,20 +2447,18 @@ class ZabbixMigrator:
                 if dst_id:
                     dst_hg_rights.append({"id": dst_id, "permission": perm})
                 else:
-                    missing_hg.append(name)
+                    missing_hg.append((name, _PERM_LABEL.get(perm, perm)))
 
             # ── Resolve template-group rights ──────────────────────────────────
-            # Both 6.4 and 7.0 use "templategroup_rights" as the response key,
-            # but 6.4 may also return it as "templategroup_rights" — handle both.
             raw_tg = (grp.get("templategroup_rights")
                       or grp.get("template_group_rights")
                       or [])
             dst_tg_rights: List[Dict] = []
-            missing_tg:    List[str]  = []
+            missing_tg: List[tuple] = []
 
             for right in raw_tg:
                 src_id = right["id"]
-                perm   = right["permission"]
+                perm   = str(right["permission"])
                 name   = src_tg_map.get(src_id)
                 if not name:
                     logger.debug("Usergroup '%s': unknown source template group id %s",
@@ -2462,15 +2468,22 @@ class ZabbixMigrator:
                 if dst_id:
                     dst_tg_rights.append({"id": dst_id, "permission": perm})
                 else:
-                    missing_tg.append(name)
+                    missing_tg.append((name, _PERM_LABEL.get(perm, perm)))
 
-            # Warn about groups that exist in source rights but not in destination
+            # ── Print per-group missing rights immediately ─────────────────────
             if missing_hg:
-                logger.debug("Usergroup '%s': host groups absent in dest: %s",
-                             grp_name, missing_hg)
+                print(f"  [Usergroups] '{grp_name}': "
+                      f"{len(missing_hg)} host group(s) not in destination — skipped:")
+                for gname, plabel in missing_hg:
+                    print(f"      - {gname}  [{plabel}]")
+                    incomplete_rights.append((grp_name, "host", gname, plabel))
+
             if missing_tg:
-                logger.debug("Usergroup '%s': template groups absent in dest: %s",
-                             grp_name, missing_tg)
+                print(f"  [Usergroups] '{grp_name}': "
+                      f"{len(missing_tg)} template group(s) not in destination — skipped:")
+                for gname, plabel in missing_tg:
+                    print(f"      - {gname}  [{plabel}]")
+                    incomplete_rights.append((grp_name, "template", gname, plabel))
 
             # ── Build 7.0 payload ──────────────────────────────────────────────
             payload = {
@@ -2478,8 +2491,8 @@ class ZabbixMigrator:
                 "gui_access":           grp.get("gui_access",   "0"),
                 "users_status":         grp.get("users_status", "0"),
                 "debug_mode":           grp.get("debug_mode",   "0"),
-                "hostgroup_rights":     dst_hg_rights,   # 7.0 snake_case name
-                "templategroup_rights": dst_tg_rights,   # same in 6.4 response + 7.0 input
+                "hostgroup_rights":     dst_hg_rights,
+                "templategroup_rights": dst_tg_rights,
             }
 
             # ── Create or update ───────────────────────────────────────────────
@@ -2501,17 +2514,6 @@ class ZabbixMigrator:
                              grp_name, action,
                              len(dst_hg_rights), len(dst_tg_rights))
 
-                if missing_hg or missing_tg:
-                    parts = []
-                    if missing_hg:
-                        parts.append(
-                            f"host groups not in dest: {', '.join(missing_hg)}")
-                    if missing_tg:
-                        parts.append(
-                            f"template groups not in dest: {', '.join(missing_tg)}")
-                    print(f"  [Usergroups] WARN '{grp_name}': "
-                          f"{'; '.join(parts)}")
-
             except Exception as exc:
                 fail_count += 1
                 reason = str(exc)
@@ -2519,6 +2521,24 @@ class ZabbixMigrator:
                 self.results["usergroups"]["errors"].append(
                     {"name": grp_name, "reason": reason})
                 logger.debug("Usergroup '%s' failed: %s", grp_name, reason)
+
+        # ── End-of-run summary of incomplete rights ────────────────────────────
+        if incomplete_rights:
+            # Group by usergroup name for a clean table
+            from collections import defaultdict
+            by_grp: Dict[str, List[tuple]] = defaultdict(list)
+            for ug_name, kind, gname, plabel in incomplete_rights:
+                by_grp[ug_name].append((kind, gname, plabel))
+
+            print(f"\n  [Usergroups] ── Incomplete rights summary "
+                  f"({len(incomplete_rights)} right(s) dropped across "
+                  f"{len(by_grp)} usergroup(s)) ──")
+            for ug_name, entries in by_grp.items():
+                print(f"    Usergroup: {ug_name}")
+                for kind, gname, plabel in entries:
+                    kind_label = "Host group     " if kind == "host" else "Template group "
+                    print(f"      {kind_label} not in dest: {gname}  [{plabel}]")
+            print()
 
         # ── Persist results ────────────────────────────────────────────────────
         self.results["usergroups"]["migrated"] += ok_count
