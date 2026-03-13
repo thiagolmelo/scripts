@@ -2383,23 +2383,85 @@ class ZabbixMigrator:
             src_tg_map = {}
 
         # ── 3. Bulk-resolve group names → IDs in destination ──────────────────
+        # Both maps are kept as lists (not dicts) so we can iterate for prefix
+        # matching: a right on group "A" is expanded to "A" and all "A/*" children.
         try:
-            dst_hg_map = {
-                g["name"]: g["groupid"]
+            dst_hg_list = [
+                (g["name"], g["groupid"])
                 for g in self.dest.hostgroup.get(output=["groupid", "name"])
-            }
+            ]
         except Exception as exc:
             print(f"  [Usergroups] WARNING: could not fetch dest host groups: {exc}")
-            dst_hg_map = {}
+            dst_hg_list = []
 
         try:
-            dst_tg_map = {
-                g["name"]: g["groupid"]
+            dst_tg_list = [
+                (g["name"], g["groupid"])
                 for g in self.dest.templategroup.get(output=["groupid", "name"])
-            }
+            ]
         except Exception as exc:
             print(f"  [Usergroups] WARNING: could not fetch dest template groups: {exc}")
-            dst_tg_map = {}
+            dst_tg_list = []
+
+        def _expand_rights(
+                src_rights: List[Dict],
+                src_id_to_name: Dict[str, str],
+                dst_name_id_list: List[tuple],
+                kind: str,
+                grp_name: str,
+        ) -> tuple:
+            """
+            For each right in src_rights, resolve the source group name, then
+            find ALL destination groups that are the group itself OR a subgroup
+            (i.e. name == parent or name.startswith(parent + "/")), and emit
+            one right entry per match using the same permission.
+
+            When two source rights expand onto the same destination group ID,
+            the higher permission value wins (higher = broader access).
+
+            Returns:
+                dst_rights   : list of {"id": ..., "permission": ...} for the API
+                missing      : list of (src_group_name, perm_label) where zero
+                               dest matches were found (neither parent nor child)
+                expanded_log : list of (src_name, dst_name, perm_label) for every
+                               subgroup that was auto-added beyond the direct match
+            """
+            # groupid → highest permission seen so far  (dedup + max-perm)
+            merged: Dict[str, str] = {}
+            missing:      List[tuple] = []
+            expanded_log: List[tuple] = []
+
+            for right in src_rights:
+                src_id = right["id"]
+                perm   = str(right["permission"])
+                src_name = src_id_to_name.get(src_id)
+                if not src_name:
+                    logger.debug("Usergroup '%s': unknown source %s id %s",
+                                 grp_name, kind, src_id)
+                    continue
+
+                prefix  = src_name + "/"
+                matches = [
+                    (dst_name, dst_id)
+                    for dst_name, dst_id in dst_name_id_list
+                    if dst_name == src_name or dst_name.startswith(prefix)
+                ]
+
+                if not matches:
+                    missing.append((src_name, _PERM_LABEL.get(perm, perm)))
+                    continue
+
+                for dst_name, dst_id in matches:
+                    # Keep the higher permission when two source rights collide
+                    if dst_id not in merged or int(perm) > int(merged[dst_id]):
+                        merged[dst_id] = perm
+                    # Track subgroups added beyond the direct match
+                    if dst_name != src_name:
+                        expanded_log.append(
+                            (src_name, dst_name, _PERM_LABEL.get(perm, perm)))
+
+            dst_rights = [{"id": gid, "permission": p} for gid, p in merged.items()]
+            return dst_rights, missing, expanded_log
 
         # ── 4. Iterate, resolve, create/update ────────────────────────────────
         # Human-readable permission labels (same values in 6.4 and 7.0)
@@ -2428,47 +2490,34 @@ class ZabbixMigrator:
                 except Exception as exc:
                     logger.debug("Could not check existence of '%s': %s", grp_name, exc)
 
-            # ── Resolve host-group rights ──────────────────────────────────────
-            # 6.4 source returns these under "rights" (selectRights param).
-            # 7.0 destination accepts them under "hostgroup_rights".
-            dst_hg_rights: List[Dict] = []
-            # Each entry: (group_name, perm_label)
-            missing_hg: List[tuple] = []
+            # ── Resolve host-group rights (with subgroup expansion) ────────────
+            dst_hg_rights, missing_hg, expanded_hg = _expand_rights(
+                src_rights       = grp.get("rights") or [],
+                src_id_to_name   = src_hg_map,
+                dst_name_id_list = dst_hg_list,
+                kind             = "host group",
+                grp_name         = grp_name,
+            )
 
-            for right in (grp.get("rights") or []):
-                src_id = right["id"]
-                perm   = str(right["permission"])
-                name   = src_hg_map.get(src_id)
-                if not name:
-                    logger.debug("Usergroup '%s': unknown source host group id %s",
-                                 grp_name, src_id)
-                    continue
-                dst_id = dst_hg_map.get(name)
-                if dst_id:
-                    dst_hg_rights.append({"id": dst_id, "permission": perm})
-                else:
-                    missing_hg.append((name, _PERM_LABEL.get(perm, perm)))
-
-            # ── Resolve template-group rights ──────────────────────────────────
+            # ── Resolve template-group rights (with subgroup expansion) ─────────
             raw_tg = (grp.get("templategroup_rights")
                       or grp.get("template_group_rights")
                       or [])
-            dst_tg_rights: List[Dict] = []
-            missing_tg: List[tuple] = []
+            dst_tg_rights, missing_tg, expanded_tg = _expand_rights(
+                src_rights       = raw_tg,
+                src_id_to_name   = src_tg_map,
+                dst_name_id_list = dst_tg_list,
+                kind             = "template group",
+                grp_name         = grp_name,
+            )
 
-            for right in raw_tg:
-                src_id = right["id"]
-                perm   = str(right["permission"])
-                name   = src_tg_map.get(src_id)
-                if not name:
-                    logger.debug("Usergroup '%s': unknown source template group id %s",
-                                 grp_name, src_id)
-                    continue
-                dst_id = dst_tg_map.get(name)
-                if dst_id:
-                    dst_tg_rights.append({"id": dst_id, "permission": perm})
-                else:
-                    missing_tg.append((name, _PERM_LABEL.get(perm, perm)))
+            # ── Log auto-expanded subgroups ────────────────────────────────────
+            for src_name, dst_name, plabel in expanded_hg:
+                logger.debug("Usergroup '%s': host group '%s' → also applied to "
+                             "subgroup '%s' [%s]", grp_name, src_name, dst_name, plabel)
+            for src_name, dst_name, plabel in expanded_tg:
+                logger.debug("Usergroup '%s': template group '%s' → also applied to "
+                             "subgroup '%s' [%s]", grp_name, src_name, dst_name, plabel)
 
             # ── Print per-group missing rights immediately ─────────────────────
             if missing_hg:
