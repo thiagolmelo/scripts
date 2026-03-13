@@ -87,7 +87,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Migration order when 'all' is requested
-MIGRATION_ORDER = ["templates", "hosts", "maps", "dashboards"]
+MIGRATION_ORDER = ["templates", "hosts", "maps", "dashboards", "usergroups"]
 
 # Sentinel: widget field references a deleted / inaccessible object
 _INACCESSIBLE = "__INACCESSIBLE__"
@@ -492,11 +492,13 @@ class ZabbixMigrator:
                  skip_existing: bool = False,
                  dashboard_filter: Optional[str] = None,
                  host_filter: Optional[str] = None,
+                 usergroup_filter: Optional[str] = None,
                  debug_json: bool = False):
-        self.cia_name         = cia_name
-        self.skip_existing    = skip_existing
-        self.dashboard_filter = dashboard_filter
-        self.host_filter      = host_filter
+        self.cia_name          = cia_name
+        self.skip_existing     = skip_existing
+        self.dashboard_filter  = dashboard_filter
+        self.host_filter       = host_filter
+        self.usergroup_filter  = usergroup_filter
         self.debug_json       = debug_json
         self._source_url      = source_url  # kept for raw API calls
         self._dest_url        = dest_url   # kept for raw API calls (bypass pyzabbix)
@@ -2296,6 +2298,247 @@ class ZabbixMigrator:
             )
         return data.get("result", True)
 
+    # =======================================================================
+    # 5. USER GROUPS
+    # =======================================================================
+
+    def migrate_usergroups(self):
+        """
+        Migrate user groups from source (6.4) to destination (7.0).
+
+        Algorithm
+        ─────────
+        1. Fetch every usergroup from source with its host-group rights and
+           template-group rights.
+        2. Resolve each right's group ID to a group name using bulk lookups
+           against the source.
+        3. In destination, resolve each group name back to an ID.
+        4. Create the usergroup if it does not exist; update it if it does.
+
+        API differences between 6.4 (source) and 7.0 (destination)
+        ─────────────────────────────────────────────────────────────
+        Source 6.4  selectRights               → rights[]            (host groups)
+                    selectTemplateGroupRights   → templategroup_rights[] (tpl groups)
+
+        Dest   7.0  create/update uses:
+                    hostgroup_rights[]          (snake_case, replaces 6.4 "rights")
+                    templategroup_rights[]      (same name as 6.4 response key)
+
+        Rights permission values are identical in both versions:
+          0 = Deny  1 = (none)  2 = Read  3 = Read-Write
+
+        What is NOT migrated
+        ────────────────────
+        • User membership      — users themselves are not migrated by this script
+        • Tag filters          — reference source host/group IDs which differ in dest
+        """
+        print("  [Usergroups] Fetching usergroups from source...")
+
+        # ── 1. Fetch all source usergroups with rights ─────────────────────────
+        try:
+            src_groups = self.source.usergroup.get(
+                output=["usrgrpid", "name", "gui_access",
+                        "users_status", "debug_mode"],
+                selectRights="extend",                # host-group rights in 6.4
+                selectTemplateGroupRights="extend",   # template-group rights
+            )
+        except Exception as exc:
+            print(f"  [Usergroups] ERROR: could not fetch from source: {exc}")
+            self.results["usergroups"]["failed"] += 1
+            return
+
+        self.counts["usergroups"]["src_total"] = len(src_groups)
+        print(f"  [Usergroups] Found {len(src_groups)} usergroup(s) in source.")
+
+        # ── Optional single-group filter ───────────────────────────────────────
+        if self.usergroup_filter:
+            src_groups = [g for g in src_groups
+                          if g["name"] == self.usergroup_filter]
+            if not src_groups:
+                print(f"  [Usergroups] Usergroup '{self.usergroup_filter}' "
+                      f"not found in source.")
+                return
+            print(f"  [Usergroups] Filtered to: '{self.usergroup_filter}'.")
+
+        if not src_groups:
+            return
+
+        # ── 2. Bulk-resolve group IDs → names in source ────────────────────────
+        try:
+            src_hg_map = {
+                g["groupid"]: g["name"]
+                for g in self.source.hostgroup.get(output=["groupid", "name"])
+            }
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch source host groups: {exc}")
+            src_hg_map = {}
+
+        try:
+            src_tg_map = {
+                g["groupid"]: g["name"]
+                for g in self.source.templategroup.get(output=["groupid", "name"])
+            }
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch source template groups: {exc}")
+            src_tg_map = {}
+
+        # ── 3. Bulk-resolve group names → IDs in destination ──────────────────
+        try:
+            dst_hg_map = {
+                g["name"]: g["groupid"]
+                for g in self.dest.hostgroup.get(output=["groupid", "name"])
+            }
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch dest host groups: {exc}")
+            dst_hg_map = {}
+
+        try:
+            dst_tg_map = {
+                g["name"]: g["groupid"]
+                for g in self.dest.templategroup.get(output=["groupid", "name"])
+            }
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch dest template groups: {exc}")
+            dst_tg_map = {}
+
+        # ── 4. Iterate, resolve, create/update ────────────────────────────────
+        ok_count   = 0
+        skip_count = 0
+        fail_count = 0
+        ok_names: List[str] = []
+
+        for grp in src_groups:
+            grp_name = grp["name"]
+
+            # --skip-existing: check once, skip if already present
+            if self.skip_existing:
+                try:
+                    if self.dest.usergroup.get(
+                            filter={"name": grp_name}, output=["usrgrpid"]):
+                        skip_count += 1
+                        logger.debug("Usergroup '%s' already exists, skipping.", grp_name)
+                        continue
+                except Exception as exc:
+                    logger.debug("Could not check existence of '%s': %s", grp_name, exc)
+
+            # ── Resolve host-group rights ──────────────────────────────────────
+            # 6.4 source returns these under "rights" (selectRights param).
+            # 7.0 destination accepts them under "hostgroup_rights".
+            dst_hg_rights: List[Dict] = []
+            missing_hg:    List[str]  = []
+
+            for right in (grp.get("rights") or []):
+                src_id = right["id"]
+                perm   = right["permission"]
+                name   = src_hg_map.get(src_id)
+                if not name:
+                    logger.debug("Usergroup '%s': unknown source host group id %s",
+                                 grp_name, src_id)
+                    continue
+                dst_id = dst_hg_map.get(name)
+                if dst_id:
+                    dst_hg_rights.append({"id": dst_id, "permission": perm})
+                else:
+                    missing_hg.append(name)
+
+            # ── Resolve template-group rights ──────────────────────────────────
+            # Both 6.4 and 7.0 use "templategroup_rights" as the response key,
+            # but 6.4 may also return it as "templategroup_rights" — handle both.
+            raw_tg = (grp.get("templategroup_rights")
+                      or grp.get("template_group_rights")
+                      or [])
+            dst_tg_rights: List[Dict] = []
+            missing_tg:    List[str]  = []
+
+            for right in raw_tg:
+                src_id = right["id"]
+                perm   = right["permission"]
+                name   = src_tg_map.get(src_id)
+                if not name:
+                    logger.debug("Usergroup '%s': unknown source template group id %s",
+                                 grp_name, src_id)
+                    continue
+                dst_id = dst_tg_map.get(name)
+                if dst_id:
+                    dst_tg_rights.append({"id": dst_id, "permission": perm})
+                else:
+                    missing_tg.append(name)
+
+            # Warn about groups that exist in source rights but not in destination
+            if missing_hg:
+                logger.debug("Usergroup '%s': host groups absent in dest: %s",
+                             grp_name, missing_hg)
+            if missing_tg:
+                logger.debug("Usergroup '%s': template groups absent in dest: %s",
+                             grp_name, missing_tg)
+
+            # ── Build 7.0 payload ──────────────────────────────────────────────
+            payload = {
+                "name":                 grp_name,
+                "gui_access":           grp.get("gui_access",   "0"),
+                "users_status":         grp.get("users_status", "0"),
+                "debug_mode":           grp.get("debug_mode",   "0"),
+                "hostgroup_rights":     dst_hg_rights,   # 7.0 snake_case name
+                "templategroup_rights": dst_tg_rights,   # same in 6.4 response + 7.0 input
+            }
+
+            # ── Create or update ───────────────────────────────────────────────
+            try:
+                existing = self.dest.usergroup.get(
+                    filter={"name": grp_name}, output=["usrgrpid"])
+
+                if existing:
+                    payload["usrgrpid"] = existing[0]["usrgrpid"]
+                    self.dest.usergroup.update(**payload)
+                    action = "updated"
+                else:
+                    self.dest.usergroup.create(**payload)
+                    action = "created"
+
+                ok_count += 1
+                ok_names.append(grp_name)
+                logger.debug("Usergroup '%s' %s (hg_rights=%d, tg_rights=%d).",
+                             grp_name, action,
+                             len(dst_hg_rights), len(dst_tg_rights))
+
+                if missing_hg or missing_tg:
+                    parts = []
+                    if missing_hg:
+                        parts.append(
+                            f"host groups not in dest: {', '.join(missing_hg)}")
+                    if missing_tg:
+                        parts.append(
+                            f"template groups not in dest: {', '.join(missing_tg)}")
+                    print(f"  [Usergroups] WARN '{grp_name}': "
+                          f"{'; '.join(parts)}")
+
+            except Exception as exc:
+                fail_count += 1
+                reason = str(exc)
+                print(f"  [Usergroups] FAIL '{grp_name}': {reason}")
+                self.results["usergroups"]["errors"].append(
+                    {"name": grp_name, "reason": reason})
+                logger.debug("Usergroup '%s' failed: %s", grp_name, reason)
+
+        # ── Persist results ────────────────────────────────────────────────────
+        self.results["usergroups"]["migrated"] += ok_count
+        self.results["usergroups"]["skipped"]  += skip_count
+        self.results["usergroups"]["failed"]   += fail_count
+        self.results["usergroups"]["names"].extend(ok_names)
+
+        try:
+            self.counts["usergroups"]["dst_total"] = int(
+                self.dest.usergroup.get(countOutput=True))
+        except Exception:
+            pass
+
+        print(f"  [Usergroups] Done: {ok_count} created/updated, "
+              f"{skip_count} skipped, {fail_count} failed.")
+
+    # =======================================================================
+    # Utilities
+    # =======================================================================
+
     def _ensure_groups_in_dest(
             self, src_groups: List[Dict], name_key: str,
             getter, creator, label: str):
@@ -3084,9 +3327,9 @@ Config files (same directory as this script):
     )
     parser.add_argument(
         "--migrate", default=None, nargs="+",
-        choices=["templates", "hosts", "maps", "dashboards", "all"],
+        choices=["templates", "hosts", "maps", "dashboards", "usergroups", "all"],
         metavar="TYPE",
-        help="Object type(s) to migrate: templates hosts maps dashboards all"
+        help="Object type(s) to migrate: templates hosts maps dashboards usergroups all"
     )
     parser.add_argument(
         "--dashboard", default=None, metavar="NAME",
@@ -3095,6 +3338,10 @@ Config files (same directory as this script):
     parser.add_argument(
         "--host", default=None, metavar="NAME",
         help="(hosts only) Migrate a single host by exact name"
+    )
+    parser.add_argument(
+        "--usergroup", default=None, metavar="NAME",
+        help="(usergroups only) Migrate a single user group by exact name"
     )
     parser.add_argument(
         "--skip-existing", action="store_true",
@@ -3208,6 +3455,10 @@ Config files (same directory as this script):
     print()
     if args.dashboard:
         print(f"  dashboard filter='{args.dashboard}'")
+    if args.host:
+        print(f"  host filter='{args.host}'")
+    if args.usergroup:
+        print(f"  usergroup filter='{args.usergroup}'")
     if args.skip_existing:
         print("  mode=skip-existing")
     print("=" * 70)
@@ -3248,6 +3499,7 @@ Config files (same directory as this script):
                 skip_existing=args.skip_existing,
                 dashboard_filter=args.dashboard,
                 host_filter=args.host,
+                usergroup_filter=args.usergroup,
                 debug_json=args.debug_json,
             )
 
@@ -3261,6 +3513,8 @@ Config files (same directory as this script):
                     migrator.migrate_maps()
                 elif mtype == "dashboards":
                     migrator.migrate_dashboards()
+                elif mtype == "usergroups":
+                    migrator.migrate_usergroups()
 
             # Run comparison after migration (or standalone when no --migrate given)
             if args.compare is not None:
