@@ -2202,6 +2202,15 @@ class ZabbixMigrator:
 
             clean["pages"].append(clean_page)
 
+        # Debug: print exact dimensions being sent to API
+        if self.debug_dashboard:
+            print("    [debug-dashboard] SENDING to API:")
+            for pg in clean.get("pages", []):
+                for ww in pg.get("widgets", []):
+                    print(f"      widget='{ww['name'][:30]}' "
+                          f"x={ww['x']} y={ww['y']} "
+                          f"width={ww['width']} height={ww['height']}")
+
         self.dest.dashboard.create(**clean)
         print(f"    + Created: {name}")
 
