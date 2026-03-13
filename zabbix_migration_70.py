@@ -498,6 +498,7 @@ class ZabbixMigrator:
                  host_filter: Optional[str] = None,
                  usergroup_filter: Optional[str] = None,
                  debug_json: bool = False,
+                 debug_dashboard: bool = False,
                  pilalert_token: str = ""):
         self.cia_name          = cia_name
         self.skip_existing     = skip_existing
@@ -505,6 +506,7 @@ class ZabbixMigrator:
         self.host_filter       = host_filter
         self.usergroup_filter  = usergroup_filter
         self.debug_json        = debug_json
+        self.debug_dashboard   = debug_dashboard
         self.pilalert_token    = pilalert_token   # Basic token for pilalerte API
         self._source_url       = source_url  # kept for raw API calls
         self._dest_url         = dest_url   # kept for raw API calls (bypass pyzabbix)
@@ -1533,6 +1535,10 @@ class ZabbixMigrator:
             self.results["dashboards"]["migrated"] += 1
             self.results["dashboards"]["names"].append(name)
 
+            # --debug-dashboard: dump source + destination full details to JSON
+            if self.debug_dashboard:
+                self._dump_dashboard_debug(dashboard, name)
+
         except Exception as exc:
             print(f"    x Error: {exc}")
             self.results["dashboards"]["failed"] += 1
@@ -2202,6 +2208,80 @@ class ZabbixMigrator:
     # -----------------------------------------------------------------------
     # Dashboard: helpers
     # -----------------------------------------------------------------------
+
+    def _dump_dashboard_debug(self, src_dashboard: Dict, name: str):
+        """
+        Fetch full dashboard details from source and destination and write
+        them side-by-side to dashboard_debug_<sanitised_name>.json next to
+        the script.  The file contains:
+          - src_raw      : raw dashboard.get output from source (6.4)
+          - dst_raw      : raw dashboard.get output from destination (7.0)
+          - src_widgets  : list of {name, type, pos} for easy comparison
+          - dst_widgets  : same for destination
+        """
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+        out_path = os.path.join(BASE_DIR, f"dashboard_debug_{safe_name}.json")
+
+        try:
+            # Full source record (use the one we already have from dashboard.get)
+            src_full = self.source.dashboard.get(
+                filter={"name": name},
+                output="extend",
+                selectPages="extend",
+                selectUsers="extend",
+                selectUserGroups="extend",
+            )
+        except Exception as exc:
+            src_full = [{"error": str(exc)}]
+
+        try:
+            dst_full = self.dest.dashboard.get(
+                filter={"name": name},
+                output="extend",
+                selectPages="extend",
+                selectUsers="extend",
+                selectUserGroups="extend",
+            )
+        except Exception as exc:
+            dst_full = [{"error": str(exc)}]
+
+        def _widget_summary(pages):
+            out = []
+            for page in (pages or []):
+                for w in (page.get("widgets") or []):
+                    out.append({
+                        "page":   page.get("name", ""),
+                        "name":   w.get("name", ""),
+                        "type":   w.get("type", ""),
+                        "x":      w.get("x"),
+                        "y":      w.get("y"),
+                        "width":  w.get("width"),
+                        "height": w.get("height"),
+                    })
+            return out
+
+        src_pages = src_full[0].get("pages", []) if src_full else []
+        dst_pages = dst_full[0].get("pages", []) if dst_full else []
+
+        debug_data = {
+            "dashboard_name": name,
+            "src_version":    "6.4",
+            "dst_version":    "7.0",
+            "grid": {
+                "src_max_columns": 24,
+                "dst_max_columns": 72,
+                "scale_factor":    GRID_SCALE,
+            },
+            "src_widgets": _widget_summary(src_pages),
+            "dst_widgets": _widget_summary(dst_pages),
+            "src_raw":     src_full[0] if src_full else {},
+            "dst_raw":     dst_full[0] if dst_full else {},
+        }
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(debug_data, f, indent=2, ensure_ascii=False)
+
+        print(f"    [debug-dashboard] Written: {out_path}")
 
     def _dashboard_exists(self, name: str) -> bool:
         return bool(self.dest.dashboard.get(
@@ -3582,6 +3662,15 @@ Config files (same directory as this script):
             "before each import call — useful to diagnose serialization errors"
         )
     )
+    parser.add_argument(
+        "--debug-dashboard", action="store_true",
+        help=(
+            "After each dashboard is created, fetch full dashboard.get output "
+            "from both source and destination and write them side-by-side to "
+            "dashboard_debug_<name>.json next to the script. Use this to compare "
+            "widget positions/sizes between the two versions."
+        )
+    )
     args = parser.parse_args()
 
     # Logging
@@ -3715,6 +3804,7 @@ Config files (same directory as this script):
                 host_filter=args.host,
                 usergroup_filter=args.usergroup,
                 debug_json=args.debug_json,
+                debug_dashboard=args.debug_dashboard,
                 pilalert_token=creds.get("pilalert_token", ""),
             )
 
