@@ -2179,9 +2179,9 @@ class ZabbixMigrator:
                 y      = int(widget.get("y", 0))
                 height = int(widget.get("height", 2))
 
-                if x + width > 36:
-                    width = 36 - x
-                width  = max(1, min(width, 36))
+                if x + width > 72:
+                    width = 72 - x
+                width  = max(1, min(width, 72))
                 height = max(2, min(height, 32))
 
                 cw = {
