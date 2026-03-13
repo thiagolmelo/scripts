@@ -112,9 +112,9 @@ FIELD_TYPE_MAP            = "8"
 # Zabbix 6.4 tag filter fields — flat structure incompatible with 7.0 API
 _TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
 
-# Grid: 6.4 = 24 cols, 7.0 = 36 cols. Only horizontal scaled (x1.5).
-# Vertical grid is identical in both versions (y 0-62, height 2-32).
-GRID_SCALE = 1.5
+# Grid: 6.4 = 24 cols (max_columns=24), 7.0 = 72 cols (max_columns=72).
+# Scale factor = 72/24 = 3.0  (horizontal only; vertical is identical).
+GRID_SCALE = 3.0
 
 # Configuration import rules
 # ---------------------------------------------------------------------------
@@ -2162,7 +2162,7 @@ class ZabbixMigrator:
             }
             for widget in page.get("widgets", []):
                 # --- Grid scaling (horizontal only, per official docs) ---
-                # 6.4: x 0-23, width 1-24   7.0: x 0-35, width 1-36  (x1.5)
+                # 6.4: x 0-23, width 1-24   7.0: x 0-71, width 1-72  (x3.0)
                 # Vertical unchanged: y 0-62, height 2-32
                 src_x = int(widget.get("x", 0))
                 src_w = int(widget.get("width", 1))
