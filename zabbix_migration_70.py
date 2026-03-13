@@ -117,11 +117,44 @@ _TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
 GRID_SCALE = 1.5
 
 # Configuration import rules
+# ---------------------------------------------------------------------------
+# configuration.export / configuration.import  —  API contract reference
+# ---------------------------------------------------------------------------
+#
+# EXPORT  (called on SOURCE — Zabbix 6.4)
+# ───────────────────────────────────────
+#   method : configuration.export
+#   params :
+#     format  : "yaml" | "json"   (we use yaml for tpl/hosts, json for maps)
+#     options : object whose keys select what to export:
+#       templates     → array of templateids
+#       hosts         → array of hostids
+#       maps          → array of sysmapids
+#       (also valid: groups, templateGroups, images, mediaTypes — not used here)
+#   result  : plain string (yaml/json export payload)
+#
+# IMPORT  (called on DESTINATION — Zabbix 7.0)
+# ─────────────────────────────────────────────
+#   method : configuration.import
+#   params :
+#     format  : "yaml" | "json"
+#     source  : the export string returned above
+#     rules   : object controlling create/update/delete behaviour per entity
+#               KEY NAMING in 7.0:
+#                 snake_case → host_groups, template_groups
+#                 camelCase  → everything else (templates, hosts, items, …)
+#   result  : true on success
+#
+#   7.0 automatically upgrades 6.4 export payloads (version tag in YAML/JSON
+#   header triggers Zabbix's internal schema-upgrade path).
+# ---------------------------------------------------------------------------
+
 TEMPLATE_IMPORT_RULES = {
-    # Zabbix 7.0 API uses snake_case for group rules, camelCase for the rest.
-    # template_groups pre-created by _ensure_template_groups_for_templates(),
-    # but including it here lets the import create any that were missed.
+    # ── groups ──────────────────────────────────────────────────────────────
+    # snake_case in 7.0; pre-created by _ensure_template_groups_for_templates()
+    # but included here so any missed groups are created automatically.
     "template_groups":    {"createMissing": True,  "updateExisting": False},
+    # ── template + its owned objects ────────────────────────────────────────
     "templates":          {"createMissing": True,  "updateExisting": True},
     "templateDashboards": {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "templateLinkage":    {"createMissing": True,  "deleteMissing": False},
@@ -129,18 +162,17 @@ TEMPLATE_IMPORT_RULES = {
     "triggers":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "graphs":             {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "discoveryRules":     {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "valueMaps":          {"createMissing": True,  "updateExisting": False},
     "httptests":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "valueMaps":          {"createMissing": True,  "updateExisting": False},
 }
 
 # Same as TEMPLATE_IMPORT_RULES but with templateDashboards disabled.
-# Used in the first of the two-step template import:
-#   Step 1 (this): create the template, its items, graphs, triggers, etc.
-#   Step 2 (full): now that graphs exist, import again with templateDashboards
-#                  so dashboard widgets that reference those graphs can resolve.
-# Zabbix 7.0 processes template dashboards before top-level graphs during a
-# single import call, so a one-shot import fails with "Cannot find graph …
-# used in dashboard".  The two-step approach avoids this ordering issue.
+# Used in Step 1 of the two-step template import:
+#   Step 1 (this)   : import template + items + graphs (no dashboards)
+#   Step 2 (full)   : re-import with dashboards; graphs exist so widget refs resolve
+# Reason: Zabbix 7.0 resolves templateDashboard graph references before it
+# finishes creating top-level graphs in a single import, so a one-shot import
+# fails with "Cannot find graph … used in dashboard".
 TEMPLATE_IMPORT_RULES_NO_DASHBOARDS = {
     "template_groups":    {"createMissing": True,  "updateExisting": False},
     "templates":          {"createMissing": True,  "updateExisting": True},
@@ -150,34 +182,39 @@ TEMPLATE_IMPORT_RULES_NO_DASHBOARDS = {
     "triggers":           {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "graphs":             {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
     "discoveryRules":     {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
-    "valueMaps":          {"createMissing": True,  "updateExisting": False},
     "httptests":          {"createMissing": True,  "updateExisting": True,  "deleteMissing": False},
+    "valueMaps":          {"createMissing": True,  "updateExisting": False},
 }
 
 HOST_IMPORT_RULES = {
-    # Zabbix 7.0 API uses snake_case for group rules, camelCase for the rest.
-    # host_groups pre-created by _ensure_host_groups_for_hosts(), but including
-    # it here lets the import create any that were missed.
-    #
-    # items/triggers/graphs/discoveryRules are intentionally DISABLED:
-    # we only import the host skeleton (interfaces, groups, macros) and its
-    # template linkages.  Zabbix automatically propagates all template-owned
-    # objects when the linkage is created.  Directly-created objects (no
-    # templateid) are not recreated — they belong to the source host only.
+    # ── groups ──────────────────────────────────────────────────────────────
+    # snake_case in 7.0; pre-created by _ensure_host_groups_for_hosts().
     "host_groups":     {"createMissing": True,  "updateExisting": False},
+    # ── host skeleton + template linkage ────────────────────────────────────
+    # items/triggers/graphs/discoveryRules are intentionally DISABLED.
+    # We import only the host shell (interfaces, groups, macros, inventory)
+    # and its template links.  Zabbix auto-propagates all template-owned
+    # objects when the link is created.  Directly-created host objects (no
+    # templateid in source) are NOT migrated — they belong to the source host.
     "hosts":           {"createMissing": True,  "updateExisting": True},
     "templateLinkage": {"createMissing": True,  "deleteMissing": False},
     "items":           {"createMissing": False, "updateExisting": False, "deleteMissing": False},
     "triggers":        {"createMissing": False, "updateExisting": False, "deleteMissing": False},
     "graphs":          {"createMissing": False, "updateExisting": False, "deleteMissing": False},
     "discoveryRules":  {"createMissing": False, "updateExisting": False, "deleteMissing": False},
-    "valueMaps":       {"createMissing": False, "updateExisting": False},
     "httptests":       {"createMissing": False, "updateExisting": False, "deleteMissing": False},
+    "valueMaps":       {"createMissing": False, "updateExisting": False},
 }
 
 MAP_IMPORT_RULES = {
-    "maps":   {"createMissing": True, "updateExisting": True},
-    "images": {"createMissing": True, "updateExisting": False},
+    # maps   : the network maps themselves (selements, links, shapes, etc.)
+    # images : background images referenced by map selements (elementtype=4)
+    # icon_maps : custom icon-mapping sets referenced by selement.iconmapid.
+    #             6.4 embeds icon_maps inline in the export; without this rule
+    #             7.0 creates maps with missing icons instead of failing loudly.
+    "maps":      {"createMissing": True, "updateExisting": True},
+    "images":    {"createMissing": True, "updateExisting": False},
+    "icon_maps": {"createMissing": True, "updateExisting": False},
 }
 
 logger = logging.getLogger(__name__)
@@ -2079,18 +2116,33 @@ class ZabbixMigrator:
     def _raw_export(self, object_type: str, ids: List[str],
                     fmt: str = "yaml") -> str:
         """
-        Call configuration.export via raw HTTP POST on the SOURCE instance,
-        bypassing pyzabbix so the result is always a plain string.
+        Call ``configuration.export`` on the SOURCE (Zabbix 6.4) instance.
 
-        object_type: 'templates', 'hosts', or 'maps'
-        ids:         list of id strings to export
-        fmt:         export format — 'yaml' (default) or 'json'.
-                     Maps use JSON: PyYAML 1.1 corrupts unquoted hex color strings
-                     (e.g. "000000" → int 0) that Zabbix 7.0 rejects as non-string.
-                     JSON has no type ambiguity; colors are always strings.
-                     Templates/hosts use YAML: the 6.4 YAML exporter writes empty
-                     arrays as `{  }` which we fix in the patch pipeline, whereas
-                     the JSON exporter omits empty arrays entirely (harder to detect).
+        Zabbix 6.4 API — configuration.export
+        ──────────────────────────────────────
+        params.format   : "yaml" | "json"  (we also accept "xml" but never use it)
+        params.options  : dict with ONE of:
+            templates     → list of templateids  (str)
+            hosts         → list of hostids      (str)
+            maps          → list of sysmapids    (str)
+            (also valid in 6.4: groups, templateGroups, images, mediaTypes)
+        result          : plain string (yaml/json/xml payload)
+
+        Format choice rationale
+        ───────────────────────
+        yaml   — used for templates and hosts.  Compact, human-readable.
+                 PyYAML 1.1 parses bare integers correctly for these objects
+                 (no hex-color fields exist in template/host exports).
+        json   — used for maps.  PyYAML 1.1 corrupts unquoted 6-digit hex
+                 strings: "000000" → int(0), "000066" → int(54).  Zabbix 7.0
+                 rejects non-string color values.  JSON preserves them as
+                 strings with no ambiguity.
+
+        Arguments
+        ─────────
+        object_type : "templates" | "hosts" | "maps"
+        ids         : list of ID strings (templateid / hostid / sysmapid)
+        fmt         : "yaml" (default) or "json"
         """
         import requests as _requests
 
@@ -2154,8 +2206,29 @@ class ZabbixMigrator:
 
     def _raw_import(self, fmt: str, source, rules: Dict):
         """
-        Call configuration.import via raw HTTP POST, bypassing pyzabbix
-        so that rule key names are never mangled.
+        Call ``configuration.import`` on the DESTINATION (Zabbix 7.0) instance.
+
+        Zabbix 7.0 API — configuration.import
+        ──────────────────────────────────────
+        params.format   : "yaml" | "json"  (must match the export format)
+        params.source   : the export string from configuration.export
+        params.rules    : dict controlling create/update/delete per entity type.
+
+        Rules key naming in 7.0  (differs from 6.4!)
+        ─────────────────────────────────────────────
+          snake_case  →  host_groups, template_groups
+          camelCase   →  templates, hosts, items, triggers, graphs,
+                         discoveryRules, templateDashboards, templateLinkage,
+                         httptests, valueMaps, maps, images, icon_maps, …
+
+        Version upgrade
+        ───────────────
+        Zabbix 7.0 automatically upgrades exports from 6.4: the YAML/JSON
+        payload carries a ``version: '6.4'`` header which triggers 7.0's
+        internal schema-upgrade path.  No manual transformation is required
+        except the JSON map-structure patches applied before this call.
+
+        result : true on success; raises on API error
         """
         import requests as _requests
 
