@@ -4,7 +4,7 @@
 zabbix_migration_70.py
 Migrates objects from Zabbix 6.4 to Zabbix 7.0.
 
-Supported object types (and their execution order when 'all' is selected):
+Supported object types (usergroups must be run explicitly — not included in 'all'):
   1. templates   - exported/imported via native configuration API
   2. hosts       - exported/imported via native configuration API
   3. maps        - exported/imported via native configuration API
@@ -90,12 +90,14 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.10"
+SCRIPT_VERSION = "2026-03-16.11"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Migration order when 'all' is requested
+# Canonical order for all object types
 MIGRATION_ORDER = ["templates", "hosts", "maps", "dashboards", "usergroups"]
+# Types included when --migrate all is used (usergroups excluded — run explicitly)
+MIGRATION_ALL   = ["templates", "hosts", "maps", "dashboards"]
 
 # Sentinel: widget field references a deleted / inaccessible object
 _INACCESSIBLE = "__INACCESSIBLE__"
@@ -4015,11 +4017,13 @@ class MissingObjectsError(Exception):
 # ---------------------------------------------------------------------------
 
 def parse_migrate_types(raw: List[str]) -> List[str]:
-    """Expand 'all' and deduplicate while preserving MIGRATION_ORDER."""
+    """Expand 'all' and deduplicate while preserving MIGRATION_ORDER.
+    Note: 'all' does NOT include 'usergroups' — run that explicitly.
+    """
     expanded = set()
     for item in raw:
         if item == "all":
-            expanded.update(MIGRATION_ORDER)
+            expanded.update(MIGRATION_ALL)
         else:
             expanded.add(item)
     return [t for t in MIGRATION_ORDER if t in expanded]
@@ -4164,6 +4168,7 @@ Config files (same directory as this script):
     parser.add_argument(
         "--migrate", default=None, nargs="+",
         choices=["templates", "hosts", "maps", "dashboards", "usergroups", "all"],
+        # Note: 'all' expands to templates+hosts+maps+dashboards only.
         metavar="TYPE",
         help="Object type(s) to migrate: templates hosts maps dashboards usergroups all"
     )
