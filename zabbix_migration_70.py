@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.6"
+SCRIPT_VERSION = "2026-03-16.8"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2717,6 +2717,101 @@ class ZabbixMigrator:
     # 5. USER GROUPS
     # =======================================================================
 
+    def update_dashboard_sharing(
+            self,
+            dashboard_filter: Optional[str],
+            group_names: List[str]):
+        """
+        Find dashboards in DESTINATION matching dashboard_filter (case-insensitive
+        substring) and add those groups with Read-Write permission.
+        Existing shares are preserved — new groups are merged in.
+        """
+        import re as _re2
+
+        def _norm(s: str) -> str:
+            return _re2.sub(r'[ \t]+', ' ', (s or '').strip()).lower()
+
+        print(f"  [ShareDashboards] Resolving {len(group_names)} group(s)...")
+
+        # Resolve group names to dest usrgrpids
+        target_groups: List[Dict] = []
+        for gname in group_names:
+            try:
+                data = self.dest.usergroup.get(
+                    filter={"name": gname}, output=["usrgrpid", "name"])
+                if data:
+                    target_groups.append({
+                        "usrgrpid":   data[0]["usrgrpid"],
+                        "permission": str(PERM_READ_WRITE),
+                        "_name":      data[0]["name"],
+                    })
+                    print(f"    + Group '{gname}' → usrgrpid {data[0]['usrgrpid']}")
+                else:
+                    print(f"    ! Group '{gname}' NOT found in destination — skipped")
+            except Exception as exc:
+                print(f"    ! Error resolving group '{gname}': {exc}")
+
+        if not target_groups:
+            print("  [ShareDashboards] No valid groups resolved — nothing to do.")
+            return
+
+        # Fetch matching dashboards from destination
+        try:
+            all_dash = self.dest.dashboard.get(
+                output=["dashboardid", "name"],
+                selectUserGroups="extend",
+                selectUsers="extend",
+            )
+        except Exception as exc:
+            print(f"  [ShareDashboards] ERROR fetching dest dashboards: {exc}")
+            return
+
+        if dashboard_filter:
+            needle = _norm(dashboard_filter)
+            matched = [d for d in all_dash
+                       if needle in _norm(d.get("name", ""))]
+        else:
+            matched = list(all_dash)
+
+        print(f"  [ShareDashboards] {len(matched)} dashboard(s) match "
+              f"'{dashboard_filter or '*'}'")
+
+        ok = skipped = failed = 0
+        for dash in matched:
+            dash_name = dash.get("name", "?")
+            dash_id   = dash["dashboardid"]
+            existing  = dash.get("userGroups") or []
+
+            existing_ids = {g["usrgrpid"] for g in existing}
+            new_groups   = list(existing)
+            added_names  = []
+            for tg in target_groups:
+                if tg["usrgrpid"] not in existing_ids:
+                    new_groups.append({
+                        "usrgrpid":   tg["usrgrpid"],
+                        "permission": tg["permission"],
+                    })
+                    existing_ids.add(tg["usrgrpid"])
+                    added_names.append(tg["_name"])
+
+            if not added_names:
+                skipped += 1
+                continue
+
+            try:
+                self.dest.dashboard.update(
+                    dashboardid=dash_id,
+                    userGroups=new_groups,
+                )
+                print(f"    + '{dash_name}' → added: {', '.join(added_names)}")
+                ok += 1
+            except Exception as exc:
+                print(f"    x '{dash_name}' — update failed: {exc}")
+                failed += 1
+
+        print(f"  [ShareDashboards] Done: {ok} updated, "
+              f"{skipped} already had groups, {failed} failed.")
+
     def migrate_usergroups(self):
         """
         Migrate user groups from source (6.4) to destination (7.0).
@@ -3097,6 +3192,107 @@ class ZabbixMigrator:
     # =======================================================================
     # Summary
     # =======================================================================
+
+    # =======================================================================
+    # Update dashboard sharing (destination only)
+    # =======================================================================
+
+    def update_dashboard_sharing(
+            self,
+            dashboard_filter: Optional[str],
+            group_names: List[str]):
+        """
+        Find all dashboards in DESTINATION matching dashboard_filter,
+        then set (or add) the given usergroups as Read-Write sharing entries.
+
+        Existing sharing entries are preserved; the specified groups are merged
+        in (no duplicates). If a group name is not found in destination it is
+        reported and skipped.
+        """
+        import re as _re
+
+        def _norm(s: str) -> str:
+            return _re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+        print(f"  [UpdateSharing] Resolving {len(group_names)} group(s) in destination...")
+
+        # ── Resolve group names → usrgrpid ────────────────────────────────────
+        target_groups: List[Dict] = []
+        for gname in group_names:
+            try:
+                data = self.dest.usergroup.get(
+                    filter={"name": gname}, output=["usrgrpid", "name"])
+                if data:
+                    target_groups.append({
+                        "usrgrpid":   data[0]["usrgrpid"],
+                        "permission": PERM_READ_WRITE,
+                        "_name":      data[0]["name"],
+                    })
+                    print(f"    + Group '{gname}' found (id={data[0]['usrgrpid']})")
+                else:
+                    print(f"    ! Group '{gname}' NOT found in destination — skipped")
+            except Exception as exc:
+                print(f"    ! Error resolving group '{gname}': {exc}")
+
+        if not target_groups:
+            print("  [UpdateSharing] No valid groups found — aborting.")
+            return
+
+        # ── Fetch matching dashboards from destination ────────────────────────
+        try:
+            all_dashboards = self.dest.dashboard.get(
+                output=["dashboardid", "name"],
+                selectUserGroups="extend",
+                selectUsers="extend",
+            )
+        except Exception as exc:
+            print(f"  [UpdateSharing] ERROR: could not fetch dest dashboards: {exc}")
+            return
+
+        if dashboard_filter:
+            needle = _norm(dashboard_filter)
+            matched = [d for d in all_dashboards
+                       if _norm(d.get("name", "")) == needle
+                       or needle in _norm(d.get("name", ""))]
+        else:
+            matched = all_dashboards
+
+        print(f"  [UpdateSharing] {len(matched)} dashboard(s) matched "
+              f"filter '{dashboard_filter or '*'}'")
+
+        ok = 0
+        failed = 0
+        for dash in matched:
+            did   = dash["dashboardid"]
+            dname = dash["name"]
+
+            # Merge existing groups + new target groups (deduplicate by usrgrpid)
+            existing = list(dash.get("userGroups") or [])
+            existing_ids = {g["usrgrpid"] for g in existing}
+            added = []
+            for tg in target_groups:
+                if tg["usrgrpid"] not in existing_ids:
+                    existing.append({
+                        "usrgrpid":   tg["usrgrpid"],
+                        "permission": tg["permission"],
+                    })
+                    existing_ids.add(tg["usrgrpid"])
+                    added.append(tg["_name"])
+
+            try:
+                self.dest.dashboard.update(
+                    dashboardid=did,
+                    userGroups=existing,
+                )
+                status = (f"added {len(added)} group(s): {', '.join(added)}"
+                          if added else "already had all groups — no change")
+                print(f"    ✓ '{dname}' — {status}")
+                ok += 1
+            except Exception as exc:
+                print(f"    ✗ '{dname}' — update failed: {exc}")
+                failed += 1
+
+        print(f"  [UpdateSharing] Done: {ok} updated, {failed} failed.")
 
     def print_summary(self, types_run: List[str]):
         """Print per-type statistics to console only. All detail is in the log file."""
@@ -3871,6 +4067,21 @@ Config files (same directory as this script):
             "widget positions/sizes between the two versions."
         )
     )
+    parser.add_argument(
+        "--update-sharing", action="store_true",
+        help=(
+            "Update sharing of dashboards in DESTINATION matching --dashboard "
+            "filter. Requires --share-group. Does not re-migrate."
+        )
+    )
+    parser.add_argument(
+        "--share-group", dest="share_groups", action="append", default=[],
+        metavar="GROUP_NAME",
+        help=(
+            "Usergroup to grant Read-Write sharing on matched dashboards. "
+            "Can be specified multiple times. Used with --update-sharing."
+        )
+    )
     args = parser.parse_args()
 
     # Logging
@@ -3893,21 +4104,24 @@ Config files (same directory as this script):
             sys.exit(0)
 
     # ── Validate migration/compare args ─────────────────────────────────────
-    if args.migrate or args.compare is not None:
+    if args.migrate or args.compare is not None or args.update_sharing:
         missing = []
         if not args.env:
             missing.append("--env")
         if not args.cia:
             missing.append("--cia")
+        if args.update_sharing and not args.share_groups:
+            print("ERROR: --update-sharing requires at least one --share-group.", file=sys.stderr)
+            sys.exit(1)
         if missing:
             print(
                 f"ERROR: {' and '.join(missing)} "
-                f"{'is' if len(missing) == 1 else 'are'} required when --migrate or --compare is used.",
+                f"{'is' if len(missing) == 1 else 'are'} required when --migrate, --compare or --update-sharing is used.",
                 file=sys.stderr
             )
             sys.exit(1)
     else:
-        # Neither --pull-repository nor --migrate nor --compare was given
+        # None of the action flags were given
         if args.pull_repository is None:
             parser.print_help()
             sys.exit(1)
@@ -3964,6 +4178,8 @@ Config files (same directory as this script):
         print(f"  usergroup filter='{args.usergroup}'")
     if args.skip_existing:
         print("  mode=skip-existing")
+    if args.update_sharing:
+        print(f"  update-sharing groups: {', '.join(args.share_groups)}")
     print("=" * 70)
 
     # Global totals
@@ -4020,6 +4236,13 @@ Config files (same directory as this script):
                     migrator.migrate_dashboards()
                 elif mtype == "usergroups":
                     migrator.migrate_usergroups()
+
+            if args.update_sharing:
+                print(f"\n  -- UPDATE SHARING --")
+                migrator.update_dashboard_sharing(
+                    dashboard_filter=args.dashboard,
+                    group_names=args.share_groups,
+                )
 
             # Run comparison after migration (or standalone when no --migrate given)
             if args.compare is not None:
