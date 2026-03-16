@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.4"
+SCRIPT_VERSION = "2026-03-16.5"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2289,6 +2289,34 @@ class ZabbixMigrator:
                         f for f in widget["fields"]
                         if not _TAG_FIELD_RE.match(f.get("name", ""))
                     ]
+
+                # Drop the entire widget if a required object reference field
+                # (graph, item, map, item_proto, graph_proto) is missing.
+                # An empty required field causes "Invalid parameter: cannot be empty"
+                # in the Zabbix UI — better to omit the widget entirely.
+                _REQUIRED_FIELD_NAMES = {
+                    "graph":  {"graphid"},
+                    "graph2": {"graphid"},
+                    "svggraph": set(),          # svggraph has no single required id
+                    "graphprototype": {"graphid"},
+                    "item":   {"itemid"},
+                    "web":    {"httptestid"},
+                    "map":    {"sysmapid"},
+                }
+                wtype = widget.get("type", "")
+                required_names = _REQUIRED_FIELD_NAMES.get(wtype, set())
+                if required_names:
+                    present_names = {
+                        f.get("name") for f in cw.get("fields", [])
+                        if f.get("value") not in (None, "", "0")
+                    }
+                    missing_required = required_names - present_names
+                    if missing_required:
+                        print(f"      ~ Widget '{cw['name']}' (type:{wtype}) "
+                              f"dropped — required field(s) empty: "
+                              f"{', '.join(sorted(missing_required))}")
+                        continue   # skip appending this widget
+
                 clean_page["widgets"].append(cw)
 
             clean["pages"].append(clean_page)
