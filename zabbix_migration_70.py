@@ -1472,12 +1472,20 @@ class ZabbixMigrator:
 
         # Filter to a specific dashboard if requested
         if self.dashboard_filter:
-            dashboards = [d for d in dashboards
-                          if d.get("name") == self.dashboard_filter]
+            # Try exact match first, then case-insensitive contains fallback
+            exact = [d for d in dashboards
+                     if d.get("name") == self.dashboard_filter]
+            if exact:
+                dashboards = exact
+            else:
+                needle = self.dashboard_filter.lower()
+                dashboards = [d for d in dashboards
+                              if needle in (d.get("name") or "").lower()]
             if not dashboards:
                 print(f"  [Dashboards] Dashboard '{self.dashboard_filter}' not found in source.")
                 return
-            print(f"  [Dashboards] Filtered to: '{self.dashboard_filter}'")
+            print(f"  [Dashboards] Filtered to {len(dashboards)} dashboard(s) "
+                  f"matching '{self.dashboard_filter}'")
 
         print()
         for dashboard in dashboards:
@@ -1599,7 +1607,16 @@ class ZabbixMigrator:
             # Try pilalerte first
             extra_groups = self._sharing_from_pilalerte(src_username)
 
-            # If pilalerte gave nothing, fall back to source Zabbix groups
+            # Also look up dest Zabbix groups for the user (Bxxxxx / ADMBxxxxx)
+            # These are added on top of pilalerte results (no duplicates)
+            dest_groups = self._sharing_from_dest_zabbix(src_username)
+            existing_ids = {g["usrgrpid"] for g in extra_groups}
+            for g in dest_groups:
+                if g["usrgrpid"] not in existing_ids:
+                    extra_groups.append(g)
+                    existing_ids.add(g["usrgrpid"])
+
+            # If still nothing, fall back to source Zabbix groups
             if not extra_groups and source_userid:
                 extra_groups = self._resolve_owner_groups_for_sharing(
                     source_userid, src_username)
@@ -1691,6 +1708,60 @@ class ZabbixMigrator:
                     print(f"        - '{sg}' not found in destination — skipped")
             except Exception as exc:
                 logger.debug("Error resolving sun_group '%s': %s", sg, exc)
+
+        return sharing
+
+    def _sharing_from_dest_zabbix(self, username: str) -> List[Dict]:
+        """
+        Look up the user in destination Zabbix (trying both the original username
+        and its ADM/non-ADM variant) and return their usergroups as Read-Write
+        sharing entries.
+
+        This mirrors the ADMBxxxxx <-> Bxxxxx equivalence logic used by pilalerte:
+          - "ADMB0026038" → also tries "B0026038"
+          - "B0026038"    → also tries "ADMB0026038"
+        """
+        # Build both variants to try
+        logins_to_try: List[str] = [username]
+        lower = username.lower()
+        if lower.startswith("adm"):
+            logins_to_try.append(username[3:])       # "ADMB0026038" → "B0026038"
+        else:
+            logins_to_try.append("adm" + username)   # "B0026038" → "ADMB0026038"
+
+        sharing: List[Dict] = []
+        seen_grp_ids: set = set()
+        found_login: Optional[str] = None
+
+        for login in logins_to_try:
+            try:
+                dest_user = self.dest.user.get(
+                    filter={"username": login}, output=["userid", "username"])
+                if not dest_user:
+                    logger.debug("dest Zabbix: user '%s' not found.", login)
+                    continue
+                found_login = dest_user[0]["username"]
+                dest_userid = dest_user[0]["userid"]
+
+                groups = self.dest.usergroup.get(
+                    userids=dest_userid, output=["usrgrpid", "name"])
+                for grp in groups:
+                    if grp["usrgrpid"] not in seen_grp_ids:
+                        sharing.append({
+                            "usrgrpid":   grp["usrgrpid"],
+                            "permission": PERM_READ_WRITE,
+                            "_name":      grp["name"],
+                        })
+                        seen_grp_ids.add(grp["usrgrpid"])
+            except Exception as exc:
+                logger.debug("dest Zabbix group lookup for '%s' failed: %s",
+                             login, exc)
+
+        if sharing:
+            print(f"      dest Zabbix user '{found_login}' → "
+                  f"{len(sharing)} group(s) added as Edit shares:")
+            for g in sharing:
+                print(f"        + '{g['_name']}'")
 
         return sharing
 
