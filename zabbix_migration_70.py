@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.5"
+SCRIPT_VERSION = "2026-03-16.6"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2355,8 +2355,15 @@ class ZabbixMigrator:
                     inaccessible_ids.add(bad_id)
                     print(f"    ! Object ID {bad_id} not available in destination "
                           f"— stripping from payload and retrying...")
-                    # Strip all widget fields whose value matches the bad ID
+                    # Strip all widget fields whose value matches the bad ID,
+                    # then drop any widget whose required field is now empty.
+                    _REQ = {
+                        "graph": "graphid", "graph2": "graphid",
+                        "graphprototype": "graphid",
+                        "item": "itemid", "web": "httptestid", "map": "sysmapid",
+                    }
                     for pg in clean.get("pages", []):
+                        kept_widgets = []
                         for ww in pg.get("widgets", []):
                             if "fields" in ww:
                                 before = len(ww["fields"])
@@ -2370,6 +2377,21 @@ class ZabbixMigrator:
                                         "Stripped %d field(s) with value %s "
                                         "from widget '%s'",
                                         dropped, bad_id, ww.get("name", "?"))
+                            # Drop widget if its required field is now missing/empty
+                            req_field = _REQ.get(ww.get("type", ""))
+                            if req_field:
+                                has_value = any(
+                                    f.get("name") == req_field
+                                    and str(f.get("value", "")) not in ("", "0")
+                                    for f in ww.get("fields", [])
+                                )
+                                if not has_value:
+                                    print(f"      ~ Widget '{ww['name']}' "
+                                          f"(type:{ww['type']}) dropped after "
+                                          f"strip — {req_field} now empty")
+                                    continue
+                            kept_widgets.append(ww)
+                        pg["widgets"] = kept_widgets
                 else:
                     raise  # non-retriable error or out of retries
 
