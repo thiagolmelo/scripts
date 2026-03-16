@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.3"
+SCRIPT_VERSION = "2026-03-16.4"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2302,8 +2302,48 @@ class ZabbixMigrator:
                           f"x={ww['x']} y={ww['y']} "
                           f"width={ww['width']} height={ww['height']}")
 
-        self.dest.dashboard.create(**clean)
-        print(f"    + Created: {name}")
+        # Retry loop: if the API rejects a specific object ID as "not available"
+        # (e.g. a graph that was found by name but is inaccessible), strip that
+        # ID from all widget fields and retry up to MAX_RETRIES times.
+        MAX_RETRIES = 10
+        inaccessible_ids: set = set()
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                self.dest.dashboard.create(**clean)
+                print(f"    + Created: {name}")
+                return
+            except Exception as exc:
+                err = str(exc)
+                # Parse: 'Graph with ID "68430" is not available.'
+                #         'Item with ID "123" is not available.' etc.
+                import re as _re
+                m = _re.search(r'with ID[^"]*"([0-9]+)"[^"]*not available', err)
+                if m and attempt < MAX_RETRIES:
+                    bad_id = m.group(1)
+                    if bad_id in inaccessible_ids:
+                        # Same ID again — no progress, give up
+                        break
+                    inaccessible_ids.add(bad_id)
+                    print(f"    ! Object ID {bad_id} not available in destination "
+                          f"— stripping from payload and retrying...")
+                    # Strip all widget fields whose value matches the bad ID
+                    for pg in clean.get("pages", []):
+                        for ww in pg.get("widgets", []):
+                            if "fields" in ww:
+                                before = len(ww["fields"])
+                                ww["fields"] = [
+                                    f for f in ww["fields"]
+                                    if str(f.get("value", "")) != bad_id
+                                ]
+                                dropped = before - len(ww["fields"])
+                                if dropped:
+                                    logger.debug(
+                                        "Stripped %d field(s) with value %s "
+                                        "from widget '%s'",
+                                        dropped, bad_id, ww.get("name", "?"))
+                else:
+                    raise  # non-retriable error or out of retries
 
     # -----------------------------------------------------------------------
     # Dashboard: helpers
