@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Version history at bottom of file — search SCRIPT_VERSION
 """
 zabbix_migration_70.py
 Migrates objects from Zabbix 6.4 to Zabbix 7.0.
@@ -83,6 +84,13 @@ def _prequote_zabbix_yaml(text: str) -> str:
     text = _COLOR_FIX_RE.sub(lambda m: m.group(1) + "'" + m.group(2) + "'", text)
     text = _BOOL_FIX_RE.sub(lambda m: m.group(1) + "'" + m.group(2) + "'", text)
     return text
+
+# ---------------------------------------------------------------------------
+# Script version — bump this on every change so the printed header makes it
+# easy to confirm which build is actually running.
+# Format: YYYY-MM-DD.N  (N = patch number within the day)
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "2026-03-16.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1472,15 +1480,22 @@ class ZabbixMigrator:
 
         # Filter to a specific dashboard if requested
         if self.dashboard_filter:
-            # Try exact match first, then case-insensitive contains fallback
+            # Normalise both sides: collapse multiple spaces, strip, lowercase
+            def _norm(s: str) -> str:
+                import re as _re
+                return _re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+            needle_norm = _norm(self.dashboard_filter)
+
+            # 1. Exact normalised match
             exact = [d for d in dashboards
-                     if d.get("name") == self.dashboard_filter]
+                     if _norm(d.get("name", "")) == needle_norm]
             if exact:
                 dashboards = exact
             else:
-                needle = self.dashboard_filter.lower()
+                # 2. Substring normalised match
                 dashboards = [d for d in dashboards
-                              if needle in (d.get("name") or "").lower()]
+                              if needle_norm in _norm(d.get("name", ""))]
             if not dashboards:
                 print(f"  [Dashboards] Dashboard '{self.dashboard_filter}' not found in source.")
                 return
@@ -3827,7 +3842,7 @@ Config files (same directory as this script):
 
     # Header
     print("\n" + "=" * 70)
-    print(f"  Zabbix Migration 6.4 -> 7.0")
+    print(f"  Zabbix Migration 6.4 -> 7.0   [v{SCRIPT_VERSION}]")
     print(f"  env={args.env}  cia={args.cia}", end="")
     if types_to_run:
         print(f"  migrate={' '.join(types_to_run)}", end="")
