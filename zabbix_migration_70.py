@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.8"
+SCRIPT_VERSION = "2026-03-16.9"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1526,6 +1526,14 @@ class ZabbixMigrator:
                 dashboard.get("userid", "")
             )
 
+            print("    - Expanding shared group members via pilalerte/dest Zabbix...")
+            group_extras = self._expand_shared_groups_via_members(dashboard)
+            seen_ids = {g["usrgrpid"] for g in extra_groups}
+            for g in group_extras:
+                if g["usrgrpid"] not in seen_ids:
+                    extra_groups.append(g)
+                    seen_ids.add(g["usrgrpid"])
+
             print("    - Converting widget IDs to names...")
             converted = self._resolve_names(dashboard)
 
@@ -1785,6 +1793,70 @@ class ZabbixMigrator:
                 print(f"        + '{g['_name']}'")
 
         return sharing
+
+    def _expand_shared_groups_via_members(self, dashboard: Dict) -> List[Dict]:
+        """
+        For each usergroup the dashboard is shared with in the source:
+          1. Fetch all members of that group from source Zabbix.
+          2. For each member, call pilalerte + dest Zabbix group lookup.
+          3. Return all unique dest usergroup IDs as Read-Write sharing entries.
+        """
+        src_groups = dashboard.get("userGroups") or []
+        if not src_groups:
+            return []
+
+        collected: Dict[str, Dict] = {}   # usrgrpid -> sharing entry (dedup)
+        processed_users: set = set()       # avoid calling pilalerte twice per user
+
+        for grp in src_groups:
+            grp_id = grp.get("usrgrpid")
+            if not grp_id:
+                continue
+
+            try:
+                grp_data = self.source.usergroup.get(
+                    usrgrpids=grp_id, output=["name"])
+                grp_name = grp_data[0]["name"] if grp_data else str(grp_id)
+            except Exception:
+                grp_name = str(grp_id)
+
+            try:
+                members = self.source.user.get(
+                    usrgrpids=grp_id, output=["userid", "username"])
+            except Exception as exc:
+                logger.debug("Could not fetch members of group '%s': %s",
+                             grp_name, exc)
+                continue
+
+            print(f"      Group '{grp_name}': {len(members)} member(s) — "
+                  f"resolving dest usergroups...")
+
+            for member in members:
+                uname = member.get("username", "")
+                if not uname or uname.lower() in processed_users:
+                    continue
+                processed_users.add(uname.lower())
+
+                for entry in self._sharing_from_pilalerte(uname):
+                    gid = entry["usrgrpid"]
+                    if gid not in collected:
+                        collected[gid] = entry
+
+                for entry in self._sharing_from_dest_zabbix(uname):
+                    gid = entry["usrgrpid"]
+                    if gid not in collected:
+                        collected[gid] = entry
+
+        result = list(collected.values())
+        if result:
+            print(f"      -> {len(result)} unique dest usergroup(s) resolved "
+                  f"from {len(processed_users)} member(s):")
+            for g in result:
+                print(f"        + '{g.get('_name', g['usrgrpid'])}'")
+        else:
+            print(f"      -> No dest usergroups resolved from shared group members.")
+
+        return result
 
     def _get_fallback_owner_id(self) -> str:
         """Return the userid of FALLBACK_OWNER in destination, raise if not found."""
