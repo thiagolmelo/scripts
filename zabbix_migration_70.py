@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.9"
+SCRIPT_VERSION = "2026-03-16.10"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -4025,6 +4025,80 @@ def parse_migrate_types(raw: List[str]) -> List[str]:
     return [t for t in MIGRATION_ORDER if t in expanded]
 
 
+def move_groups(zapi, from_prefix: str, into_parent: str,
+                group_type: str = "host"):
+    """
+    Rename all host groups (or template groups) whose name equals from_prefix
+    or starts with from_prefix + "/" by prepending into_parent + "/" to them.
+
+    group_type: "host" or "template"
+
+    Example:
+      from_prefix  = "PRD-APP-MYS-WORKFLOW"
+      into_parent  = "PRD-APP-AGENCES-WORKFLOW"
+
+      "PRD-APP-MYS-WORKFLOW"                            -> "PRD-APP-AGENCES-WORKFLOW/PRD-APP-MYS-WORKFLOW"
+      "PRD-APP-MYS-WORKFLOW/VAL/STANDARD/CEEP8_ANCODOC" -> "PRD-APP-AGENCES-WORKFLOW/PRD-APP-MYS-WORKFLOW/VAL/STANDARD/CEEP8_ANCODOC"
+    """
+    if group_type == "template":
+        getter = zapi.templategroup
+        id_key = "groupid"
+    else:
+        getter = zapi.hostgroup
+        id_key = "groupid"
+
+    print(f"  Fetching all {group_type} groups...")
+    try:
+        all_groups = getter.get(output=["groupid", "name"])
+    except Exception as exc:
+        print(f"  ERROR: could not fetch {group_type} groups: {exc}")
+        return
+
+    prefix_exact = from_prefix
+    prefix_child = from_prefix + "/"
+
+    to_rename = [
+        g for g in all_groups
+        if g["name"] == prefix_exact or g["name"].startswith(prefix_child)
+    ]
+
+    if not to_rename:
+        print(f"  No {group_type} groups found matching '{from_prefix}' or '{from_prefix}/*'.")
+        return
+
+    print(f"  Found {len(to_rename)} group(s) to rename:")
+    renamed  = 0
+    skipped  = 0
+    failed   = 0
+
+    for grp in sorted(to_rename, key=lambda g: g["name"]):
+        old_name = grp["name"]
+        new_name = into_parent + "/" + old_name
+        gid      = grp[id_key]
+
+        # Check if the new name already exists
+        try:
+            existing = getter.get(filter={"name": new_name}, output=["groupid"])
+            if existing:
+                print(f"    ~ SKIP  '{old_name}' → '{new_name}' (already exists)")
+                skipped += 1
+                continue
+        except Exception:
+            pass
+
+        try:
+            getter.update(**{id_key: gid, "name": new_name})
+            print(f"    ✓ '{old_name}'")
+            print(f"      → '{new_name}'")
+            renamed += 1
+        except Exception as exc:
+            print(f"    ✗ '{old_name}' → '{new_name}': {exc}")
+            failed += 1
+
+    print(f"\n  Done: {renamed} renamed, {skipped} skipped (already exist), "
+          f"{failed} failed.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Migrate Zabbix objects from 6.4 to 7.0",
@@ -4154,6 +4228,21 @@ Config files (same directory as this script):
             "Can be specified multiple times. Used with --update-sharing."
         )
     )
+    parser.add_argument(
+        "--move-groups", nargs=2, metavar=("FROM_PREFIX", "INTO_PARENT"),
+        help=(
+            "Rename host/template groups: prepend INTO_PARENT/ to every group "
+            "whose name equals FROM_PREFIX or starts with FROM_PREFIX/. "
+            "Example: --move-groups PRD-APP-MYS-WORKFLOW PRD-APP-AGENCES-WORKFLOW "
+            "renames 'PRD-APP-MYS-WORKFLOW/X' -> 'PRD-APP-AGENCES-WORKFLOW/PRD-APP-MYS-WORKFLOW/X'. "
+            "Requires --env, --cia and --target (source|dest)."
+        )
+    )
+    parser.add_argument(
+        "--move-groups-target", choices=["source", "dest"], default="dest",
+        metavar="source|dest",
+        help="Which Zabbix instance to apply --move-groups on (default: dest)."
+    )
     args = parser.parse_args()
 
     # Logging
@@ -4176,7 +4265,7 @@ Config files (same directory as this script):
             sys.exit(0)
 
     # ── Validate migration/compare args ─────────────────────────────────────
-    if args.migrate or args.compare is not None or args.update_sharing:
+    if args.migrate or args.compare is not None or args.update_sharing or args.move_groups:
         missing = []
         if not args.env:
             missing.append("--env")
@@ -4184,6 +4273,9 @@ Config files (same directory as this script):
             missing.append("--cia")
         if args.update_sharing and not args.share_groups:
             print("ERROR: --update-sharing requires at least one --share-group.", file=sys.stderr)
+            sys.exit(1)
+        if args.move_groups and not args.env:
+            print("ERROR: --move-groups requires --env and --cia.", file=sys.stderr)
             sys.exit(1)
         if missing:
             print(
@@ -4295,6 +4387,19 @@ Config files (same directory as this script):
                 debug_dashboard=args.debug_dashboard,
                 pilalert_token=creds.get("pilalert_token", ""),
             )
+
+            # ── --move-groups ──────────────────────────────────────────────
+            if args.move_groups:
+                from_prefix = args.move_groups[0]
+                into_parent = args.move_groups[1]
+                target      = args.move_groups_target
+                zapi        = migrator.dest if target == "dest" else migrator.source
+                print(f"\n  -- MOVE GROUPS ({target.upper()}) --")
+                print(f"  From prefix : '{from_prefix}'")
+                print(f"  Into parent : '{into_parent}'")
+                for gtype in ("host", "template"):
+                    print(f"\n  [{gtype.capitalize()} groups]")
+                    move_groups(zapi, from_prefix, into_parent, group_type=gtype)
 
             for mtype in types_to_run:
                 print(f"\n  -- {mtype.upper()} --")
