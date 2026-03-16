@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.1"
+SCRIPT_VERSION = "2026-03-16.2"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1655,6 +1655,11 @@ class ZabbixMigrator:
         is not found, or any network error occurs.
         """
         import requests as _req
+        try:
+            from requests.packages.urllib3.exceptions import InsecureRequestWarning
+            _req.packages.urllib3.disable_warnings(InsecureRequestWarning)
+        except Exception:
+            pass
 
         if not self.pilalert_token:
             logger.debug("pilalert_token not configured — skipping pilalerte lookup.")
@@ -1680,7 +1685,8 @@ class ZabbixMigrator:
 
             url = f"{base}/api/user/{login}"
             try:
-                resp = _req.get(url, headers=headers, timeout=10)
+                resp = _req.get(url, headers=headers, timeout=10,
+                                verify=False)   # internal CA — skip SSL verify
                 if resp.status_code == 404:
                     logger.debug("pilalerte: user '%s' not found (404).", login)
                     continue
@@ -1693,6 +1699,8 @@ class ZabbixMigrator:
                         sun_groups.append(sg)
                 logger.debug("pilalerte: user '%s' → sun_groups %s", login, sun_groups)
             except Exception as exc:
+                # Print the real error so it is visible without --debug
+                print(f"      [pilalerte] WARNING: request for '{login}' failed: {exc}")
                 logger.debug("pilalerte request for '%s' failed: %s", login, exc)
 
         return sun_groups
