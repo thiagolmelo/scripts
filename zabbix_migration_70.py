@@ -209,12 +209,11 @@ HOST_IMPORT_RULES = {
 MAP_IMPORT_RULES = {
     # maps   : the network maps themselves (selements, links, shapes, etc.)
     # images : background images referenced by map selements (elementtype=4)
-    # icon_maps : custom icon-mapping sets referenced by selement.iconmapid.
-    #             6.4 embeds icon_maps inline in the export; without this rule
-    #             7.0 creates maps with missing icons instead of failing loudly.
-    "maps":      {"createMissing": True, "updateExisting": True},
-    "images":    {"createMissing": True, "updateExisting": False},
-    "icon_maps": {"createMissing": True, "updateExisting": False},
+    # Note: icon_maps is NOT a valid import rule key in Zabbix 7.0 API —
+    #       it raises "unexpected parameter /rules/icon_maps". Icon mappings
+    #       are embedded in the export XML/JSON and handled transparently.
+    "maps":   {"createMissing": True, "updateExisting": True},
+    "images": {"createMissing": True, "updateExisting": False},
 }
 
 logger = logging.getLogger(__name__)
