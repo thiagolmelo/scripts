@@ -90,7 +90,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.2"
+SCRIPT_VERSION = "2026-03-16.3"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -520,7 +520,7 @@ class ZabbixMigrator:
 
         # Per-type result counters
         self.results: Dict[str, Dict] = {
-            t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": [], "names": []}
+            t: {"migrated": 0, "skipped": 0, "failed": 0, "errors": [], "names": [], "widget_warnings": []}
             for t in MIGRATION_ORDER
         }
         # Source/destination object counts for final report
@@ -1538,19 +1538,17 @@ class ZabbixMigrator:
                 for w in soft_warnings:
                     logger.info("[Dashboard '%s'] %s", name, w)
 
-            # Hard failures: widget data objects missing — skip dashboard.
+            # Widget object warnings — widgets with unresolved references are
+            # dropped from the dashboard but the dashboard is still created.
             if hard_missing:
-                print(f"    x Skipped -- {len(hard_missing)} missing widget objects "
-                      f"in destination:")
+                print(f"    ! {len(hard_missing)} widget object(s) not found in "
+                      f"destination — affected widgets dropped, dashboard still created:")
                 for obj in hard_missing:
                     print(f"      - {obj}")
-                self.results["dashboards"]["failed"] += 1
-                self.results["dashboards"]["errors"].append({
+                self.results["dashboards"]["widget_warnings"].append({
                     "name": name,
-                    "reason": "Missing widget objects in destination",
-                    "details": hard_missing
+                    "missing": hard_missing
                 })
-                return
 
             print("    - Creating dashboard...")
             self._create_dashboard(resolved, owner_userid, extra_groups)
@@ -3038,6 +3036,16 @@ class ZabbixMigrator:
                   f"Migrated: {r['migrated']:4}  "
                   f"Skipped: {r['skipped']:4}  "
                   f"Failed: {r['failed']:4}")
+
+            # Dashboard widget warnings
+            if t == "dashboards" and r.get("widget_warnings"):
+                print(f"  [{'Warnings':8}] [{t.capitalize():12}] "
+                      f"{len(r['widget_warnings'])} dashboard(s) created with "
+                      f"missing widget object(s):")
+                for ww in r["widget_warnings"]:
+                    print(f"    • {ww['name']}")
+                    for obj in ww["missing"]:
+                        print(f"        - {obj}")
             print()
 
 
