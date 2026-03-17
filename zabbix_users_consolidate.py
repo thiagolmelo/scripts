@@ -447,7 +447,12 @@ def _str_representer(dumper, data):
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
     return dumper.represent_scalar("tag:yaml.org,2002:str", data)
 
+def _odict_representer(dumper, data):
+    # Serialize OrderedDict as a plain YAML mapping (no Python-specific tags)
+    return dumper.represent_mapping("tag:yaml.org,2002:map", data.items())
+
 _CleanDumper.add_representer(str, _str_representer)
+_CleanDumper.add_representer(OrderedDict, _odict_representer)
 
 
 def write_canonical_yaml(
