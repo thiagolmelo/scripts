@@ -4,7 +4,9 @@
 zabbix_migration_70.py
 Migrates objects from Zabbix 6.4 to Zabbix 7.0.
 
-Supported object types (usergroups must be run explicitly — not included in 'all'):
+Supported object types (migration order):
+  0. regexps    - global regular expressions (Administration > General > Regex)
+  Note: usergroups must be run explicitly — not included in 'all'.
   1. templates   - exported/imported via native configuration API
   2. hosts       - exported/imported via native configuration API
   3. maps        - exported/imported via native configuration API
@@ -90,14 +92,14 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.11"
+SCRIPT_VERSION = "2026-03-16.12"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Canonical order for all object types
-MIGRATION_ORDER = ["templates", "hosts", "maps", "dashboards", "usergroups"]
+MIGRATION_ORDER = ["regexps", "templates", "hosts", "maps", "dashboards", "usergroups"]
 # Types included when --migrate all is used (usergroups excluded — run explicitly)
-MIGRATION_ALL   = ["templates", "hosts", "maps", "dashboards"]
+MIGRATION_ALL   = ["regexps", "templates", "hosts", "maps", "dashboards"]
 
 # Sentinel: widget field references a deleted / inaccessible object
 _INACCESSIBLE = "__INACCESSIBLE__"
@@ -2886,6 +2888,96 @@ class ZabbixMigrator:
         print(f"  [ShareDashboards] Done: {ok} updated, "
               f"{skipped} already had groups, {failed} failed.")
 
+    def migrate_regexps(self):
+        """
+        Migrate global regular expressions from source to destination.
+        Uses regexp.get / regexp.create / regexp.update via the Zabbix API.
+
+        Each global regexp has a name, description, and a list of test expressions
+        (expressions[]), each with: expression, expression_type, case_sensitive, result.
+        """
+        print("  [Regexps] Fetching global regular expressions from source...")
+        try:
+            src_regexps = self.source.regexp.get(
+                output="extend",
+                selectExpressions="extend"
+            )
+        except Exception as exc:
+            print(f"  [Regexps] ERROR: could not fetch source regexps: {exc}")
+            self.results["regexps"]["failed"] += 1
+            return
+
+        if not src_regexps:
+            print("  [Regexps] No global regular expressions found in source.")
+            return
+
+        print(f"  [Regexps] Found {len(src_regexps)} regular expression(s).")
+
+        try:
+            dst_by_name = {
+                r["name"]: r
+                for r in self.dest.regexp.get(output="extend",
+                                               selectExpressions="extend")
+            }
+        except Exception as exc:
+            print(f"  [Regexps] WARNING: could not fetch dest regexps: {exc}")
+            dst_by_name = {}
+
+        self.counts["regexps"]["src_total"] = len(src_regexps)
+        ok_count   = 0
+        skip_count = 0
+        fail_count = 0
+
+        for rx in src_regexps:
+            name = rx.get("name", "")
+
+            payload = {
+                "name":        name,
+                "test_string": rx.get("test_string", ""),
+                "expressions": [
+                    {
+                        "expression":      e["expression"],
+                        "expression_type": e["expression_type"],
+                        "case_sensitive":  e["case_sensitive"],
+                        "result":          e.get("result", ""),
+                    }
+                    for e in (rx.get("expressions") or [])
+                ]
+            }
+
+            try:
+                if name in dst_by_name:
+                    if self.skip_existing:
+                        skip_count += 1
+                        logger.debug("Regexp '%s' already exists — skipped.", name)
+                        continue
+                    payload["regexpid"] = dst_by_name[name]["regexpid"]
+                    self.dest.regexp.update(**payload)
+                    print(f"    ~ Updated: {name}")
+                else:
+                    self.dest.regexp.create(**payload)
+                    print(f"    + Created: {name}")
+                ok_count += 1
+            except Exception as exc:
+                fail_count += 1
+                reason = str(exc)
+                print(f"    x Failed  '{name}': {reason}")
+                self.results["regexps"]["errors"].append(
+                    {"name": name, "reason": reason})
+
+        self.results["regexps"]["migrated"] += ok_count
+        self.results["regexps"]["skipped"]  += skip_count
+        self.results["regexps"]["failed"]   += fail_count
+
+        try:
+            self.counts["regexps"]["dst_total"] = len(
+                self.dest.regexp.get(output=["name"]))
+        except Exception:
+            pass
+
+        print(f"  [Regexps] Done: {ok_count} created/updated, "
+              f"{skip_count} skipped, {fail_count} failed.")
+
     def migrate_usergroups(self):
         """
         Migrate user groups from source (6.4) to destination (7.0).
@@ -4167,7 +4259,7 @@ Config files (same directory as this script):
     )
     parser.add_argument(
         "--migrate", default=None, nargs="+",
-        choices=["templates", "hosts", "maps", "dashboards", "usergroups", "all"],
+        choices=["regexps", "templates", "hosts", "maps", "dashboards", "usergroups", "all"],
         # Note: 'all' expands to templates+hosts+maps+dashboards only.
         metavar="TYPE",
         help="Object type(s) to migrate: templates hosts maps dashboards usergroups all"
@@ -4408,7 +4500,9 @@ Config files (same directory as this script):
 
             for mtype in types_to_run:
                 print(f"\n  -- {mtype.upper()} --")
-                if mtype == "templates":
+                if mtype == "regexps":
+                    migrator.migrate_regexps()
+                elif mtype == "templates":
                     migrator.migrate_templates()
                 elif mtype == "hosts":
                     migrator.migrate_hosts()
