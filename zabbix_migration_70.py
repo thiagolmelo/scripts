@@ -92,7 +92,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.12"
+SCRIPT_VERSION = "2026-03-16.13"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2939,7 +2939,7 @@ class ZabbixMigrator:
                         "expression":      e["expression"],
                         "expression_type": e["expression_type"],
                         "case_sensitive":  e["case_sensitive"],
-                        "result":          e.get("result", ""),
+                        # "result" field removed in Zabbix 7.0 API
                     }
                     for e in (rx.get("expressions") or [])
                 ]
