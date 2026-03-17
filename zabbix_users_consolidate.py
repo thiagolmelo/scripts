@@ -186,15 +186,26 @@ def build_instance_list(
             cfg = cia_map[cia_name]
             pairs: List[Tuple[str, str]] = []
 
-            if target in ("source", "all"):
-                pairs.append((f"{env}/{cia_name}/source", cfg["url_export"]))
-            if target in ("dest", "all"):
-                dest_url = cfg["url_import"]
-                src_url  = cfg["url_export"]
-                # Avoid duplicate when source == dest
-                if target == "all" and dest_url == src_url:
-                    continue
-                pairs.append((f"{env}/{cia_name}/dest", dest_url))
+            # ── Collect every URL-like value found under this CIA entry ───────
+            # We don't rely on key names at all: any value starting with http(s)
+            # is an instance to scan.  Typos like "uurl_import", non-standard
+            # key names, and future config changes are all handled transparently.
+            cia_urls: List[Tuple[str, str]] = []   # (key_name, url)
+            for k, v in cfg.items():
+                if isinstance(v, str) and v.strip().lower().startswith("http"):
+                    cia_urls.append((k, v.strip()))
+
+            if not cia_urls:
+                print(f"  WARNING: CIA '{cia_name}' ({env}) has no URL values "
+                      f"— skipping.  Keys found: {list(cfg.keys())}",
+                      file=sys.stderr)
+                continue
+
+            logger.debug("CIA '%s/%s' — found %d URL(s): %s",
+                         env, cia_name, len(cia_urls), cia_urls)
+
+            for k, url in cia_urls:
+                pairs.append((f"{env}/{cia_name}/{k}", url))
 
             for label, url in pairs:
                 norm = url.rstrip("/").lower()
