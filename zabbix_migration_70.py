@@ -92,7 +92,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.13"
+SCRIPT_VERSION = "2026-03-16.15"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -200,22 +200,21 @@ TEMPLATE_IMPORT_RULES_NO_DASHBOARDS = {
 
 HOST_IMPORT_RULES = {
     # ── groups ──────────────────────────────────────────────────────────────
-    # snake_case in 7.0; pre-created by _ensure_host_groups_for_hosts().
     "host_groups":     {"createMissing": True,  "updateExisting": False},
     # ── host skeleton + template linkage ────────────────────────────────────
-    # items/triggers/graphs/discoveryRules are intentionally DISABLED.
-    # We import only the host shell (interfaces, groups, macros, inventory)
-    # and its template links.  Zabbix auto-propagates all template-owned
-    # objects when the link is created.  Directly-created host objects (no
-    # templateid in source) are NOT migrated — they belong to the source host.
+    # Full import: host shell (interfaces, groups, macros, inventory),
+    # template linkage, AND locally-created objects (items, triggers, graphs,
+    # discovery rules, web scenarios).
+    # createMissing=True / updateExisting=False → create only, never overwrite.
+    # Re-runs are safe: existing objects are skipped, new ones are added.
     "hosts":           {"createMissing": True,  "updateExisting": True},
     "templateLinkage": {"createMissing": True,  "deleteMissing": False},
-    "items":           {"createMissing": False, "updateExisting": False, "deleteMissing": False},
-    "triggers":        {"createMissing": False, "updateExisting": False, "deleteMissing": False},
-    "graphs":          {"createMissing": False, "updateExisting": False, "deleteMissing": False},
-    "discoveryRules":  {"createMissing": False, "updateExisting": False, "deleteMissing": False},
-    "httptests":       {"createMissing": False, "updateExisting": False, "deleteMissing": False},
-    "valueMaps":       {"createMissing": False, "updateExisting": False},
+    "items":           {"createMissing": True,  "updateExisting": False, "deleteMissing": False},
+    "triggers":        {"createMissing": True,  "updateExisting": False, "deleteMissing": False},
+    "graphs":          {"createMissing": True,  "updateExisting": False, "deleteMissing": False},
+    "discoveryRules":  {"createMissing": True,  "updateExisting": False, "deleteMissing": False},
+    "httptests":       {"createMissing": True,  "updateExisting": False, "deleteMissing": False},
+    "valueMaps":       {"createMissing": True,  "updateExisting": False},
 }
 
 MAP_IMPORT_RULES = {
@@ -516,8 +515,8 @@ class ZabbixMigrator:
         self.dashboard_filter  = dashboard_filter
         self.host_filter       = host_filter
         self.usergroup_filter  = usergroup_filter
-        self.debug_json        = debug_json
-        self.debug_dashboard   = debug_dashboard
+        self.debug_json           = debug_json
+        self.debug_dashboard      = debug_dashboard
         self.pilalert_token    = pilalert_token   # Basic token for pilalerte API
         self._source_url       = source_url  # kept for raw API calls
         self._dest_url         = dest_url   # kept for raw API calls (bypass pyzabbix)
