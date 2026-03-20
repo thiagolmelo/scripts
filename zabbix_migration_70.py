@@ -92,7 +92,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-16.15"
+SCRIPT_VERSION = "2026-03-19.2"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -123,6 +123,14 @@ FIELD_TYPE_MAP            = "8"
 
 # Zabbix 6.4 tag filter fields — flat structure incompatible with 7.0 API
 _TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
+
+# svggraph/graph widget fields that in 6.4 were stored as type 3 (HOST ID)
+# but in 7.0 expect type 1 (STRING — hostname or pattern).
+# When resolving names→IDs for these fields we convert the type and send the
+# hostname string directly instead of looking up the destination hostid.
+_HOST_AS_STRING_RE = re.compile(
+    r'^(ds\.\d+\.hosts\.\d+|or\.\d+\.hosts\.\d+|problemhosts\.\d+)$'
+)
 
 # Grid: 6.4 = 24 cols (max_columns=24), 7.0 = 72 cols (max_columns=72).
 # Scale factor = 72/24 = 3.0  (horizontal only; vertical is identical).
@@ -509,15 +517,17 @@ class ZabbixMigrator:
                  usergroup_filter: Optional[str] = None,
                  debug_json: bool = False,
                  debug_dashboard: bool = False,
+                 include_disabled_hosts: bool = False,
                  pilalert_token: str = ""):
-        self.cia_name          = cia_name
-        self.skip_existing     = skip_existing
-        self.dashboard_filter  = dashboard_filter
-        self.host_filter       = host_filter
-        self.usergroup_filter  = usergroup_filter
-        self.debug_json           = debug_json
-        self.debug_dashboard      = debug_dashboard
-        self.pilalert_token    = pilalert_token   # Basic token for pilalerte API
+        self.cia_name               = cia_name
+        self.skip_existing          = skip_existing
+        self.dashboard_filter       = dashboard_filter
+        self.host_filter            = host_filter
+        self.usergroup_filter       = usergroup_filter
+        self.debug_json             = debug_json
+        self.debug_dashboard        = debug_dashboard
+        self.include_disabled_hosts = include_disabled_hosts
+        self.pilalert_token         = pilalert_token   # Basic token for pilalerte API
         self._source_url       = source_url  # kept for raw API calls
         self._dest_url         = dest_url   # kept for raw API calls (bypass pyzabbix)
 
@@ -973,24 +983,33 @@ class ZabbixMigrator:
 
         # --host filter: restrict to a single host by name
         if self.host_filter:
-            enabled = [h for h in enabled if h["name"] == self.host_filter]
-            disabled = []
-            if not enabled:
-                print(f"  [Hosts] Host '{self.host_filter}' not found "
-                      f"(or is disabled) in source.")
+            pool  = all_hosts if self.include_disabled_hosts else enabled
+            match = [h for h in pool if h["name"] == self.host_filter]
+            if not match:
+                hint = "" if self.include_disabled_hosts \
+                    else " (or is disabled — add --include-disabled-hosts)"
+                print(f"  [Hosts] Host '{self.host_filter}' not found{hint} in source.")
                 return
+            enabled  = match
+            disabled = []
             print(f"  [Hosts] Filtered to single host: '{self.host_filter}'.")
 
         print(f"  [Hosts] Source — total: {len(all_hosts)}, "
               f"enabled: {len(enabled)}, disabled: {len(disabled)}.")
 
         if disabled:
-            self.disabled_hosts = [h["name"] for h in disabled]
-            self.results["hosts"]["skipped"] += len(disabled)
-            # No console detail — disabled list goes to log file only
+            if self.include_disabled_hosts:
+                print(f"  [Hosts] Including {len(disabled)} disabled host(s) "
+                      f"(--include-disabled-hosts).")
+                enabled = enabled + disabled
+            else:
+                self.disabled_hosts = [h["name"] for h in disabled]
+                self.results["hosts"]["skipped"] += len(disabled)
+                print(f"  [Hosts] Skipping {len(disabled)} disabled host(s) "
+                      f"(use --include-disabled-hosts to migrate them too).")
 
         if not enabled:
-            print("  [Hosts] No enabled hosts to import.")
+            print("  [Hosts] No hosts to import.")
             return
 
         self._ensure_host_groups_for_hosts()
@@ -1992,18 +2011,20 @@ class ZabbixMigrator:
 
                 elif ftype == FIELD_TYPE_ITEM:
                     data = self.source.item.get(
-                        itemids=fval, output=["key_"], selectHosts=["host"])
+                        itemids=fval, output=["key_", "name"], selectHosts=["host"])
                     if data:
                         cf["value_name"] = data[0]["key_"]
+                        cf["item_name"]  = data[0]["name"]   # fallback for svggraph
                         cf["host_name"]  = data[0]["hosts"][0]["host"]
                     else:
                         cf["value_name"] = _INACCESSIBLE
 
                 elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:
                     data = self.source.itemprototype.get(
-                        itemids=fval, output=["key_"], selectHosts=["host"])
+                        itemids=fval, output=["key_", "name"], selectHosts=["host"])
                     if data:
                         cf["value_name"] = data[0]["key_"]
+                        cf["item_name"]  = data[0]["name"]   # fallback for svggraph
                         cf["host_name"]  = data[0]["hosts"][0]["host"]
                     else:
                         cf["value_name"] = _INACCESSIBLE
@@ -2142,24 +2163,40 @@ class ZabbixMigrator:
             vname = field["value_name"]
             ctx   = f"widget '{wname}' (type:{wtype}) field '{fname}'"
 
+            # resolved=True means we successfully set cf["value"] to a dest ID.
+            # If False, the field is dropped — sending a stale 6.4 ID to 7.0
+            # would silently map to the wrong object (e.g. wrong host in graph).
+            resolved = False
             try:
                 if ftype == FIELD_TYPE_HOST_GROUP:
                     data = self.dest.hostgroup.get(
                         filter={"name": vname}, output=["groupid"])
                     if data:
                         cf["value"] = data[0]["groupid"]
+                        resolved = True
                     else:
                         annotation = self._annotate_missing_group(vname)
                         missing.append(f"Host group '{vname}' [{ctx}]{annotation}")
 
                 elif ftype == FIELD_TYPE_HOST:
-                    data = self.dest.host.get(
-                        filter={"host": vname}, output=["hostid"])
-                    if data:
-                        cf["value"] = data[0]["hostid"]
+                    # svggraph/graph fields ds.N.hosts.M, or.N.hosts.M and
+                    # problemhosts.N were stored as type 3 (HOST ID) in 6.4
+                    # but 7.0 expects type 1 (STRING — hostname or pattern).
+                    # Convert the field type and pass the hostname string directly;
+                    # no dest ID lookup needed.
+                    if _HOST_AS_STRING_RE.match(fname):
+                        cf["type"]  = FIELD_TYPE_STRING   # "1"
+                        cf["value"] = vname               # hostname string
+                        resolved = True
                     else:
-                        annotation = self._annotate_missing_host(vname)
-                        missing.append(f"Host '{vname}' [{ctx}]{annotation}")
+                        data = self.dest.host.get(
+                            filter={"host": vname}, output=["hostid"])
+                        if data:
+                            cf["value"] = data[0]["hostid"]
+                            resolved = True
+                        else:
+                            annotation = self._annotate_missing_host(vname)
+                            missing.append(f"Host '{vname}' [{ctx}]{annotation}")
 
                 elif ftype == FIELD_TYPE_ITEM:
                     host_name = field.get("host_name")
@@ -2173,6 +2210,7 @@ class ZabbixMigrator:
                                 output=["itemid"])
                             if items:
                                 cf["value"] = items[0]["itemid"]
+                                resolved = True
                             else:
                                 missing.append(
                                     f"Item '{vname}' on host '{host_name}' [{ctx}]")
@@ -2194,6 +2232,7 @@ class ZabbixMigrator:
                                 output=["itemid"])
                             if protos:
                                 cf["value"] = protos[0]["itemid"]
+                                resolved = True
                             else:
                                 missing.append(
                                     f"Item prototype '{vname}' on host '{host_name}' [{ctx}]")
@@ -2215,6 +2254,7 @@ class ZabbixMigrator:
                                 output=["graphid"])
                             if graphs:
                                 cf["value"] = graphs[0]["graphid"]
+                                resolved = True
                             else:
                                 missing.append(
                                     f"Graph '{vname}' on host '{host_name}' [{ctx}]")
@@ -2226,6 +2266,7 @@ class ZabbixMigrator:
                             filter={"name": vname}, output=["graphid"])
                         if graphs:
                             cf["value"] = graphs[0]["graphid"]
+                            resolved = True
                         else:
                             missing.append(f"Graph '{vname}' [{ctx}]")
 
@@ -2241,6 +2282,7 @@ class ZabbixMigrator:
                                 output=["graphid"])
                             if protos:
                                 cf["value"] = protos[0]["graphid"]
+                                resolved = True
                             else:
                                 missing.append(
                                     f"Graph prototype '{vname}' on host '{host_name}' [{ctx}]")
@@ -2255,6 +2297,7 @@ class ZabbixMigrator:
                         filter={"name": vname}, output=["sysmapid"])
                     if data:
                         cf["value"] = data[0]["sysmapid"]
+                        resolved = True
                     else:
                         missing.append(f"Map '{vname}' [{ctx}]")
 
@@ -2263,11 +2306,23 @@ class ZabbixMigrator:
 
             cf.pop("value_name", None)
             cf.pop("host_name",  None)
-            converted["fields"].append(cf)
+
+            # Only append the field if resolution succeeded.
+            # Dropping is safer than sending a stale 6.4 ID which would silently
+            # map to the wrong object in the destination (wrong host in graph, etc.)
+            if resolved:
+                converted["fields"].append(cf)
+            else:
+                # Print visibly — this is always useful for diagnosis.
+                # missing[] already has the reason (host/item/graph not found).
+                print(f"      ~ Dropped field '{fname}' "
+                      f"(type:{ftype}, value_name:'{field.get('value_name','')}') "
+                      f"from widget '{wname}' — not resolved in destination")
 
         return converted, missing
 
     # -----------------------------------------------------------------------
+
     # Dashboard: create
     # -----------------------------------------------------------------------
 
@@ -4294,6 +4349,13 @@ Config files (same directory as this script):
         help="Enable verbose debug logging"
     )
     parser.add_argument(
+        "--include-disabled-hosts", action="store_true",
+        help=(
+            "Also migrate hosts that are disabled in the source. "
+            "By default only enabled hosts (status=0) are migrated."
+        )
+    )
+    parser.add_argument(
         "--debug-json", action="store_true",
         help=(
             "Dump the raw JSON payload sent to the API into debug_payload.json "
@@ -4438,6 +4500,8 @@ Config files (same directory as this script):
         print(f"  usergroup filter='{args.usergroup}'")
     if args.skip_existing:
         print("  mode=skip-existing")
+    if args.include_disabled_hosts:
+        print("  mode=include-disabled-hosts")
     if args.update_sharing:
         print(f"  update-sharing groups: {', '.join(args.share_groups)}")
     print("=" * 70)
@@ -4481,6 +4545,7 @@ Config files (same directory as this script):
                 usergroup_filter=args.usergroup,
                 debug_json=args.debug_json,
                 debug_dashboard=args.debug_dashboard,
+                include_disabled_hosts=args.include_disabled_hosts,
                 pilalert_token=creds.get("pilalert_token", ""),
             )
 
