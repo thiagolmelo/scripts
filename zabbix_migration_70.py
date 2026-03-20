@@ -92,7 +92,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-19.4"
+SCRIPT_VERSION = "2026-03-19.5"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -125,6 +125,17 @@ FIELD_TYPE_MAP            = "8"
 # Zabbix 7.0 uses the reversed format:       tags.N.tag  / tags.N.operator  / tags.N.value
 # We transform the name on the fly instead of stripping the field.
 _TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.(\d+)$')
+
+# Zabbix 6.4 svggraph / override field format: ds.PROP.DS.ITEM  or  ds.PROP.DS
+# Zabbix 7.0 format:                           ds.DS.PROP.ITEM  or  ds.DS.PROP
+# Same restructuring applies to override (or.*) fields.
+# svggraph/graph dataset and override fields changed structure between 6.4 and 7.0:
+# 6.4: ds.FIELD.N         → 7.0: ds.N.FIELD
+# 6.4: ds.FIELD.N.M       → 7.0: ds.N.FIELD.M
+# 6.4: or.FIELD.N         → 7.0: or.N.FIELD
+# 6.4: or.FIELD.N.M       → 7.0: or.N.FIELD.M
+# Regex captures: prefix(ds|or) . field . dataset_idx [. item_idx]
+_DS_OR_FIELD_RE = re.compile(r'^(ds|or)\.([^.]+)\.(\d+)(?:\.(.+))?$')
 
 # svggraph/graph widget fields that in 6.4 were stored as type 3 (HOST ID)
 # but in 7.0 expect type 1 (STRING — hostname or pattern).
@@ -2449,13 +2460,34 @@ class ZabbixMigrator:
                 if widget.get("fields"):
                     transformed = []
                     for f in widget["fields"]:
-                        m = _TAG_FIELD_RE.match(f.get("name", ""))
+                        fname = f.get("name", "")
+
+                        # Transform tag field names: 6.4 tags.tag.N → 7.0 tags.N.tag
+                        m = _TAG_FIELD_RE.match(fname)
                         if m:
-                            # 6.4: tags.tag.N / tags.operator.N / tags.value.N
-                            # 7.0: tags.N.tag / tags.N.operator / tags.N.value
                             key, idx = m.group(1), m.group(2)
-                            f = dict(f)   # copy — don't mutate original
+                            f = dict(f)
                             f["name"] = f"tags.{idx}.{key}"
+                            transformed.append(f)
+                            continue
+
+                        # Transform svggraph/graph dataset + override field names:
+                        # 6.4: ds.FIELD.N[.M]  → 7.0: ds.N.FIELD[.M]
+                        # 6.4: or.FIELD.N[.M]  → 7.0: or.N.FIELD[.M]
+                        m = _DS_OR_FIELD_RE.match(fname)
+                        if m:
+                            prefix  = m.group(1)   # "ds" or "or"
+                            field   = m.group(2)   # e.g. "hosts", "items", "color"
+                            ds_idx  = m.group(3)   # dataset index
+                            item_idx = m.group(4)  # optional item index
+                            f = dict(f)
+                            if item_idx is not None:
+                                f["name"] = f"{prefix}.{ds_idx}.{field}.{item_idx}"
+                            else:
+                                f["name"] = f"{prefix}.{ds_idx}.{field}"
+                            transformed.append(f)
+                            continue
+
                         transformed.append(f)
                     cw["fields"] = transformed
 
