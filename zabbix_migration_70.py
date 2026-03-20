@@ -92,7 +92,11 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
+<<<<<<< HEAD
 SCRIPT_VERSION = "2026-03-19.2"
+=======
+SCRIPT_VERSION = "2026-03-16.16"
+>>>>>>> a2610e42870d911b42dc4082d7c22cd22be09b16
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2179,6 +2183,7 @@ class ZabbixMigrator:
                         missing.append(f"Host group '{vname}' [{ctx}]{annotation}")
 
                 elif ftype == FIELD_TYPE_HOST:
+<<<<<<< HEAD
                     # svggraph/graph fields ds.N.hosts.M, or.N.hosts.M and
                     # problemhosts.N were stored as type 3 (HOST ID) in 6.4
                     # but 7.0 expects type 1 (STRING — hostname or pattern).
@@ -2187,6 +2192,12 @@ class ZabbixMigrator:
                     if _HOST_AS_STRING_RE.match(fname):
                         cf["type"]  = FIELD_TYPE_STRING   # "1"
                         cf["value"] = vname               # hostname string
+=======
+                    data = self.dest.host.get(
+                        filter={"host": vname}, output=["hostid"])
+                    if data:
+                        cf["value"] = data[0]["hostid"]
+>>>>>>> a2610e42870d911b42dc4082d7c22cd22be09b16
                         resolved = True
                     else:
                         data = self.dest.host.get(
@@ -2313,11 +2324,16 @@ class ZabbixMigrator:
             if resolved:
                 converted["fields"].append(cf)
             else:
+<<<<<<< HEAD
                 # Print visibly — this is always useful for diagnosis.
                 # missing[] already has the reason (host/item/graph not found).
                 print(f"      ~ Dropped field '{fname}' "
                       f"(type:{ftype}, value_name:'{field.get('value_name','')}') "
                       f"from widget '{wname}' — not resolved in destination")
+=======
+                logger.debug("[%s '%s'] field '%s' dropped — no dest ID resolved",
+                             wtype, wname, fname)
+>>>>>>> a2610e42870d911b42dc4082d7c22cd22be09b16
 
         return converted, missing
 
