@@ -92,7 +92,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-19.2"
+SCRIPT_VERSION = "2026-03-19.4"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -121,8 +121,10 @@ FIELD_TYPE_GRAPH          = "6"
 FIELD_TYPE_GRAPH_PROTO    = "7"
 FIELD_TYPE_MAP            = "8"
 
-# Zabbix 6.4 tag filter fields — flat structure incompatible with 7.0 API
-_TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.\d+$')
+# Zabbix 6.4 tag filter fields use format:  tags.tag.N / tags.operator.N / tags.value.N
+# Zabbix 7.0 uses the reversed format:       tags.N.tag  / tags.N.operator  / tags.N.value
+# We transform the name on the fly instead of stripping the field.
+_TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.(\d+)$')
 
 # svggraph/graph widget fields that in 6.4 were stored as type 3 (HOST ID)
 # but in 7.0 expect type 1 (STRING — hostname or pattern).
@@ -518,6 +520,7 @@ class ZabbixMigrator:
                  debug_json: bool = False,
                  debug_dashboard: bool = False,
                  include_disabled_hosts: bool = False,
+                 debug_widget_fields: bool = False,
                  pilalert_token: str = ""):
         self.cia_name               = cia_name
         self.skip_existing          = skip_existing
@@ -527,6 +530,7 @@ class ZabbixMigrator:
         self.debug_json             = debug_json
         self.debug_dashboard        = debug_dashboard
         self.include_disabled_hosts = include_disabled_hosts
+        self.debug_widget_fields   = debug_widget_fields
         self.pilalert_token         = pilalert_token   # Basic token for pilalerte API
         self._source_url       = source_url  # kept for raw API calls
         self._dest_url         = dest_url   # kept for raw API calls (bypass pyzabbix)
@@ -1559,8 +1563,36 @@ class ZabbixMigrator:
             print("    - Converting widget IDs to names...")
             converted = self._resolve_names(dashboard)
 
+            if self.debug_widget_fields:
+                import json as _json
+                safe = name.replace("/", "_").replace(" ", "_")[:60]
+                # Stage 1: raw source fields
+                src_widgets = [{"name": w.get("name"), "type": w.get("type"),
+                                "fields": w.get("fields", [])}
+                               for pg in dashboard.get("pages", [])
+                               for w in pg.get("widgets", [])]
+                # Stage 2: after IDs → names
+                cvt_widgets = [{"name": w.get("name"), "type": w.get("type"),
+                                "fields": w.get("fields", [])}
+                               for pg in converted.get("pages", [])
+                               for w in pg.get("widgets", [])]
+                with open(f"dbg_{safe}_1_src.json", "w") as _f:
+                    _json.dump(src_widgets, _f, indent=2, default=str)
+                with open(f"dbg_{safe}_2_converted.json", "w") as _f:
+                    _json.dump(cvt_widgets, _f, indent=2, default=str)
+                print(f"    [debug] Dumped stage-1 (raw src) and stage-2 (converted) to dbg_{safe}_1_src.json / _2_converted.json")
+
             print("    - Resolving names to destination IDs...")
             resolved, hard_missing, soft_warnings = self._resolve_ids(converted)
+
+            if self.debug_widget_fields:
+                res_widgets = [{"name": w.get("name"), "type": w.get("type"),
+                                "fields": w.get("fields", [])}
+                               for pg in resolved.get("pages", [])
+                               for w in pg.get("widgets", [])]
+                with open(f"dbg_{safe}_3_resolved.json", "w") as _f:
+                    _json.dump(res_widgets, _f, indent=2, default=str)
+                print(f"    [debug] Dumped stage-3 (resolved dest IDs) to dbg_{safe}_3_resolved.json")
 
             # Soft warnings: shared groups not found in destination — drop them,
             # log quietly, and continue creating the dashboard.
@@ -2415,10 +2447,17 @@ class ZabbixMigrator:
                     "view_mode": int(widget.get("view_mode", 0)),
                 }
                 if widget.get("fields"):
-                    cw["fields"] = [
-                        f for f in widget["fields"]
-                        if not _TAG_FIELD_RE.match(f.get("name", ""))
-                    ]
+                    transformed = []
+                    for f in widget["fields"]:
+                        m = _TAG_FIELD_RE.match(f.get("name", ""))
+                        if m:
+                            # 6.4: tags.tag.N / tags.operator.N / tags.value.N
+                            # 7.0: tags.N.tag / tags.N.operator / tags.N.value
+                            key, idx = m.group(1), m.group(2)
+                            f = dict(f)   # copy — don't mutate original
+                            f["name"] = f"tags.{idx}.{key}"
+                        transformed.append(f)
+                    cw["fields"] = transformed
 
                 # Drop the entire widget if a required object reference field
                 # (graph, item, map, item_proto, graph_proto) is missing.
@@ -2450,6 +2489,18 @@ class ZabbixMigrator:
                 clean_page["widgets"].append(cw)
 
             clean["pages"].append(clean_page)
+
+        # Debug: dump full widget fields sent to API
+        if self.debug_widget_fields:
+            import json as _json
+            safe = name.replace("/", "_").replace(" ", "_")[:60]
+            final_widgets = [{"name": w.get("name"), "type": w.get("type"),
+                              "fields": w.get("fields", [])}
+                             for pg in clean.get("pages", [])
+                             for w in pg.get("widgets", [])]
+            with open(f"dbg_{safe}_4_final_api.json", "w") as _f:
+                _json.dump(final_widgets, _f, indent=2, default=str)
+            print(f"    [debug] Dumped stage-4 (final API payload) to dbg_{safe}_4_final_api.json")
 
         # Debug: print exact dimensions being sent to API
         if self.debug_dashboard:
@@ -4363,6 +4414,14 @@ Config files (same directory as this script):
         )
     )
     parser.add_argument(
+        "--debug-widget-fields", action="store_true",
+        help=(
+            "Dump all widget field values at each pipeline stage to JSON files: "
+            "stage 1=raw source, 2=after ID→name, 3=after name→dest ID, "
+            "4=final API payload. Files are written next to the script."
+        )
+    )
+    parser.add_argument(
         "--debug-dashboard", action="store_true",
         help=(
             "After each dashboard is created, fetch full dashboard.get output "
@@ -4546,6 +4605,7 @@ Config files (same directory as this script):
                 debug_json=args.debug_json,
                 debug_dashboard=args.debug_dashboard,
                 include_disabled_hosts=args.include_disabled_hosts,
+                debug_widget_fields=args.debug_widget_fields,
                 pilalert_token=creds.get("pilalert_token", ""),
             )
 
