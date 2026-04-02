@@ -1862,9 +1862,14 @@ class ZabbixMigrator:
     def _expand_shared_groups_via_members(self, dashboard: Dict) -> List[Dict]:
         """
         For each usergroup the dashboard is shared with in the source:
+          0. (NEW) Try a direct name match in destination — if the group exists
+             there by the same name, add it immediately with its original
+             permission.  Groups not found are skipped (soft, non-fatal).
           1. Fetch all members of that group from source Zabbix.
           2. For each member, call pilalerte + dest Zabbix group lookup.
-          3. Return all unique dest usergroup IDs as Read-Write sharing entries.
+          3. Return all unique dest usergroup IDs as sharing entries.
+        Steps 1-2 run on top of step 0 regardless of whether a direct match
+        was found, so pilalerte-derived groups are always added as well.
         """
         src_groups = dashboard.get("userGroups") or []
         if not src_groups:
@@ -1872,6 +1877,8 @@ class ZabbixMigrator:
 
         collected: Dict[str, Dict] = {}   # usrgrpid -> sharing entry (dedup)
         processed_users: set = set()       # avoid calling pilalerte twice per user
+        direct_matched: int = 0
+        direct_skipped: int = 0
 
         for grp in src_groups:
             grp_id = grp.get("usrgrpid")
@@ -1885,6 +1892,37 @@ class ZabbixMigrator:
             except Exception:
                 grp_name = str(grp_id)
 
+            # ── Step 0: direct name match ──────────────────────────────────
+            # Check whether the source group exists in destination by the same
+            # name.  If yes, add it with the original source permission so that
+            # Read-only / Read-write is preserved exactly as configured.
+            # If not, log a soft skip and continue to the member-expansion path.
+            src_permission = grp.get("permission", PERM_READ_WRITE)
+            try:
+                dest_grp = self.dest.usergroup.get(
+                    filter={"name": grp_name}, output=["usrgrpid"])
+                if dest_grp:
+                    dest_gid = dest_grp[0]["usrgrpid"]
+                    if dest_gid not in collected:
+                        collected[dest_gid] = {
+                            "usrgrpid":   dest_gid,
+                            "permission": src_permission,
+                            "_name":      grp_name,
+                        }
+                    direct_matched += 1
+                    print(f"      [direct] '{grp_name}' → found in destination "
+                          f"(permission={src_permission}) ✓")
+                else:
+                    direct_skipped += 1
+                    logger.debug("Direct match: group '%s' not in destination — skipped.",
+                                 grp_name)
+            except Exception as exc:
+                direct_skipped += 1
+                logger.debug("Direct match lookup failed for '%s': %s", grp_name, exc)
+
+            # ── Steps 1-2: member-based expansion ─────────────────────────
+            # Always run regardless of whether the direct match succeeded so
+            # that pilalerte sun_groups are also added on top.
             try:
                 members = self.source.user.get(
                     usrgrpids=grp_id, output=["userid", "username"])
@@ -1894,7 +1932,7 @@ class ZabbixMigrator:
                 continue
 
             print(f"      Group '{grp_name}': {len(members)} member(s) — "
-                  f"resolving dest usergroups...")
+                  f"resolving dest usergroups via members...")
 
             for member in members:
                 uname = member.get("username", "")
@@ -1913,13 +1951,15 @@ class ZabbixMigrator:
                         collected[gid] = entry
 
         result = list(collected.values())
+        print(f"      -> Direct matches: {direct_matched} added, "
+              f"{direct_skipped} not found in destination (skipped).")
         if result:
-            print(f"      -> {len(result)} unique dest usergroup(s) resolved "
-                  f"from {len(processed_users)} member(s):")
+            print(f"      -> {len(result)} unique dest usergroup(s) total "
+                  f"(direct + member expansion from {len(processed_users)} member(s)):")
             for g in result:
                 print(f"        + '{g.get('_name', g['usrgrpid'])}'")
         else:
-            print(f"      -> No dest usergroups resolved from shared group members.")
+            print(f"      -> No dest usergroups resolved (direct or via members).")
 
         return result
 
