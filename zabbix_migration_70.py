@@ -2389,6 +2389,7 @@ class ZabbixMigrator:
 
             cf.pop("value_name", None)
             cf.pop("host_name",  None)
+            cf.pop("item_name",  None)
 
             # Only append the field if resolution succeeded.
             # Dropping is safer than sending a stale 6.4 ID which would silently
