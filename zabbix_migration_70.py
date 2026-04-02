@@ -92,7 +92,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-19.5"
+SCRIPT_VERSION = "2026-03-26.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2389,6 +2389,7 @@ class ZabbixMigrator:
 
             cf.pop("value_name", None)
             cf.pop("host_name",  None)
+            cf.pop("item_name",  None)
 
             # Only append the field if resolution succeeded.
             # Dropping is safer than sending a stale 6.4 ID which would silently
