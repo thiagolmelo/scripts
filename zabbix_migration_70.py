@@ -126,6 +126,11 @@ FIELD_TYPE_MAP            = "8"
 # We transform the name on the fly instead of stripping the field.
 _TAG_FIELD_RE = re.compile(r'^tags\.(tag|operator|value)\.(\d+)$')
 
+# Zabbix 6.4 itemvalue threshold fields:  thresholds.color.N / thresholds.threshold.N
+# Zabbix 7.0 reversed format:             thresholds.N.color / thresholds.N.threshold
+# Same index-reversal pattern as tags.*.
+_THRESHOLD_FIELD_RE = re.compile(r'^thresholds\.(color|threshold)\.(\d+)$')
+
 # Zabbix 6.4 svggraph / override field format: ds.PROP.DS.ITEM  or  ds.PROP.DS
 # Zabbix 7.0 format:                           ds.DS.PROP.ITEM  or  ds.DS.PROP
 # Same restructuring applies to override (or.*) fields.
@@ -2510,6 +2515,17 @@ class ZabbixMigrator:
                             f = dict(f)
                             f["name"] = f"tags.{idx}.{key}"
                             transformed.append(f)
+
+                        # Transform itemvalue threshold field names:
+                        # 6.4: thresholds.color.N / thresholds.threshold.N
+                        # 7.0: thresholds.N.color / thresholds.N.threshold
+                        m = _THRESHOLD_FIELD_RE.match(fname)
+                        if m:
+                            key, idx = m.group(1), m.group(2)
+                            f = dict(f)
+                            f["name"] = f"thresholds.{idx}.{key}"
+                            transformed.append(f)
+                            continue
                             continue
 
                         # Transform svggraph/graph dataset + override field names:
