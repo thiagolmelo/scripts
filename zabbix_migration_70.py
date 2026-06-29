@@ -4332,13 +4332,15 @@ class ZabbixStatusSync:
     STATUS_DISABLED = "1"
     STATUS_ENABLED  = "0"
 
-    # (kind label, API root (item/discoveryrule/trigger), ID field name, extra .get() filter)
+    # (kind label, API root (item/discoveryrule/trigger), ID field name,
+    #  display-name field, extra .get() filter)
     # itemid is shared by items and discovery rules (both live in Zabbix's
-    # items table); triggers use their own triggerid.
+    # items table); triggers use their own triggerid. Triggers also expose
+    # their display name as "description", not "name".
     _OBJECT_KINDS = [
-        ("items",           "item",          "itemid",    {"flags": ["0", "4"]}),
-        ("discovery-rules", "discoveryrule", "itemid",    None),
-        ("triggers",        "trigger",       "triggerid", {"flags": ["0", "4"]}),
+        ("items",           "item",          "itemid",    "name",        {"flags": ["0", "4"]}),
+        ("discovery-rules", "discoveryrule", "itemid",    "name",        None),
+        ("triggers",        "trigger",       "triggerid", "description", {"flags": ["0", "4"]}),
     ]
 
     def __init__(self, src_api, dst_api, cia_name: str,
@@ -4354,7 +4356,7 @@ class ZabbixStatusSync:
         self.totals: Dict[str, Dict[str, int]] = {
             kind: {"disabled": 0, "already": 0, "missing": 0,
                    "ambiguous": 0, "errors": 0}
-            for kind, _, _, _ in self._OBJECT_KINDS
+            for kind, _, _, _, _ in self._OBJECT_KINDS
         }
         self.hosts_skipped_not_in_dest: List[str] = []
 
@@ -4371,11 +4373,11 @@ class ZabbixStatusSync:
               f"{' [DRY-RUN]' if self.dry_run else ''}...")
         for src_host, dst_host in pairs:
             host_name = src_host["name"]
-            for kind, root, id_field, extra_filter in self._OBJECT_KINDS:
+            for kind, root, id_field, name_field, extra_filter in self._OBJECT_KINDS:
                 self._sync_objects(
                     src_id=src_host["hostid"], dst_id=dst_host["hostid"],
                     host_name=host_name, root=root, id_field=id_field,
-                    extra_filter=extra_filter, kind=kind,
+                    name_field=name_field, extra_filter=extra_filter, kind=kind,
                 )
 
         self._print_summary()
@@ -4431,17 +4433,17 @@ class ZabbixStatusSync:
 
     # ── per-host, per-kind comparison ────────────────────────────────────────
 
-    def _by_name(self, api, root: str, id_field: str, host_id: str,
+    def _by_name(self, api, root: str, id_field: str, name_field: str, host_id: str,
                  extra_filter: Optional[Dict], host_name: str, kind: str) -> Dict[str, Dict]:
         """Return {name: object} for unambiguous (non-duplicate) names."""
         getter = getattr(api, root)
         objects = getter.get(
-            hostids=[host_id], output=[id_field, "name", "status"],
+            hostids=[host_id], output=[id_field, name_field, "status"],
             filter=extra_filter or {},
         )
         by_name: Dict[str, List[Dict]] = {}
         for obj in objects:
-            by_name.setdefault(obj["name"], []).append(obj)
+            by_name.setdefault(obj[name_field], []).append(obj)
 
         result: Dict[str, Dict] = {}
         for name, objs in by_name.items():
@@ -4454,10 +4456,11 @@ class ZabbixStatusSync:
         return result
 
     def _sync_objects(self, src_id: str, dst_id: str, host_name: str,
-                       root: str, id_field: str, extra_filter: Optional[Dict], kind: str):
+                       root: str, id_field: str, name_field: str,
+                       extra_filter: Optional[Dict], kind: str):
         try:
-            src_objs = self._by_name(self.src, root, id_field, src_id, extra_filter, host_name, kind)
-            dst_objs = self._by_name(self.dst, root, id_field, dst_id, extra_filter, host_name, kind)
+            src_objs = self._by_name(self.src, root, id_field, name_field, src_id, extra_filter, host_name, kind)
+            dst_objs = self._by_name(self.dst, root, id_field, name_field, dst_id, extra_filter, host_name, kind)
         except Exception as exc:
             print(f"    x [{kind}] Host '{host_name}': fetch failed: {exc}")
             self.totals[kind]["errors"] += 1
@@ -4497,7 +4500,7 @@ class ZabbixStatusSync:
     def _print_summary(self):
         print(f"\n  Status-sync summary for CIA '{self.cia}'"
               f"{' [DRY-RUN — nothing applied]' if self.dry_run else ''}:")
-        for kind, _, _, _ in self._OBJECT_KINDS:
+        for kind, _, _, _, _ in self._OBJECT_KINDS:
             t = self.totals[kind]
             print(f"  [{kind:16}] "
                   f"Disabled: {t['disabled']:4}  "
