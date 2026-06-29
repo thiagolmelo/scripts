@@ -4337,10 +4337,11 @@ class ZabbixStatusSync:
     # itemid is shared by items and discovery rules (both live in Zabbix's
     # items table); triggers use their own triggerid. Triggers also expose
     # their display name as "description", not "name".
+    # Order: triggers, then items, then discovery rules.
     _OBJECT_KINDS = [
+        ("triggers",        "trigger",       "triggerid", "description", {"flags": ["0", "4"]}),
         ("items",           "item",          "itemid",    "name",        {"flags": ["0", "4"]}),
         ("discovery-rules", "discoveryrule", "itemid",    "name",        None),
-        ("triggers",        "trigger",       "triggerid", "description", {"flags": ["0", "4"]}),
     ]
 
     def __init__(self, src_api, dst_api, cia_name: str,
@@ -4359,6 +4360,10 @@ class ZabbixStatusSync:
             for kind, _, _, _, _ in self._OBJECT_KINDS
         }
         self.hosts_skipped_not_in_dest: List[str] = []
+        # Every object actually disabled on destination this run — enough to
+        # re-enable them later. Populated only on real (non-dry-run) changes.
+        self.changes: List[Dict] = []
+        self.rollback_path: Optional[str] = None
 
     # ── public entry point ───────────────────────────────────────────────────
 
@@ -4381,6 +4386,8 @@ class ZabbixStatusSync:
                 )
 
         self._print_summary()
+        if self.changes:
+            self._write_rollback_file()
 
     # ── host resolution ──────────────────────────────────────────────────────
 
@@ -4490,6 +4497,11 @@ class ZabbixStatusSync:
                 updater.update(**{id_field: dst_obj[id_field], "status": self.STATUS_DISABLED})
                 print(f"    ✓ Disabled {kind} '{name}' on host '{host_name}'")
                 self.totals[kind]["disabled"] += 1
+                self.changes.append({
+                    "kind": kind, "root": root, "id_field": id_field,
+                    "dest_id": dst_obj[id_field],
+                    "host": host_name, "name": name,
+                })
             except Exception as exc:
                 print(f"    x Failed to disable {kind} '{name}' "
                       f"on host '{host_name}': {exc}")
@@ -4508,6 +4520,73 @@ class ZabbixStatusSync:
                   f"Missing-in-dest: {t['missing']:4}  "
                   f"Ambiguous: {t['ambiguous']:4}  "
                   f"Errors: {t['errors']:4}")
+
+    # ── rollback file ────────────────────────────────────────────────────────
+
+    def _write_rollback_file(self):
+        """
+        Write every object actually disabled this run to a JSON file, so a
+        rollback (re-enable) is possible later via:
+          --rollback-file <path>
+        """
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cia_slug = self.cia.replace("/", "_").replace(" ", "_")
+        filename = f"rollback_sync_disabled_status_{cia_slug}_{ts}.json"
+        path     = os.path.join(BASE_DIR, filename)
+
+        payload = {
+            "cia":       self.cia,
+            "generated": datetime.now().isoformat(),
+            "changes":   self.changes,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        self.rollback_path = path
+        print(f"\n  Rollback file written: {path}")
+        print(f"  ({len(self.changes)} object(s) disabled — re-enable them if "
+              f"needed with: --rollback-file \"{path}\")")
+
+
+def rollback_status_sync(dst_api, cia_name: str, path: str):
+    """
+    Re-enable every object recorded in a rollback file written by
+    ZabbixStatusSync._write_rollback_file(). Only applies entries whose
+    "cia" matches cia_name — safe to run with --cia all without cross-CIA
+    side effects.
+    """
+    if not os.path.exists(path):
+        print(f"  ERROR: rollback file not found: {path}")
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if data.get("cia") != cia_name:
+        print(f"  Skipping rollback file '{path}' — recorded for CIA "
+              f"'{data.get('cia')}', not '{cia_name}'.")
+        return
+
+    changes = data.get("changes", [])
+    print(f"  Re-enabling {len(changes)} object(s) from '{path}' "
+          f"(CIA '{cia_name}')...")
+
+    re_enabled = 0
+    errors     = 0
+    for ch in changes:
+        try:
+            updater = getattr(dst_api, ch["root"])
+            updater.update(**{ch["id_field"]: ch["dest_id"],
+                               "status": ZabbixStatusSync.STATUS_ENABLED})
+            print(f"    ✓ Re-enabled {ch['kind']} '{ch['name']}' "
+                  f"on host '{ch['host']}'")
+            re_enabled += 1
+        except Exception as exc:
+            print(f"    x Failed to re-enable {ch['kind']} '{ch['name']}' "
+                  f"on host '{ch['host']}': {exc}")
+            errors += 1
+
+    print(f"\n  Rollback done: {re_enabled} re-enabled, {errors} failed.")
 
 
 # ---------------------------------------------------------------------------
@@ -4648,14 +4727,19 @@ Examples:
   # Migrate everything then immediately run the health-check
   python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --compare
 
-  # Preview which items/triggers/discovery rules would be disabled on
+  # Preview which triggers/items/discovery rules would be disabled on
   # destination (disabled on source, still enabled on destination), for one host
   python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
       --host SRV01 --dry-run
 
-  # Apply that sync for every host in a host group
+  # Apply that sync for every host in a host group — writes a rollback JSON
+  # file next to the script listing everything it disabled
   python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
       --hostgroup "PRD-APP-MYS-WORKFLOW"
+
+  # Undo it later if needed: re-enable everything from that rollback file
+  python zabbix_migration_70.py --env ppr --cia biz01 \\
+      --rollback-file rollback_sync_disabled_status_biz01_20260629_120000.json
 
 Config files (same directory as this script):
   zabbix_credential.yml          username / password
@@ -4801,6 +4885,14 @@ Config files (same directory as this script):
         "--dry-run", action="store_true",
         help="(--sync-disabled-status only) Preview changes without applying them."
     )
+    parser.add_argument(
+        "--rollback-file", default=None, metavar="FILE",
+        help=(
+            "Re-enable every object recorded in a rollback JSON file "
+            "previously written by --sync-disabled-status (only applies "
+            "entries matching the current --cia). Does not run the sync itself."
+        )
+    )
     args = parser.parse_args()
 
     # Logging
@@ -4824,7 +4916,7 @@ Config files (same directory as this script):
 
     # ── Validate migration/compare args ─────────────────────────────────────
     if (args.migrate or args.compare is not None or args.update_sharing
-            or args.move_groups or args.sync_disabled_status):
+            or args.move_groups or args.sync_disabled_status or args.rollback_file):
         missing = []
         if not args.env:
             missing.append("--env")
@@ -4840,7 +4932,8 @@ Config files (same directory as this script):
             print(
                 f"ERROR: {' and '.join(missing)} "
                 f"{'is' if len(missing) == 1 else 'are'} required when --migrate, "
-                f"--compare, --update-sharing or --sync-disabled-status is used.",
+                f"--compare, --update-sharing, --sync-disabled-status or "
+                f"--rollback-file is used.",
                 file=sys.stderr
             )
             sys.exit(1)
@@ -4910,6 +5003,8 @@ Config files (same directory as this script):
         print(f"  update-sharing groups: {', '.join(args.share_groups)}")
     if args.sync_disabled_status:
         print(f"  sync-disabled-status=on{'  mode=dry-run' if args.dry_run else ''}")
+    if args.rollback_file:
+        print(f"  rollback-file='{args.rollback_file}'")
     print("=" * 70)
 
     # Global totals
@@ -4992,13 +5087,19 @@ Config files (same directory as this script):
                 )
 
             if args.sync_disabled_status:
-                print(f"\n  -- SYNC DISABLED STATUS (items + triggers + discovery rules) --")
+                print(f"\n  -- SYNC DISABLED STATUS (triggers + items + discovery rules) --")
                 syncer = ZabbixStatusSync(
                     src_api=migrator.source, dst_api=migrator.dest, cia_name=cia_name,
                     host_filter=args.host, hostgroup_filter=args.hostgroup,
                     dry_run=args.dry_run,
                 )
                 syncer.run()
+
+            if args.rollback_file:
+                print(f"\n  -- ROLLBACK from '{args.rollback_file}' --")
+                rollback_status_sync(
+                    dst_api=migrator.dest, cia_name=cia_name, path=args.rollback_file,
+                )
 
             # Run comparison after migration (or standalone when no --migrate given)
             if args.compare is not None:
