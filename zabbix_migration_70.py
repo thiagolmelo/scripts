@@ -4312,6 +4312,199 @@ class ZabbixComparator:
 
 
 # ---------------------------------------------------------------------------
+# Status sync — disable in destination what's already disabled in source
+# ---------------------------------------------------------------------------
+
+class ZabbixStatusSync:
+    """
+    HOST_IMPORT_RULES imports items/discoveryRules with updateExisting=False,
+    so once a host is migrated, disabling an item or discovery rule later on
+    the 6.4 source never propagates to the 7.0 destination — it keeps
+    alerting there. This pass fixes that drift, scoped to hosts only:
+
+    For every host that exists on both source and destination, items and
+    discovery rules are matched by name. Whenever an object is disabled on
+    source but still enabled on destination, it gets disabled on
+    destination too. One-directional: never re-enables anything, and never
+    touches objects that are enabled on source.
+    """
+
+    STATUS_DISABLED = "1"
+    STATUS_ENABLED  = "0"
+
+    # (kind label, getter API method, updater API method, item.get extra filter)
+    _OBJECT_KINDS = [
+        ("items",           "item",          {"flags": ["0", "4"]}),
+        ("discovery-rules", "discoveryrule", None),
+    ]
+
+    def __init__(self, src_api, dst_api, cia_name: str,
+                 host_filter: Optional[str] = None,
+                 hostgroup_filter: Optional[str] = None,
+                 dry_run: bool = False):
+        self.src = src_api
+        self.dst = dst_api
+        self.cia = cia_name
+        self.host_filter      = host_filter
+        self.hostgroup_filter = hostgroup_filter
+        self.dry_run = dry_run
+        self.totals: Dict[str, Dict[str, int]] = {
+            kind: {"disabled": 0, "already": 0, "missing": 0,
+                   "ambiguous": 0, "errors": 0}
+            for kind, _, _ in self._OBJECT_KINDS
+        }
+        self.hosts_skipped_not_in_dest: List[str] = []
+
+    # ── public entry point ───────────────────────────────────────────────────
+
+    def run(self):
+        print(f"\n  Resolving target host(s) for CIA '{self.cia}'...")
+        pairs = self._resolve_host_pairs()
+        if not pairs:
+            print("  No matching host(s) found on both source and destination.")
+            return
+
+        print(f"  Processing {len(pairs)} host(s)"
+              f"{' [DRY-RUN]' if self.dry_run else ''}...")
+        for src_host, dst_host in pairs:
+            host_name = src_host["name"]
+            for kind, root, extra_filter in self._OBJECT_KINDS:
+                self._sync_objects(
+                    src_id=src_host["hostid"], dst_id=dst_host["hostid"],
+                    host_name=host_name, root=root,
+                    extra_filter=extra_filter, kind=kind,
+                )
+
+        self._print_summary()
+
+    # ── host resolution ──────────────────────────────────────────────────────
+
+    def _find_host(self, api, name: str) -> Optional[Dict]:
+        data = api.host.get(filter={"name": name}, output=["hostid", "name"])
+        return data[0] if data else None
+
+    def _resolve_host_pairs(self) -> List[Tuple[Dict, Dict]]:
+        if self.host_filter:
+            src_host = self._find_host(self.src, self.host_filter)
+            if not src_host:
+                print(f"  Host '{self.host_filter}' not found on source.")
+                return []
+            dst_host = self._find_host(self.dst, self.host_filter)
+            if not dst_host:
+                print(f"  Host '{self.host_filter}' not found on destination "
+                      f"(not migrated yet?).")
+                return []
+            return [(src_host, dst_host)]
+
+        if self.hostgroup_filter:
+            groups = self.src.hostgroup.get(
+                filter={"name": self.hostgroup_filter},
+                selectHosts=["hostid", "name", "flags"],
+            )
+            if not groups:
+                print(f"  Host group '{self.hostgroup_filter}' not found on source.")
+                return []
+            src_hosts = [h for h in groups[0].get("hosts", [])
+                         if str(h.get("flags", "0")) == "0"]
+        else:
+            src_hosts = self.src.host.get(
+                output=["hostid", "name"], filter={"flags": "0"})
+
+        dst_hosts  = self.dst.host.get(output=["hostid", "name"], filter={"flags": "0"})
+        dst_by_name = {h["name"]: h for h in dst_hosts}
+
+        pairs: List[Tuple[Dict, Dict]] = []
+        for h in src_hosts:
+            dst_host = dst_by_name.get(h["name"])
+            if dst_host:
+                pairs.append((h, dst_host))
+            else:
+                self.hosts_skipped_not_in_dest.append(h["name"])
+
+        if self.hosts_skipped_not_in_dest:
+            print(f"  Skipping {len(self.hosts_skipped_not_in_dest)} host(s) "
+                  f"not present on destination (not migrated yet).")
+        return pairs
+
+    # ── per-host, per-kind comparison ────────────────────────────────────────
+
+    def _by_name(self, api, root: str, host_id: str, extra_filter: Optional[Dict],
+                 host_name: str, kind: str) -> Dict[str, str]:
+        """Return {name: itemid} for unambiguous (non-duplicate) names."""
+        getter = getattr(api, root)
+        objects = getter.get(
+            hostids=[host_id], output=["itemid", "name", "status"],
+            filter=extra_filter or {},
+        )
+        by_name: Dict[str, List[Dict]] = {}
+        for obj in objects:
+            by_name.setdefault(obj["name"], []).append(obj)
+
+        result: Dict[str, Dict] = {}
+        for name, objs in by_name.items():
+            if len(objs) > 1:
+                self.totals[kind]["ambiguous"] += 1
+                logger.debug("[StatusSync] Host '%s': ambiguous %s name '%s' "
+                             "(%d objects) — skipped.", host_name, kind, name, len(objs))
+                continue
+            result[name] = objs[0]
+        return result
+
+    def _sync_objects(self, src_id: str, dst_id: str, host_name: str,
+                       root: str, extra_filter: Optional[Dict], kind: str):
+        try:
+            src_objs = self._by_name(self.src, root, src_id, extra_filter, host_name, kind)
+            dst_objs = self._by_name(self.dst, root, dst_id, extra_filter, host_name, kind)
+        except Exception as exc:
+            print(f"    x [{kind}] Host '{host_name}': fetch failed: {exc}")
+            self.totals[kind]["errors"] += 1
+            return
+
+        updater = getattr(self.dst, root)
+        for name, src_obj in src_objs.items():
+            if str(src_obj.get("status")) != self.STATUS_DISABLED:
+                continue   # enabled on source — nothing to do
+
+            dst_obj = dst_objs.get(name)
+            if dst_obj is None:
+                self.totals[kind]["missing"] += 1
+                continue
+            if str(dst_obj.get("status")) == self.STATUS_DISABLED:
+                self.totals[kind]["already"] += 1
+                continue
+
+            # Disabled on source, still enabled on destination — fix it.
+            if self.dry_run:
+                print(f"    ~ [DRY-RUN] would disable {kind} '{name}' "
+                      f"on host '{host_name}'")
+                self.totals[kind]["disabled"] += 1
+                continue
+
+            try:
+                updater.update(itemid=dst_obj["itemid"], status=self.STATUS_DISABLED)
+                print(f"    ✓ Disabled {kind} '{name}' on host '{host_name}'")
+                self.totals[kind]["disabled"] += 1
+            except Exception as exc:
+                print(f"    x Failed to disable {kind} '{name}' "
+                      f"on host '{host_name}': {exc}")
+                self.totals[kind]["errors"] += 1
+
+    # ── summary ──────────────────────────────────────────────────────────────
+
+    def _print_summary(self):
+        print(f"\n  Status-sync summary for CIA '{self.cia}'"
+              f"{' [DRY-RUN — nothing applied]' if self.dry_run else ''}:")
+        for kind, _, _ in self._OBJECT_KINDS:
+            t = self.totals[kind]
+            print(f"  [{kind:16}] "
+                  f"Disabled: {t['disabled']:4}  "
+                  f"Already-disabled: {t['already']:4}  "
+                  f"Missing-in-dest: {t['missing']:4}  "
+                  f"Ambiguous: {t['ambiguous']:4}  "
+                  f"Errors: {t['errors']:4}")
+
+
+# ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
 
@@ -4449,6 +4642,15 @@ Examples:
   # Migrate everything then immediately run the health-check
   python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --compare
 
+  # Preview which items/discovery rules would be disabled on destination
+  # (disabled on source, still enabled on destination), for one host
+  python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
+      --host SRV01 --dry-run
+
+  # Apply that sync for every host in a host group
+  python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
+      --hostgroup "PRD-APP-MYS-WORKFLOW"
+
 Config files (same directory as this script):
   zabbix_credential.yml          username / password
   zabbix_instances_ppr.yml       CIA source/destination URLs for PPR
@@ -4487,7 +4689,14 @@ Config files (same directory as this script):
     )
     parser.add_argument(
         "--host", default=None, metavar="NAME",
-        help="(hosts only) Migrate a single host by exact name"
+        help=(
+            "(hosts / --sync-disabled-status) Migrate a single host by exact "
+            "name, or scope --sync-disabled-status to that host"
+        )
+    )
+    parser.add_argument(
+        "--hostgroup", default=None, metavar="NAME",
+        help="(--sync-disabled-status only) Limit to hosts in this host group."
     )
     parser.add_argument(
         "--usergroup", default=None, metavar="NAME",
@@ -4572,6 +4781,20 @@ Config files (same directory as this script):
         metavar="source|dest",
         help="Which Zabbix instance to apply --move-groups on (default: dest)."
     )
+    parser.add_argument(
+        "--sync-disabled-status", action="store_true",
+        help=(
+            "For hosts that exist in both source and destination, disable "
+            "items and discovery rules on destination that are disabled on "
+            "source but still enabled on destination. Never re-enables "
+            "anything. Scope with --host or --hostgroup; with neither, all "
+            "common hosts are processed."
+        )
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="(--sync-disabled-status only) Preview changes without applying them."
+    )
     args = parser.parse_args()
 
     # Logging
@@ -4594,7 +4817,8 @@ Config files (same directory as this script):
             sys.exit(0)
 
     # ── Validate migration/compare args ─────────────────────────────────────
-    if args.migrate or args.compare is not None or args.update_sharing or args.move_groups:
+    if (args.migrate or args.compare is not None or args.update_sharing
+            or args.move_groups or args.sync_disabled_status):
         missing = []
         if not args.env:
             missing.append("--env")
@@ -4609,7 +4833,8 @@ Config files (same directory as this script):
         if missing:
             print(
                 f"ERROR: {' and '.join(missing)} "
-                f"{'is' if len(missing) == 1 else 'are'} required when --migrate, --compare or --update-sharing is used.",
+                f"{'is' if len(missing) == 1 else 'are'} required when --migrate, "
+                f"--compare, --update-sharing or --sync-disabled-status is used.",
                 file=sys.stderr
             )
             sys.exit(1)
@@ -4667,6 +4892,8 @@ Config files (same directory as this script):
         print(f"  dashboard filter='{args.dashboard}'")
     if args.host:
         print(f"  host filter='{args.host}'")
+    if args.hostgroup:
+        print(f"  hostgroup filter='{args.hostgroup}'")
     if args.usergroup:
         print(f"  usergroup filter='{args.usergroup}'")
     if args.skip_existing:
@@ -4675,6 +4902,8 @@ Config files (same directory as this script):
         print("  mode=include-disabled-hosts")
     if args.update_sharing:
         print(f"  update-sharing groups: {', '.join(args.share_groups)}")
+    if args.sync_disabled_status:
+        print(f"  sync-disabled-status=on{'  mode=dry-run' if args.dry_run else ''}")
     print("=" * 70)
 
     # Global totals
@@ -4755,6 +4984,15 @@ Config files (same directory as this script):
                     dashboard_filter=args.dashboard,
                     group_names=args.share_groups,
                 )
+
+            if args.sync_disabled_status:
+                print(f"\n  -- SYNC DISABLED STATUS (items + discovery rules) --")
+                syncer = ZabbixStatusSync(
+                    src_api=migrator.source, dst_api=migrator.dest, cia_name=cia_name,
+                    host_filter=args.host, hostgroup_filter=args.hostgroup,
+                    dry_run=args.dry_run,
+                )
+                syncer.run()
 
             # Run comparison after migration (or standalone when no --migrate given)
             if args.compare is not None:
