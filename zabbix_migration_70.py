@@ -54,6 +54,15 @@ import re
 import yaml
 from zabbix_utils import ZabbixAPI
 
+# All Zabbix/pilalerte endpoints sit behind an internal CA — verify=False is
+# used throughout this script, so silence the resulting per-request warning.
+try:
+    import requests as _requests_for_warnings
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    _requests_for_warnings.packages.urllib3.disable_warnings(InsecureRequestWarning)
+except Exception:
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -571,12 +580,12 @@ class ZabbixMigrator:
         self._password = password
 
         logger.debug("Connecting to source: %s", source_url)
-        self.source = ZabbixAPI(url=source_url)
+        self.source = ZabbixAPI(url=source_url, validate_certs=False)  # internal CA — skip SSL verify
         self.source.login(user=username, password=password)
         logger.debug("Source login OK.")
 
         logger.debug("Connecting to destination: %s", dest_url)
-        self.dest = ZabbixAPI(url=dest_url)
+        self.dest = ZabbixAPI(url=dest_url, validate_certs=False)  # internal CA — skip SSL verify
         self.dest.login(user=username, password=password)
         logger.debug("Destination login OK.")
 
@@ -599,7 +608,8 @@ class ZabbixMigrator:
                 "params": {user_key: username, "password": password}
             })
             resp = _requests.post(api_url, data=payload,
-                                  headers={"Content-Type": "application/json"}, timeout=30)
+                                  headers={"Content-Type": "application/json"}, timeout=30,
+                                  verify=False)   # internal CA — skip SSL verify
             resp.raise_for_status()
             data = resp.json()
             if "error" in data:
@@ -619,12 +629,12 @@ class ZabbixMigrator:
         self._dest_token = self._raw_login(self._dest_url,   self._username, self._password)
         # Keep pyzabbix session in sync too (for .host.get etc.)
         try:
-            self.source = ZabbixAPI(url=self._source_url)
+            self.source = ZabbixAPI(url=self._source_url, validate_certs=False)
             self.source.login(user=self._username, password=self._password)
         except Exception as exc:
             logger.debug("pyzabbix source re-login failed: %s", exc)
         try:
-            self.dest = ZabbixAPI(url=self._dest_url)
+            self.dest = ZabbixAPI(url=self._dest_url, validate_certs=False)
             self.dest.login(user=self._username, password=self._password)
         except Exception as exc:
             logger.debug("pyzabbix dest re-login failed: %s", exc)
@@ -2528,6 +2538,17 @@ class ZabbixMigrator:
                             continue
                             continue
 
+                        # Transform itemvalue threshold field names:
+                        # 6.4: thresholds.color.N / thresholds.threshold.N
+                        # 7.0: thresholds.N.color / thresholds.N.threshold
+                        m = _THRESHOLD_FIELD_RE.match(fname)
+                        if m:
+                            key, idx = m.group(1), m.group(2)
+                            f = dict(f)
+                            f["name"] = f"thresholds.{idx}.{key}"
+                            transformed.append(f)
+                            continue
+
                         # Transform svggraph/graph dataset + override field names:
                         # 6.4: ds.FIELD.N[.M]  → 7.0: ds.N.FIELD[.M]
                         # 6.4: or.FIELD.N[.M]  → 7.0: or.N.FIELD[.M]
@@ -2851,7 +2872,8 @@ class ZabbixMigrator:
             api_url,
             data=payload,
             headers={"Content-Type": "application/json"},
-            timeout=120
+            timeout=120,
+            verify=False   # internal CA — skip SSL verify
         )
         resp.raise_for_status()
         data = resp.json()
@@ -2972,7 +2994,8 @@ class ZabbixMigrator:
             api_url,
             data=raw_body,
             headers={"Content-Type": "application/json"},
-            timeout=120
+            timeout=120,
+            verify=False   # internal CA — skip SSL verify
         )
         resp.raise_for_status()
         data = resp.json()
