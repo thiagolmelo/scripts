@@ -4317,14 +4317,14 @@ class ZabbixComparator:
 
 class ZabbixStatusSync:
     """
-    HOST_IMPORT_RULES imports items/discoveryRules with updateExisting=False,
-    so once a host is migrated, disabling an item or discovery rule later on
-    the 6.4 source never propagates to the 7.0 destination — it keeps
-    alerting there. This pass fixes that drift, scoped to hosts only:
+    HOST_IMPORT_RULES imports items/triggers/discoveryRules with
+    updateExisting=False, so once a host is migrated, disabling one of these
+    later on the 6.4 source never propagates to the 7.0 destination — it
+    keeps alerting there. This pass fixes that drift, scoped to hosts only:
 
-    For every host that exists on both source and destination, items and
-    discovery rules are matched by name. Whenever an object is disabled on
-    source but still enabled on destination, it gets disabled on
+    For every host that exists on both source and destination, items,
+    triggers and discovery rules are matched by name. Whenever an object is
+    disabled on source but still enabled on destination, it gets disabled on
     destination too. One-directional: never re-enables anything, and never
     touches objects that are enabled on source.
     """
@@ -4332,10 +4332,13 @@ class ZabbixStatusSync:
     STATUS_DISABLED = "1"
     STATUS_ENABLED  = "0"
 
-    # (kind label, getter API method, updater API method, item.get extra filter)
+    # (kind label, API root (item/discoveryrule/trigger), ID field name, extra .get() filter)
+    # itemid is shared by items and discovery rules (both live in Zabbix's
+    # items table); triggers use their own triggerid.
     _OBJECT_KINDS = [
-        ("items",           "item",          {"flags": ["0", "4"]}),
-        ("discovery-rules", "discoveryrule", None),
+        ("items",           "item",          "itemid",    {"flags": ["0", "4"]}),
+        ("discovery-rules", "discoveryrule", "itemid",    None),
+        ("triggers",        "trigger",       "triggerid", {"flags": ["0", "4"]}),
     ]
 
     def __init__(self, src_api, dst_api, cia_name: str,
@@ -4351,7 +4354,7 @@ class ZabbixStatusSync:
         self.totals: Dict[str, Dict[str, int]] = {
             kind: {"disabled": 0, "already": 0, "missing": 0,
                    "ambiguous": 0, "errors": 0}
-            for kind, _, _ in self._OBJECT_KINDS
+            for kind, _, _, _ in self._OBJECT_KINDS
         }
         self.hosts_skipped_not_in_dest: List[str] = []
 
@@ -4368,10 +4371,10 @@ class ZabbixStatusSync:
               f"{' [DRY-RUN]' if self.dry_run else ''}...")
         for src_host, dst_host in pairs:
             host_name = src_host["name"]
-            for kind, root, extra_filter in self._OBJECT_KINDS:
+            for kind, root, id_field, extra_filter in self._OBJECT_KINDS:
                 self._sync_objects(
                     src_id=src_host["hostid"], dst_id=dst_host["hostid"],
-                    host_name=host_name, root=root,
+                    host_name=host_name, root=root, id_field=id_field,
                     extra_filter=extra_filter, kind=kind,
                 )
 
@@ -4428,12 +4431,12 @@ class ZabbixStatusSync:
 
     # ── per-host, per-kind comparison ────────────────────────────────────────
 
-    def _by_name(self, api, root: str, host_id: str, extra_filter: Optional[Dict],
-                 host_name: str, kind: str) -> Dict[str, str]:
-        """Return {name: itemid} for unambiguous (non-duplicate) names."""
+    def _by_name(self, api, root: str, id_field: str, host_id: str,
+                 extra_filter: Optional[Dict], host_name: str, kind: str) -> Dict[str, Dict]:
+        """Return {name: object} for unambiguous (non-duplicate) names."""
         getter = getattr(api, root)
         objects = getter.get(
-            hostids=[host_id], output=["itemid", "name", "status"],
+            hostids=[host_id], output=[id_field, "name", "status"],
             filter=extra_filter or {},
         )
         by_name: Dict[str, List[Dict]] = {}
@@ -4451,10 +4454,10 @@ class ZabbixStatusSync:
         return result
 
     def _sync_objects(self, src_id: str, dst_id: str, host_name: str,
-                       root: str, extra_filter: Optional[Dict], kind: str):
+                       root: str, id_field: str, extra_filter: Optional[Dict], kind: str):
         try:
-            src_objs = self._by_name(self.src, root, src_id, extra_filter, host_name, kind)
-            dst_objs = self._by_name(self.dst, root, dst_id, extra_filter, host_name, kind)
+            src_objs = self._by_name(self.src, root, id_field, src_id, extra_filter, host_name, kind)
+            dst_objs = self._by_name(self.dst, root, id_field, dst_id, extra_filter, host_name, kind)
         except Exception as exc:
             print(f"    x [{kind}] Host '{host_name}': fetch failed: {exc}")
             self.totals[kind]["errors"] += 1
@@ -4481,7 +4484,7 @@ class ZabbixStatusSync:
                 continue
 
             try:
-                updater.update(itemid=dst_obj["itemid"], status=self.STATUS_DISABLED)
+                updater.update(**{id_field: dst_obj[id_field], "status": self.STATUS_DISABLED})
                 print(f"    ✓ Disabled {kind} '{name}' on host '{host_name}'")
                 self.totals[kind]["disabled"] += 1
             except Exception as exc:
@@ -4494,7 +4497,7 @@ class ZabbixStatusSync:
     def _print_summary(self):
         print(f"\n  Status-sync summary for CIA '{self.cia}'"
               f"{' [DRY-RUN — nothing applied]' if self.dry_run else ''}:")
-        for kind, _, _ in self._OBJECT_KINDS:
+        for kind, _, _, _ in self._OBJECT_KINDS:
             t = self.totals[kind]
             print(f"  [{kind:16}] "
                   f"Disabled: {t['disabled']:4}  "
@@ -4642,8 +4645,8 @@ Examples:
   # Migrate everything then immediately run the health-check
   python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --compare
 
-  # Preview which items/discovery rules would be disabled on destination
-  # (disabled on source, still enabled on destination), for one host
+  # Preview which items/triggers/discovery rules would be disabled on
+  # destination (disabled on source, still enabled on destination), for one host
   python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
       --host SRV01 --dry-run
 
@@ -4785,10 +4788,10 @@ Config files (same directory as this script):
         "--sync-disabled-status", action="store_true",
         help=(
             "For hosts that exist in both source and destination, disable "
-            "items and discovery rules on destination that are disabled on "
-            "source but still enabled on destination. Never re-enables "
-            "anything. Scope with --host or --hostgroup; with neither, all "
-            "common hosts are processed."
+            "items, triggers and discovery rules on destination that are "
+            "disabled on source but still enabled on destination. Never "
+            "re-enables anything. Scope with --host or --hostgroup; with "
+            "neither, all common hosts are processed."
         )
     )
     parser.add_argument(
@@ -4986,7 +4989,7 @@ Config files (same directory as this script):
                 )
 
             if args.sync_disabled_status:
-                print(f"\n  -- SYNC DISABLED STATUS (items + discovery rules) --")
+                print(f"\n  -- SYNC DISABLED STATUS (items + triggers + discovery rules) --")
                 syncer = ZabbixStatusSync(
                     src_api=migrator.source, dst_api=migrator.dest, cia_name=cia_name,
                     host_filter=args.host, hostgroup_filter=args.hostgroup,
