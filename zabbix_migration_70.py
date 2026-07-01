@@ -4874,6 +4874,17 @@ def move_groups(zapi, from_prefix: str, into_parent: str,
           f"{failed} failed.")
 
 
+def _ask_apply_after_dryrun() -> bool:
+    """Return True if running in an interactive terminal and user answers 'y'."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        ans = input("\n  Apply changes now? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans == "y"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Migrate Zabbix objects from 6.4 to 7.0",
@@ -5297,6 +5308,13 @@ Config files (same directory as this script):
                     dry_run=args.dry_run,
                 )
                 syncer.run()
+                if args.dry_run and _ask_apply_after_dryrun():
+                    print(f"\n  -- SYNC DISABLED STATUS (applying) --")
+                    ZabbixStatusSync(
+                        src_api=migrator.source, dst_api=migrator.dest, cia_name=cia_name,
+                        host_filter=args.host, hostgroup_filter=args.hostgroup,
+                        dry_run=False,
+                    ).run()
 
             if args.sync_hostgroups:
                 print(f"\n  -- SYNC HOSTGROUPS --")
@@ -5307,6 +5325,14 @@ Config files (same directory as this script):
                     dry_run=args.dry_run,
                 )
                 hg_syncer.run()
+                if args.dry_run and _ask_apply_after_dryrun():
+                    print(f"\n  -- SYNC HOSTGROUPS (applying) --")
+                    ZabbixHostGroupSync(
+                        src_api=migrator.source, dst_api=migrator.dest,
+                        cia_name=cia_name,
+                        host_filter=args.host, hostgroup_filter=args.hostgroup,
+                        dry_run=False,
+                    ).run()
 
             if args.rollback_file:
                 print(f"\n  -- ROLLBACK from '{args.rollback_file}' --")
