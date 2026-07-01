@@ -4590,6 +4590,190 @@ def rollback_status_sync(dst_api, cia_name: str, path: str):
 
 
 # ---------------------------------------------------------------------------
+# 7. HOST GROUP SYNC
+# ---------------------------------------------------------------------------
+
+class ZabbixHostGroupSync:
+    """
+    For every host present on both source and destination, fetch the hostgroups
+    assigned to it on the source. Any group present on source but absent on
+    destination is added to the host on destination (creating the group first
+    if it does not yet exist there). One-directional: never removes groups.
+    """
+
+    def __init__(self, src_api, dst_api, cia_name: str,
+                 host_filter: Optional[str] = None,
+                 hostgroup_filter: Optional[str] = None,
+                 dry_run: bool = False):
+        self.src = src_api
+        self.dst = dst_api
+        self.cia = cia_name
+        self.host_filter      = host_filter
+        self.hostgroup_filter = hostgroup_filter
+        self.dry_run = dry_run
+        self.totals = {
+            "assigned": 0, "groups_created": 0,
+            "hosts_changed": 0, "errors": 0,
+        }
+        self.hosts_skipped_not_in_dest: List[str] = []
+
+    # ── public entry point ───────────────────────────────────────────────────
+
+    def run(self):
+        print(f"\n  Resolving target host(s) for CIA '{self.cia}'...")
+        pairs = self._resolve_host_pairs()
+        if not pairs:
+            print("  No matching host(s) found on both source and destination.")
+            return
+
+        print(f"  Processing {len(pairs)} host(s)"
+              f"{' [DRY-RUN]' if self.dry_run else ''}...")
+        for src_host, dst_host in pairs:
+            self._sync_groups(src_host, dst_host)
+
+        self._print_summary()
+
+    # ── host resolution ──────────────────────────────────────────────────────
+
+    def _find_host(self, api, name: str) -> Optional[Dict]:
+        data = api.host.get(filter={"name": name}, output=["hostid", "name"])
+        return data[0] if data else None
+
+    def _resolve_host_pairs(self) -> List[Tuple[Dict, Dict]]:
+        if self.host_filter:
+            src_host = self._find_host(self.src, self.host_filter)
+            if not src_host:
+                print(f"  Host '{self.host_filter}' not found on source.")
+                return []
+            dst_host = self._find_host(self.dst, self.host_filter)
+            if not dst_host:
+                print(f"  Host '{self.host_filter}' not found on destination "
+                      f"(not migrated yet?).")
+                return []
+            return [(src_host, dst_host)]
+
+        if self.hostgroup_filter:
+            groups = self.src.hostgroup.get(
+                filter={"name": self.hostgroup_filter},
+                selectHosts=["hostid", "name", "flags"],
+            )
+            if not groups:
+                print(f"  Host group '{self.hostgroup_filter}' not found on source.")
+                return []
+            src_hosts = [h for h in groups[0].get("hosts", [])
+                         if str(h.get("flags", "0")) == "0"]
+        else:
+            src_hosts = self.src.host.get(
+                output=["hostid", "name"], filter={"flags": "0"})
+
+        dst_hosts   = self.dst.host.get(output=["hostid", "name"], filter={"flags": "0"})
+        dst_by_name = {h["name"]: h for h in dst_hosts}
+
+        pairs: List[Tuple[Dict, Dict]] = []
+        for h in src_hosts:
+            dst_host = dst_by_name.get(h["name"])
+            if dst_host:
+                pairs.append((h, dst_host))
+            else:
+                self.hosts_skipped_not_in_dest.append(h["name"])
+
+        if self.hosts_skipped_not_in_dest:
+            print(f"  Skipping {len(self.hosts_skipped_not_in_dest)} host(s) "
+                  f"not present on destination (not migrated yet).")
+        return pairs
+
+    # ── per-host group comparison ────────────────────────────────────────────
+
+    def _sync_groups(self, src_host: Dict, dst_host: Dict):
+        host_name = src_host["name"]
+        src_id    = src_host["hostid"]
+        dst_id    = dst_host["hostid"]
+
+        try:
+            src_data = self.src.host.get(
+                hostids=[src_id], output=["hostid"],
+                selectGroups=["groupid", "name"],
+            )
+            dst_data = self.dst.host.get(
+                hostids=[dst_id], output=["hostid"],
+                selectGroups=["groupid", "name"],
+            )
+        except Exception as exc:
+            print(f"    x Host '{host_name}': fetch failed: {exc}")
+            self.totals["errors"] += 1
+            return
+
+        if not src_data or not dst_data:
+            return
+
+        src_group_names    = {g["name"] for g in src_data[0].get("groups", [])}
+        dst_groups_by_name = {g["name"]: g for g in dst_data[0].get("groups", [])}
+
+        missing = sorted(src_group_names - set(dst_groups_by_name.keys()))
+        if not missing:
+            return  # all source groups already present on destination host
+
+        # Base payload for host.update — must include all currently-assigned groups
+        groups_payload: List[Dict] = [
+            {"groupid": g["groupid"]} for g in dst_data[0].get("groups", [])
+        ]
+        newly_assigned: List[str] = []
+
+        for gname in missing:
+            if self.dry_run:
+                try:
+                    exists = self.dst.hostgroup.get(
+                        filter={"name": gname}, output=["groupid"])
+                    action = "assign" if exists else "create + assign"
+                except Exception:
+                    action = "create + assign"
+                print(f"    ~ [DRY-RUN] would {action} group '{gname}' "
+                      f"to host '{host_name}'")
+                self.totals["assigned"] += 1
+                continue
+
+            try:
+                existing = self.dst.hostgroup.get(
+                    filter={"name": gname}, output=["groupid"])
+                if existing:
+                    gid = existing[0]["groupid"]
+                else:
+                    result = self.dst.hostgroup.create(name=gname)
+                    gid    = result["groupids"][0]
+                    print(f"    + Created hostgroup '{gname}'")
+                    self.totals["groups_created"] += 1
+                groups_payload.append({"groupid": gid})
+                newly_assigned.append(gname)
+            except Exception as exc:
+                print(f"    x Failed to resolve group '{gname}' "
+                      f"for host '{host_name}': {exc}")
+                self.totals["errors"] += 1
+
+        if not self.dry_run and newly_assigned:
+            try:
+                self.dst.host.update(hostid=dst_id, groups=groups_payload)
+                for gname in newly_assigned:
+                    print(f"    ✓ Assigned '{gname}' → host '{host_name}'")
+                    self.totals["assigned"] += 1
+                self.totals["hosts_changed"] += 1
+            except Exception as exc:
+                print(f"    x Host '{host_name}': failed to apply group "
+                      f"assignments: {exc}")
+                self.totals["errors"] += len(newly_assigned)
+
+    # ── summary ──────────────────────────────────────────────────────────────
+
+    def _print_summary(self):
+        t = self.totals
+        print(f"\n  Host-group sync summary for CIA '{self.cia}'"
+              f"{' [DRY-RUN — nothing applied]' if self.dry_run else ''}:")
+        print(f"  Hosts modified  : {t['hosts_changed']}")
+        print(f"  Groups assigned : {t['assigned']}")
+        print(f"  Groups created  : {t['groups_created']}")
+        print(f"  Errors          : {t['errors']}")
+
+
+# ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
 
@@ -4786,7 +4970,10 @@ Config files (same directory as this script):
     )
     parser.add_argument(
         "--hostgroup", default=None, metavar="NAME",
-        help="(--sync-disabled-status only) Limit to hosts in this host group."
+        help=(
+            "(--sync-disabled-status / --sync-hostgroups) "
+            "Limit to hosts in this host group."
+        )
     )
     parser.add_argument(
         "--usergroup", default=None, metavar="NAME",
@@ -4882,8 +5069,21 @@ Config files (same directory as this script):
         )
     )
     parser.add_argument(
+        "--sync-hostgroups", action="store_true",
+        help=(
+            "For hosts that exist in both source and destination, ensure the "
+            "destination host belongs to every hostgroup the source host belongs "
+            "to. Creates missing groups on destination if needed. Never removes "
+            "groups. Scope with --host or --hostgroup; with neither, all common "
+            "hosts are processed."
+        )
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
-        help="(--sync-disabled-status only) Preview changes without applying them."
+        help=(
+            "(--sync-disabled-status / --sync-hostgroups) "
+            "Preview changes without applying them."
+        )
     )
     parser.add_argument(
         "--rollback-file", default=None, metavar="FILE",
@@ -4916,7 +5116,8 @@ Config files (same directory as this script):
 
     # ── Validate migration/compare args ─────────────────────────────────────
     if (args.migrate or args.compare is not None or args.update_sharing
-            or args.move_groups or args.sync_disabled_status or args.rollback_file):
+            or args.move_groups or args.sync_disabled_status or args.rollback_file
+            or args.sync_hostgroups):
         missing = []
         if not args.env:
             missing.append("--env")
@@ -4932,8 +5133,8 @@ Config files (same directory as this script):
             print(
                 f"ERROR: {' and '.join(missing)} "
                 f"{'is' if len(missing) == 1 else 'are'} required when --migrate, "
-                f"--compare, --update-sharing, --sync-disabled-status or "
-                f"--rollback-file is used.",
+                f"--compare, --update-sharing, --sync-disabled-status, "
+                f"--sync-hostgroups or --rollback-file is used.",
                 file=sys.stderr
             )
             sys.exit(1)
@@ -5003,6 +5204,8 @@ Config files (same directory as this script):
         print(f"  update-sharing groups: {', '.join(args.share_groups)}")
     if args.sync_disabled_status:
         print(f"  sync-disabled-status=on{'  mode=dry-run' if args.dry_run else ''}")
+    if args.sync_hostgroups:
+        print(f"  sync-hostgroups=on{'  mode=dry-run' if args.dry_run else ''}")
     if args.rollback_file:
         print(f"  rollback-file='{args.rollback_file}'")
     print("=" * 70)
@@ -5094,6 +5297,16 @@ Config files (same directory as this script):
                     dry_run=args.dry_run,
                 )
                 syncer.run()
+
+            if args.sync_hostgroups:
+                print(f"\n  -- SYNC HOSTGROUPS --")
+                hg_syncer = ZabbixHostGroupSync(
+                    src_api=migrator.source, dst_api=migrator.dest,
+                    cia_name=cia_name,
+                    host_filter=args.host, hostgroup_filter=args.hostgroup,
+                    dry_run=args.dry_run,
+                )
+                hg_syncer.run()
 
             if args.rollback_file:
                 print(f"\n  -- ROLLBACK from '{args.rollback_file}' --")
