@@ -2197,4 +2197,3611 @@ class ZabbixMigrator:
                         "_name":      uname,   # stripped before API call
                     })
                 else:
-                    sof
+                    soft_warnings.append(
+                        f"Shared user not in destination (dropped): '{uname}' ")
+
+        # Shared user groups — drop if not in destination (soft warning only)
+        if dashboard.get("userGroups"):
+            converted["userGroups"] = []
+            for group in dashboard["userGroups"]:
+                data = self.dest.usergroup.get(
+                    filter={"name": group["name"]}, output=["usrgrpid"])
+                if data:
+                    converted["userGroups"].append({
+                        "usrgrpid":   data[0]["usrgrpid"],
+                        "permission": group["permission"],
+                        "_name":      group["name"],   # kept for logging, stripped before API call
+                    })
+                else:
+                    soft_warnings.append(
+                        f"Shared group not in destination (dropped): '{group['name']}'")
+
+        # Pages and widgets — missing data objects are hard failures
+        if dashboard.get("pages"):
+            converted["pages"] = []
+            for page in dashboard["pages"]:
+                cp = page.copy()
+                if page.get("widgets"):
+                    cp["widgets"] = []
+                    for widget in page["widgets"]:
+                        w, w_miss = self._widget_names_to_ids(widget)
+                        cp["widgets"].append(w)
+                        hard_missing.extend(w_miss)
+                converted["pages"].append(cp)
+
+        return converted, hard_missing, soft_warnings
+
+    def _widget_names_to_ids(self, widget: Dict) -> Tuple[Dict, List[str]]:
+        """Resolve portable names to destination IDs. Drop _INACCESSIBLE fields."""
+        converted = widget.copy()
+        missing: List[str] = []
+        wname = widget.get("name", "?")
+        wtype = widget.get("type", "?")
+
+        if not widget.get("fields"):
+            return converted, missing
+
+        converted["fields"] = []
+        for field in widget["fields"]:
+            cf    = field.copy()
+            ftype = str(field.get("type", ""))
+            fname = field.get("name", "")
+
+            # Pass-through fields (no value_name means integer/string/etc.)
+            if "value_name" not in field:
+                converted["fields"].append(cf)
+                continue
+
+            # Silently drop fields that were inaccessible in source
+            if field["value_name"] == _INACCESSIBLE:
+                logger.debug("[%s '%s'] field '%s' inaccessible in source, dropped",
+                             wtype, wname, fname)
+                continue
+
+            vname = field["value_name"]
+            ctx   = f"widget '{wname}' (type:{wtype}) field '{fname}'"
+
+            # resolved=True means we successfully set cf["value"] to a dest ID.
+            # If False, the field is dropped — sending a stale 6.4 ID to 7.0
+            # would silently map to the wrong object (e.g. wrong host in graph).
+            resolved = False
+            try:
+                if ftype == FIELD_TYPE_HOST_GROUP:
+                    data = self.dest.hostgroup.get(
+                        filter={"name": vname}, output=["groupid"])
+                    if data:
+                        cf["value"] = data[0]["groupid"]
+                        resolved = True
+                    else:
+                        annotation = self._annotate_missing_group(vname)
+                        missing.append(f"Host group '{vname}' [{ctx}]{annotation}")
+
+                elif ftype == FIELD_TYPE_HOST:
+                    # svggraph/graph fields ds.N.hosts.M, or.N.hosts.M and
+                    # problemhosts.N were stored as type 3 (HOST ID) in 6.4
+                    # but 7.0 expects type 1 (STRING — hostname or pattern).
+                    # Convert the field type and pass the hostname string directly;
+                    # no dest ID lookup needed.
+                    if _HOST_AS_STRING_RE.match(fname):
+                        cf["type"]  = FIELD_TYPE_STRING   # "1"
+                        cf["value"] = vname               # hostname string
+                        resolved = True
+                    else:
+                        data = self.dest.host.get(
+                            filter={"host": vname}, output=["hostid"])
+                        if data:
+                            cf["value"] = data[0]["hostid"]
+                            resolved = True
+                        else:
+                            annotation = self._annotate_missing_host(vname)
+                            missing.append(f"Host '{vname}' [{ctx}]{annotation}")
+
+                elif ftype == FIELD_TYPE_ITEM:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            items = self.dest.item.get(
+                                filter={"key_": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["itemid"])
+                            if items:
+                                cf["value"] = items[0]["itemid"]
+                                resolved = True
+                            else:
+                                missing.append(
+                                    f"Item '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for item '{vname}') [{ctx}]")
+                    else:
+                        missing.append(f"Item '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_ITEM_PROTOTYPE:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            protos = self.dest.itemprototype.get(
+                                filter={"key_": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["itemid"])
+                            if protos:
+                                cf["value"] = protos[0]["itemid"]
+                                resolved = True
+                            else:
+                                missing.append(
+                                    f"Item prototype '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for item_proto '{vname}') [{ctx}]")
+                    else:
+                        missing.append(f"Item prototype '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_GRAPH:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            graphs = self.dest.graph.get(
+                                filter={"name": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["graphid"])
+                            if graphs:
+                                cf["value"] = graphs[0]["graphid"]
+                                resolved = True
+                            else:
+                                missing.append(
+                                    f"Graph '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for graph '{vname}') [{ctx}]")
+                    else:
+                        graphs = self.dest.graph.get(
+                            filter={"name": vname}, output=["graphid"])
+                        if graphs:
+                            cf["value"] = graphs[0]["graphid"]
+                            resolved = True
+                        else:
+                            missing.append(f"Graph '{vname}' [{ctx}]")
+
+                elif ftype == FIELD_TYPE_GRAPH_PROTO:
+                    host_name = field.get("host_name")
+                    if host_name:
+                        hosts = self.dest.host.get(
+                            filter={"host": host_name}, output=["hostid"])
+                        if hosts:
+                            protos = self.dest.graphprototype.get(
+                                filter={"name": vname},
+                                hostids=[hosts[0]["hostid"]],
+                                output=["graphid"])
+                            if protos:
+                                cf["value"] = protos[0]["graphid"]
+                                resolved = True
+                            else:
+                                missing.append(
+                                    f"Graph prototype '{vname}' on host '{host_name}' [{ctx}]")
+                        else:
+                            missing.append(
+                                f"Host '{host_name}' (for graph_proto '{vname}') [{ctx}]")
+                    else:
+                        missing.append(f"Graph prototype '{vname}' (no host context) [{ctx}]")
+
+                elif ftype == FIELD_TYPE_MAP:
+                    data = self.dest.map.get(
+                        filter={"name": vname}, output=["sysmapid"])
+                    if data:
+                        cf["value"] = data[0]["sysmapid"]
+                        resolved = True
+                    else:
+                        missing.append(f"Map '{vname}' [{ctx}]")
+
+            except Exception as exc:
+                missing.append(f"{ctx} -- error: {exc}")
+
+            cf.pop("value_name", None)
+            cf.pop("host_name",  None)
+            cf.pop("item_name",  None)
+
+            # Only append the field if resolution succeeded.
+            # Dropping is safer than sending a stale 6.4 ID which would silently
+            # map to the wrong object in the destination (wrong host in graph, etc.)
+            if resolved:
+                converted["fields"].append(cf)
+            else:
+                # Print visibly — this is always useful for diagnosis.
+                # missing[] already has the reason (host/item/graph not found).
+                print(f"      ~ Dropped field '{fname}' "
+                      f"(type:{ftype}, value_name:'{field.get('value_name','')}') "
+                      f"from widget '{wname}' — not resolved in destination")
+
+        return converted, missing
+
+    # -----------------------------------------------------------------------
+
+    # Dashboard: create
+    # -----------------------------------------------------------------------
+
+    def _create_dashboard(self, dashboard: Dict,
+                          owner_userid: str,
+                          extra_groups: List[Dict]):
+        """Build cleaned payload and create dashboard in destination."""
+        name = dashboard["name"]
+
+        clean = {
+            "name":           name,
+            "userid":         owner_userid,
+            "display_period": int(dashboard.get("display_period", 30)),
+            "auto_start":     int(dashboard.get("auto_start", 1)),
+        }
+
+        # Individual user shares — include resolved users, log them
+        user_shares = list(dashboard.get("users") or [])
+        if user_shares:
+            clean["users"] = [
+                {k: v for k, v in u.items() if k != "_name"}
+                for u in user_shares
+            ]
+
+        # Merge existing shared groups + groups added for fallback owner
+        existing_groups = list(dashboard.get("userGroups") or [])
+        all_groups = list(existing_groups)
+        added_groups = []
+        for eg in extra_groups:
+            # Avoid duplicates
+            if not any(g.get("usrgrpid") == eg["usrgrpid"] for g in all_groups):
+                all_groups.append(eg)
+                added_groups.append(eg)
+        # (userGroups set below after logging)
+
+        # Log the full sharing picture so the output is unambiguous
+        if existing_groups or added_groups or user_shares:
+            total = len(all_groups) + len(user_shares)
+            print(f"    - Sharing: {total} share(s) total "
+                  f"({len(all_groups)} group(s), {len(user_shares)} user(s))")
+            for g in existing_groups:
+                gname = g.get("_name") or g.get("usrgrpid", "?")
+                print(f"        (source group)       {gname}")
+            for g in added_groups:
+                gname = g.get("_name") or g.get("usrgrpid", "?")
+                print(f"        (owner sun_group)    {gname}")
+            for u in user_shares:
+                uname = u.get("_name") or u.get("userid", "?")
+                print(f"        (user)               {uname}")
+
+        # Strip internal _name field before sending to Zabbix API
+        if all_groups:
+            clean["userGroups"] = [
+                {k: v for k, v in g.items() if k != "_name"}
+                for g in all_groups
+            ]
+
+        clean["pages"] = []
+        for page in dashboard.get("pages", []):
+            clean_page = {
+                "name":           page.get("name", ""),
+                "display_period": int(page.get("display_period", 0)),
+                "widgets":        []
+            }
+            for widget in page.get("widgets", []):
+                # --- Grid scaling (horizontal only, per official docs) ---
+                # 6.4: x 0-23, width 1-24   7.0: x 0-71, width 1-72  (x3.0)
+                # Vertical unchanged: y 0-62, height 2-32
+                src_x = int(widget.get("x", 0))
+                src_w = int(widget.get("width", 1))
+
+                x     = round(src_x * GRID_SCALE)
+                width = round((src_x + src_w) * GRID_SCALE) - x
+
+                y      = int(widget.get("y", 0))
+                height = int(widget.get("height", 2))
+
+                if x + width > 72:
+                    width = 72 - x
+                width  = max(1, min(width, 72))
+                height = max(2, min(height, 32))
+
+                cw = {
+                    "type":      widget["type"],
+                    "name":      widget.get("name", ""),
+                    "x":         x,
+                    "y":         y,
+                    "width":     width,
+                    "height":    height,
+                    "view_mode": int(widget.get("view_mode", 0)),
+                }
+                if widget.get("fields"):
+                    transformed = []
+                    for f in widget["fields"]:
+                        fname = f.get("name", "")
+
+                        # Transform tag field names: 6.4 tags.tag.N → 7.0 tags.N.tag
+                        m = _TAG_FIELD_RE.match(fname)
+                        if m:
+                            key, idx = m.group(1), m.group(2)
+                            f = dict(f)
+                            f["name"] = f"tags.{idx}.{key}"
+                            transformed.append(f)
+
+                        # Transform itemvalue threshold field names:
+                        # 6.4: thresholds.color.N / thresholds.threshold.N
+                        # 7.0: thresholds.N.color / thresholds.N.threshold
+                        m = _THRESHOLD_FIELD_RE.match(fname)
+                        if m:
+                            key, idx = m.group(1), m.group(2)
+                            f = dict(f)
+                            f["name"] = f"thresholds.{idx}.{key}"
+                            transformed.append(f)
+                            continue
+                            continue
+
+                        # Transform itemvalue threshold field names:
+                        # 6.4: thresholds.color.N / thresholds.threshold.N
+                        # 7.0: thresholds.N.color / thresholds.N.threshold
+                        m = _THRESHOLD_FIELD_RE.match(fname)
+                        if m:
+                            key, idx = m.group(1), m.group(2)
+                            f = dict(f)
+                            f["name"] = f"thresholds.{idx}.{key}"
+                            transformed.append(f)
+                            continue
+
+                        # Transform svggraph/graph dataset + override field names:
+                        # 6.4: ds.FIELD.N[.M]  → 7.0: ds.N.FIELD[.M]
+                        # 6.4: or.FIELD.N[.M]  → 7.0: or.N.FIELD[.M]
+                        m = _DS_OR_FIELD_RE.match(fname)
+                        if m:
+                            prefix  = m.group(1)   # "ds" or "or"
+                            field   = m.group(2)   # e.g. "hosts", "items", "color"
+                            ds_idx  = m.group(3)   # dataset index
+                            item_idx = m.group(4)  # optional item index
+                            f = dict(f)
+                            if item_idx is not None:
+                                f["name"] = f"{prefix}.{ds_idx}.{field}.{item_idx}"
+                            else:
+                                f["name"] = f"{prefix}.{ds_idx}.{field}"
+                            transformed.append(f)
+                            continue
+
+                        transformed.append(f)
+                    cw["fields"] = transformed
+
+                # Drop the entire widget if a required object reference field
+                # (graph, item, map, item_proto, graph_proto) is missing.
+                # An empty required field causes "Invalid parameter: cannot be empty"
+                # in the Zabbix UI — better to omit the widget entirely.
+                _REQUIRED_FIELD_NAMES = {
+                    "graph":  {"graphid"},
+                    "graph2": {"graphid"},
+                    "svggraph": set(),          # svggraph has no single required id
+                    "graphprototype": {"graphid"},
+                    "item":   {"itemid"},
+                    "web":    {"httptestid"},
+                    "map":    {"sysmapid"},
+                }
+                wtype = widget.get("type", "")
+                required_names = _REQUIRED_FIELD_NAMES.get(wtype, set())
+                if required_names:
+                    present_names = {
+                        f.get("name") for f in cw.get("fields", [])
+                        if f.get("value") not in (None, "", "0")
+                    }
+                    missing_required = required_names - present_names
+                    if missing_required:
+                        print(f"      ~ Widget '{cw['name']}' (type:{wtype}) "
+                              f"dropped — required field(s) empty: "
+                              f"{', '.join(sorted(missing_required))}")
+                        continue   # skip appending this widget
+
+                clean_page["widgets"].append(cw)
+
+            clean["pages"].append(clean_page)
+
+        # Debug: dump full widget fields sent to API
+        if self.debug_widget_fields:
+            import json as _json
+            safe = name.replace("/", "_").replace(" ", "_")[:60]
+            final_widgets = [{"name": w.get("name"), "type": w.get("type"),
+                              "fields": w.get("fields", [])}
+                             for pg in clean.get("pages", [])
+                             for w in pg.get("widgets", [])]
+            with open(f"dbg_{safe}_4_final_api.json", "w") as _f:
+                _json.dump(final_widgets, _f, indent=2, default=str)
+            print(f"    [debug] Dumped stage-4 (final API payload) to dbg_{safe}_4_final_api.json")
+
+        # Debug: print exact dimensions being sent to API
+        if self.debug_dashboard:
+            print("    [debug-dashboard] SENDING to API:")
+            for pg in clean.get("pages", []):
+                for ww in pg.get("widgets", []):
+                    print(f"      widget='{ww['name'][:30]}' "
+                          f"x={ww['x']} y={ww['y']} "
+                          f"width={ww['width']} height={ww['height']}")
+
+        # Retry loop: if the API rejects a specific object ID as "not available"
+        # (e.g. a graph that was found by name but is inaccessible), strip that
+        # ID from all widget fields and retry up to MAX_RETRIES times.
+        MAX_RETRIES = 10
+        inaccessible_ids: set = set()
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                self.dest.dashboard.create(**clean)
+                print(f"    + Created: {name}")
+                return
+            except Exception as exc:
+                err = str(exc)
+                # Parse: 'Graph with ID "68430" is not available.'
+                #         'Item with ID "123" is not available.' etc.
+                import re as _re
+                m = _re.search(r'with ID[^"]*"([0-9]+)"[^"]*not available', err)
+                if m and attempt < MAX_RETRIES:
+                    bad_id = m.group(1)
+                    if bad_id in inaccessible_ids:
+                        # Same ID again — no progress, give up
+                        break
+                    inaccessible_ids.add(bad_id)
+                    print(f"    ! Object ID {bad_id} not available in destination "
+                          f"— stripping from payload and retrying...")
+                    # Strip all widget fields whose value matches the bad ID,
+                    # then drop any widget whose required field is now empty.
+                    _REQ = {
+                        "graph": "graphid", "graph2": "graphid",
+                        "graphprototype": "graphid",
+                        "item": "itemid", "web": "httptestid", "map": "sysmapid",
+                    }
+                    for pg in clean.get("pages", []):
+                        kept_widgets = []
+                        for ww in pg.get("widgets", []):
+                            if "fields" in ww:
+                                before = len(ww["fields"])
+                                ww["fields"] = [
+                                    f for f in ww["fields"]
+                                    if str(f.get("value", "")) != bad_id
+                                ]
+                                dropped = before - len(ww["fields"])
+                                if dropped:
+                                    logger.debug(
+                                        "Stripped %d field(s) with value %s "
+                                        "from widget '%s'",
+                                        dropped, bad_id, ww.get("name", "?"))
+                            # Drop widget if its required field is now missing/empty
+                            req_field = _REQ.get(ww.get("type", ""))
+                            if req_field:
+                                has_value = any(
+                                    f.get("name") == req_field
+                                    and str(f.get("value", "")) not in ("", "0")
+                                    for f in ww.get("fields", [])
+                                )
+                                if not has_value:
+                                    print(f"      ~ Widget '{ww['name']}' "
+                                          f"(type:{ww['type']}) dropped after "
+                                          f"strip — {req_field} now empty")
+                                    continue
+                            kept_widgets.append(ww)
+                        pg["widgets"] = kept_widgets
+                else:
+                    raise  # non-retriable error or out of retries
+
+    # -----------------------------------------------------------------------
+    # Dashboard: helpers
+    # -----------------------------------------------------------------------
+
+    def _dump_dashboard_debug(self, src_dashboard: Dict, name: str):
+        """
+        Fetch full dashboard details from source and destination and write
+        them side-by-side to dashboard_debug_<sanitised_name>.json next to
+        the script.  The file contains:
+          - src_raw      : raw dashboard.get output from source (6.4)
+          - dst_raw      : raw dashboard.get output from destination (7.0)
+          - src_widgets  : list of {name, type, pos} for easy comparison
+          - dst_widgets  : same for destination
+        """
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+        out_path = os.path.join(BASE_DIR, f"dashboard_debug_{safe_name}.json")
+
+        try:
+            # Full source record (use the one we already have from dashboard.get)
+            src_full = self.source.dashboard.get(
+                filter={"name": name},
+                output="extend",
+                selectPages="extend",
+                selectUsers="extend",
+                selectUserGroups="extend",
+            )
+        except Exception as exc:
+            src_full = [{"error": str(exc)}]
+
+        try:
+            dst_full = self.dest.dashboard.get(
+                filter={"name": name},
+                output="extend",
+                selectPages="extend",
+                selectUsers="extend",
+                selectUserGroups="extend",
+            )
+        except Exception as exc:
+            dst_full = [{"error": str(exc)}]
+
+        def _widget_summary(pages):
+            out = []
+            for page in (pages or []):
+                for w in (page.get("widgets") or []):
+                    out.append({
+                        "page":   page.get("name", ""),
+                        "name":   w.get("name", ""),
+                        "type":   w.get("type", ""),
+                        "x":      w.get("x"),
+                        "y":      w.get("y"),
+                        "width":  w.get("width"),
+                        "height": w.get("height"),
+                    })
+            return out
+
+        src_pages = src_full[0].get("pages", []) if src_full else []
+        dst_pages = dst_full[0].get("pages", []) if dst_full else []
+
+        debug_data = {
+            "dashboard_name": name,
+            "src_version":    "6.4",
+            "dst_version":    "7.0",
+            "grid": {
+                "src_max_columns": 24,
+                "dst_max_columns": 72,
+                "scale_factor":    GRID_SCALE,
+            },
+            "src_widgets": _widget_summary(src_pages),
+            "dst_widgets": _widget_summary(dst_pages),
+            "src_raw":     src_full[0] if src_full else {},
+            "dst_raw":     dst_full[0] if dst_full else {},
+        }
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(debug_data, f, indent=2, ensure_ascii=False)
+
+        print(f"    [debug-dashboard] Written: {out_path}")
+
+    def _dashboard_exists(self, name: str) -> bool:
+        return bool(self.dest.dashboard.get(
+            filter={"name": name}, output=["dashboardid"]))
+
+    def _delete_dashboard(self, name: str):
+        existing = self.dest.dashboard.get(
+            filter={"name": name}, output=["dashboardid"])
+        if existing:
+            self.dest.dashboard.delete(existing[0]["dashboardid"])
+            logger.debug("Deleted existing dashboard '%s'", name)
+
+    def _annotate_missing_group(self, group_name: str) -> str:
+        """Add diagnostic annotation for a host group missing in destination."""
+        try:
+            src_grp = self.source.hostgroup.get(
+                filter={"name": group_name}, output=["groupid"])
+            if not src_grp:
+                return " [group also absent from source — possibly deleted]"
+            gid = src_grp[0]["groupid"]
+            count = int(self.source.host.get(groupids=gid, countOutput=True))
+            if count == 0:
+                return (
+                    " [NOTE: group is EMPTY in source (no hosts)"
+                    " -- verify if it should exist in destination]"
+                )
+            else:
+                return (
+                    f" [!! UNEXPECTED: group has {count} host(s) in source"
+                    " but is MISSING in destination -- please investigate !!]"
+                )
+        except Exception:
+            return " [could not determine source status]"
+
+    def _annotate_missing_host(self, host_name: str) -> str:
+        """Add diagnostic annotation for a host missing in destination."""
+        try:
+            data = self.source.host.get(
+                filter={"host": host_name}, output=["status"])
+            if not data:
+                return " [host also absent from source — possibly deleted]"
+            if str(data[0]["status"]) == "1":
+                return (
+                    " [NOTE: host is DISABLED in source"
+                    " -- verify if it should be migrated to destination]"
+                )
+            else:
+                return (
+                    " [!! UNEXPECTED: host is ACTIVE in source"
+                    " but is MISSING in destination -- please investigate !!]"
+                )
+        except Exception:
+            return " [could not determine source status]"
+
+    # =======================================================================
+    # Generic helpers
+    # =======================================================================
+
+    def _raw_export(self, object_type: str, ids: List[str],
+                    fmt: str = "yaml") -> str:
+        """
+        Call ``configuration.export`` on the SOURCE (Zabbix 6.4) instance.
+
+        Zabbix 6.4 API — configuration.export
+        ──────────────────────────────────────
+        params.format   : "yaml" | "json"  (we also accept "xml" but never use it)
+        params.options  : dict with ONE of:
+            templates     → list of templateids  (str)
+            hosts         → list of hostids      (str)
+            maps          → list of sysmapids    (str)
+            (also valid in 6.4: groups, templateGroups, images, mediaTypes)
+        result          : plain string (yaml/json/xml payload)
+
+        Format choice rationale
+        ───────────────────────
+        yaml   — used for templates and hosts.  Compact, human-readable.
+                 PyYAML 1.1 parses bare integers correctly for these objects
+                 (no hex-color fields exist in template/host exports).
+        json   — used for maps.  PyYAML 1.1 corrupts unquoted 6-digit hex
+                 strings: "000000" → int(0), "000066" → int(54).  Zabbix 7.0
+                 rejects non-string color values.  JSON preserves them as
+                 strings with no ambiguity.
+
+        Arguments
+        ─────────
+        object_type : "templates" | "hosts" | "maps"
+        ids         : list of ID strings (templateid / hostid / sysmapid)
+        fmt         : "yaml" (default) or "json"
+        """
+        import requests as _requests
+
+        token   = self._src_token
+        api_url = self._source_url.rstrip("/") + "/api_jsonrpc.php"
+
+        payload = json.dumps(self._sanitize({
+            "jsonrpc": "2.0",
+            "method":  "configuration.export",
+            "id":      1,
+            "auth":    token,
+            "params":  {
+                "format":  fmt,
+                "options": {object_type: ids}
+            }
+        }))
+
+        resp = _requests.post(
+            api_url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+            verify=False   # internal CA — skip SSL verify
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(data["error"].get("data") or data["error"].get("message", str(data["error"])))
+        result = data.get("result", "")
+        # result is a plain string for both json and yaml formats
+        if isinstance(result, str):
+            return result
+        return json.dumps(result)
+
+    @staticmethod
+    def _sanitize(obj):
+        """
+        Recursively convert any object to plain JSON-safe Python types.
+        Handles pyzabbix APIObject regardless of whether it subclasses dict.
+        """
+        # Primitives — already safe
+        if obj is None or isinstance(obj, (bool, int, float, str)):
+            return obj
+        # Plain dict — recurse into values
+        if type(obj) is dict:
+            return {str(k): ZabbixMigrator._sanitize(v) for k, v in obj.items()}
+        # Plain list/tuple
+        if type(obj) in (list, tuple):
+            return [ZabbixMigrator._sanitize(i) for i in obj]
+        # Dict-like (APIObject, AttrDict, any dict subclass)
+        try:
+            return {str(k): ZabbixMigrator._sanitize(v) for k, v in obj.items()}
+        except (AttributeError, TypeError):
+            pass
+        # Any iterable
+        try:
+            return [ZabbixMigrator._sanitize(i) for i in obj]
+        except TypeError:
+            pass
+        # Last resort — stringify
+        return str(obj)
+
+    def _raw_import(self, fmt: str, source, rules: Dict):
+        """
+        Call ``configuration.import`` on the DESTINATION (Zabbix 7.0) instance.
+
+        Zabbix 7.0 API — configuration.import
+        ──────────────────────────────────────
+        params.format   : "yaml" | "json"  (must match the export format)
+        params.source   : the export string from configuration.export
+        params.rules    : dict controlling create/update/delete per entity type.
+
+        Rules key naming in 7.0  (differs from 6.4!)
+        ─────────────────────────────────────────────
+          snake_case  →  host_groups, template_groups
+          camelCase   →  templates, hosts, items, triggers, graphs,
+                         discoveryRules, templateDashboards, templateLinkage,
+                         httptests, valueMaps, maps, images, icon_maps, …
+
+        Version upgrade
+        ───────────────
+        Zabbix 7.0 automatically upgrades exports from 6.4: the YAML/JSON
+        payload carries a ``version: '6.4'`` header which triggers 7.0's
+        internal schema-upgrade path.  No manual transformation is required
+        except the JSON map-structure patches applied before this call.
+
+        result : true on success; raises on API error
+        """
+        import requests as _requests
+
+        token   = self._dest_token
+        api_url = self._dest_url.rstrip("/") + "/api_jsonrpc.php"
+
+        source_str = source if isinstance(source, str) \
+                     else json.dumps(self._sanitize(source))
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "configuration.import",
+            "id":      1,
+            "auth":    token,
+            "params":  {
+                "format": fmt,
+                "source": source_str,
+                "rules":  rules,
+            }
+        }
+
+        # --debug-json: walk the entire payload and report any non-serializable type
+        if self.debug_json:
+            def _find_bad(obj, path="root"):
+                try:
+                    json.dumps(obj)
+                    return          # this branch is fine
+                except TypeError:
+                    pass
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        _find_bad(v, f"{path}.{k}")
+                elif isinstance(obj, (list, tuple)):
+                    for i, v in enumerate(obj):
+                        _find_bad(v, f"{path}[{i}]")
+                else:
+                    print(f"  [DEBUG-JSON] Non-serializable at {path}: "
+                          f"type={type(obj).__name__!r}  value={repr(obj)[:120]}")
+
+            print("  [DEBUG-JSON] Inspecting payload for non-serializable types...")
+            _find_bad(payload)
+
+            dump_path = os.path.join(BASE_DIR, "debug_payload.json")
+            try:
+                sanitized = self._sanitize(payload)
+                with open(dump_path, "w", encoding="utf-8") as _f:
+                    json.dump(sanitized, _f, indent=2)
+                print(f"  [DEBUG-JSON] Sanitized payload written to: {dump_path}")
+            except Exception as _e:
+                print(f"  [DEBUG-JSON] Could not write payload: {_e}")
+
+        raw_body = json.dumps(self._sanitize(payload))
+        resp = _requests.post(
+            api_url,
+            data=raw_body,
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+            verify=False   # internal CA — skip SSL verify
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise Exception(
+                data["error"].get("data") or
+                data["error"].get("message", str(data["error"]))
+            )
+        return data.get("result", True)
+
+    # =======================================================================
+    # 5. USER GROUPS
+    # =======================================================================
+
+    def update_dashboard_sharing(
+            self,
+            dashboard_filter: Optional[str],
+            group_names: List[str]):
+        """
+        Find dashboards in DESTINATION matching dashboard_filter (case-insensitive
+        substring) and add those groups with Read-Write permission.
+        Existing shares are preserved — new groups are merged in.
+        """
+        import re as _re2
+
+        def _norm(s: str) -> str:
+            return _re2.sub(r'[ \t]+', ' ', (s or '').strip()).lower()
+
+        print(f"  [ShareDashboards] Resolving {len(group_names)} group(s)...")
+
+        # Resolve group names to dest usrgrpids
+        target_groups: List[Dict] = []
+        for gname in group_names:
+            try:
+                data = self.dest.usergroup.get(
+                    filter={"name": gname}, output=["usrgrpid", "name"])
+                if data:
+                    target_groups.append({
+                        "usrgrpid":   data[0]["usrgrpid"],
+                        "permission": str(PERM_READ_WRITE),
+                        "_name":      data[0]["name"],
+                    })
+                    print(f"    + Group '{gname}' → usrgrpid {data[0]['usrgrpid']}")
+                else:
+                    print(f"    ! Group '{gname}' NOT found in destination — skipped")
+            except Exception as exc:
+                print(f"    ! Error resolving group '{gname}': {exc}")
+
+        if not target_groups:
+            print("  [ShareDashboards] No valid groups resolved — nothing to do.")
+            return
+
+        # Fetch matching dashboards from destination
+        try:
+            all_dash = self.dest.dashboard.get(
+                output=["dashboardid", "name"],
+                selectUserGroups="extend",
+                selectUsers="extend",
+            )
+        except Exception as exc:
+            print(f"  [ShareDashboards] ERROR fetching dest dashboards: {exc}")
+            return
+
+        if dashboard_filter:
+            needle = _norm(dashboard_filter)
+            matched = [d for d in all_dash
+                       if needle in _norm(d.get("name", ""))]
+        else:
+            matched = list(all_dash)
+
+        print(f"  [ShareDashboards] {len(matched)} dashboard(s) match "
+              f"'{dashboard_filter or '*'}'")
+
+        ok = skipped = failed = 0
+        for dash in matched:
+            dash_name = dash.get("name", "?")
+            dash_id   = dash["dashboardid"]
+            existing  = dash.get("userGroups") or []
+
+            existing_ids = {g["usrgrpid"] for g in existing}
+            new_groups   = list(existing)
+            added_names  = []
+            for tg in target_groups:
+                if tg["usrgrpid"] not in existing_ids:
+                    new_groups.append({
+                        "usrgrpid":   tg["usrgrpid"],
+                        "permission": tg["permission"],
+                    })
+                    existing_ids.add(tg["usrgrpid"])
+                    added_names.append(tg["_name"])
+
+            if not added_names:
+                skipped += 1
+                continue
+
+            try:
+                self.dest.dashboard.update(
+                    dashboardid=dash_id,
+                    userGroups=new_groups,
+                )
+                print(f"    + '{dash_name}' → added: {', '.join(added_names)}")
+                ok += 1
+            except Exception as exc:
+                print(f"    x '{dash_name}' — update failed: {exc}")
+                failed += 1
+
+        print(f"  [ShareDashboards] Done: {ok} updated, "
+              f"{skipped} already had groups, {failed} failed.")
+
+    def migrate_regexps(self):
+        """
+        Migrate global regular expressions from source to destination.
+        Uses regexp.get / regexp.create / regexp.update via the Zabbix API.
+
+        Each global regexp has a name, description, and a list of test expressions
+        (expressions[]), each with: expression, expression_type, case_sensitive, result.
+        """
+        print("  [Regexps] Fetching global regular expressions from source...")
+        try:
+            src_regexps = self.source.regexp.get(
+                output="extend",
+                selectExpressions="extend"
+            )
+        except Exception as exc:
+            print(f"  [Regexps] ERROR: could not fetch source regexps: {exc}")
+            self.results["regexps"]["failed"] += 1
+            return
+
+        if not src_regexps:
+            print("  [Regexps] No global regular expressions found in source.")
+            return
+
+        print(f"  [Regexps] Found {len(src_regexps)} regular expression(s).")
+
+        try:
+            dst_by_name = {
+                r["name"]: r
+                for r in self.dest.regexp.get(output="extend",
+                                               selectExpressions="extend")
+            }
+        except Exception as exc:
+            print(f"  [Regexps] WARNING: could not fetch dest regexps: {exc}")
+            dst_by_name = {}
+
+        self.counts["regexps"]["src_total"] = len(src_regexps)
+        ok_count   = 0
+        skip_count = 0
+        fail_count = 0
+
+        for rx in src_regexps:
+            name = rx.get("name", "")
+
+            payload = {
+                "name":        name,
+                "test_string": rx.get("test_string", ""),
+                "expressions": [
+                    {
+                        "expression":      e["expression"],
+                        "expression_type": e["expression_type"],
+                        "case_sensitive":  e["case_sensitive"],
+                        # "result" field removed in Zabbix 7.0 API
+                    }
+                    for e in (rx.get("expressions") or [])
+                ]
+            }
+
+            try:
+                if name in dst_by_name:
+                    if self.skip_existing:
+                        skip_count += 1
+                        logger.debug("Regexp '%s' already exists — skipped.", name)
+                        continue
+                    payload["regexpid"] = dst_by_name[name]["regexpid"]
+                    self.dest.regexp.update(**payload)
+                    print(f"    ~ Updated: {name}")
+                else:
+                    self.dest.regexp.create(**payload)
+                    print(f"    + Created: {name}")
+                ok_count += 1
+            except Exception as exc:
+                fail_count += 1
+                reason = str(exc)
+                print(f"    x Failed  '{name}': {reason}")
+                self.results["regexps"]["errors"].append(
+                    {"name": name, "reason": reason})
+
+        self.results["regexps"]["migrated"] += ok_count
+        self.results["regexps"]["skipped"]  += skip_count
+        self.results["regexps"]["failed"]   += fail_count
+
+        try:
+            self.counts["regexps"]["dst_total"] = len(
+                self.dest.regexp.get(output=["name"]))
+        except Exception:
+            pass
+
+        print(f"  [Regexps] Done: {ok_count} created/updated, "
+              f"{skip_count} skipped, {fail_count} failed.")
+
+    def migrate_usergroups(self):
+        """
+        Migrate user groups from source (6.4) to destination (7.0).
+
+        Algorithm
+        ─────────
+        1. Fetch every usergroup from source with its host-group rights and
+           template-group rights.
+        2. Resolve each right's group ID to a group name using bulk lookups
+           against the source.
+        3. In destination, resolve each group name back to an ID.
+        4. Create the usergroup if it does not exist; update it if it does.
+
+        API differences between 6.4 (source) and 7.0 (destination)
+        ─────────────────────────────────────────────────────────────
+        Source 6.4  selectRights               → rights[]            (host groups)
+                    selectTemplateGroupRights   → templategroup_rights[] (tpl groups)
+
+        Dest   7.0  create/update uses:
+                    hostgroup_rights[]          (snake_case, replaces 6.4 "rights")
+                    templategroup_rights[]      (same name as 6.4 response key)
+
+        Rights permission values are identical in both versions:
+          0 = Deny  1 = (none)  2 = Read  3 = Read-Write
+
+        What is NOT migrated
+        ────────────────────
+        • User membership      — users themselves are not migrated by this script
+        • Tag filters          — reference source host/group IDs which differ in dest
+        """
+        print("  [Usergroups] Fetching usergroups from source...")
+
+        # ── 1. Fetch all source usergroups with rights ─────────────────────────
+        try:
+            src_groups = self.source.usergroup.get(
+                output=["usrgrpid", "name", "gui_access",
+                        "users_status", "debug_mode"],
+                selectRights="extend",                # host-group rights in 6.4
+                selectTemplateGroupRights="extend",   # template-group rights
+            )
+        except Exception as exc:
+            print(f"  [Usergroups] ERROR: could not fetch from source: {exc}")
+            self.results["usergroups"]["failed"] += 1
+            return
+
+        self.counts["usergroups"]["src_total"] = len(src_groups)
+        print(f"  [Usergroups] Found {len(src_groups)} usergroup(s) in source.")
+
+        # ── Optional single-group filter ───────────────────────────────────────
+        if self.usergroup_filter:
+            src_groups = [g for g in src_groups
+                          if g["name"] == self.usergroup_filter]
+            if not src_groups:
+                print(f"  [Usergroups] Usergroup '{self.usergroup_filter}' "
+                      f"not found in source.")
+                return
+            print(f"  [Usergroups] Filtered to: '{self.usergroup_filter}'.")
+
+        if not src_groups:
+            return
+
+        # ── 2. Bulk-resolve group IDs → names in source ────────────────────────
+        try:
+            src_hg_map = {
+                g["groupid"]: g["name"]
+                for g in self.source.hostgroup.get(output=["groupid", "name"])
+            }
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch source host groups: {exc}")
+            src_hg_map = {}
+
+        try:
+            src_tg_map = {
+                g["groupid"]: g["name"]
+                for g in self.source.templategroup.get(output=["groupid", "name"])
+            }
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch source template groups: {exc}")
+            src_tg_map = {}
+
+        # ── 3. Bulk-resolve group names → IDs in destination ──────────────────
+        # Both maps are kept as lists (not dicts) so we can iterate for prefix
+        # matching: a right on group "A" is expanded to "A" and all "A/*" children.
+        try:
+            dst_hg_list = [
+                (g["name"], g["groupid"])
+                for g in self.dest.hostgroup.get(output=["groupid", "name"])
+            ]
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch dest host groups: {exc}")
+            dst_hg_list = []
+
+        try:
+            dst_tg_list = [
+                (g["name"], g["groupid"])
+                for g in self.dest.templategroup.get(output=["groupid", "name"])
+            ]
+        except Exception as exc:
+            print(f"  [Usergroups] WARNING: could not fetch dest template groups: {exc}")
+            dst_tg_list = []
+
+        def _expand_rights(
+                src_rights: List[Dict],
+                src_id_to_name: Dict[str, str],
+                dst_name_id_list: List[tuple],
+                kind: str,
+                grp_name: str,
+        ) -> tuple:
+            """
+            For each right in src_rights, resolve the source group name, then
+            find ALL destination groups that are the group itself OR a subgroup
+            (i.e. name == parent or name.startswith(parent + "/")), and emit
+            one right entry per match using the same permission.
+
+            When two source rights expand onto the same destination group ID,
+            the higher permission value wins (higher = broader access).
+
+            Returns:
+                dst_rights   : list of {"id": ..., "permission": ...} for the API
+                missing      : list of (src_group_name, perm_label) where zero
+                               dest matches were found (neither parent nor child)
+                expanded_log : list of (src_name, dst_name, perm_label) for every
+                               subgroup that was auto-added beyond the direct match
+            """
+            # groupid → highest permission seen so far  (dedup + max-perm)
+            merged: Dict[str, str] = {}
+            missing:      List[tuple] = []
+            expanded_log: List[tuple] = []
+
+            for right in src_rights:
+                src_id = right["id"]
+                perm   = str(right["permission"])
+                src_name = src_id_to_name.get(src_id)
+                if not src_name:
+                    logger.debug("Usergroup '%s': unknown source %s id %s",
+                                 grp_name, kind, src_id)
+                    continue
+
+                prefix  = src_name + "/"
+                matches = [
+                    (dst_name, dst_id)
+                    for dst_name, dst_id in dst_name_id_list
+                    if dst_name == src_name or dst_name.startswith(prefix)
+                ]
+
+                if not matches:
+                    missing.append((src_name, _PERM_LABEL.get(perm, perm)))
+                    continue
+
+                for dst_name, dst_id in matches:
+                    # Keep the higher permission when two source rights collide
+                    if dst_id not in merged or int(perm) > int(merged[dst_id]):
+                        merged[dst_id] = perm
+                    # Track subgroups added beyond the direct match
+                    if dst_name != src_name:
+                        expanded_log.append(
+                            (src_name, dst_name, _PERM_LABEL.get(perm, perm)))
+
+            dst_rights = [{"id": gid, "permission": p} for gid, p in merged.items()]
+            return dst_rights, missing, expanded_log
+
+        # ── 4. Iterate, resolve, create/update ────────────────────────────────
+        # Human-readable permission labels (same values in 6.4 and 7.0)
+        _PERM_LABEL = {"0": "Deny", "1": "None", "2": "Read", "3": "Read-Write"}
+
+        ok_count   = 0
+        skip_count = 0
+        fail_count = 0
+        ok_names: List[str] = []
+
+        # Accumulate incomplete rights across all groups for the end-of-run summary.
+        # Structure: [(grp_name, "host"|"template", group_name, perm_str), …]
+        incomplete_rights: List[tuple] = []
+
+        for grp in src_groups:
+            grp_name = grp["name"]
+
+            # --skip-existing: check once, skip if already present
+            if self.skip_existing:
+                try:
+                    if self.dest.usergroup.get(
+                            filter={"name": grp_name}, output=["usrgrpid"]):
+                        skip_count += 1
+                        logger.debug("Usergroup '%s' already exists, skipping.", grp_name)
+                        continue
+                except Exception as exc:
+                    logger.debug("Could not check existence of '%s': %s", grp_name, exc)
+
+            # ── Resolve host-group rights (with subgroup expansion) ────────────
+            dst_hg_rights, missing_hg, expanded_hg = _expand_rights(
+                src_rights       = grp.get("rights") or [],
+                src_id_to_name   = src_hg_map,
+                dst_name_id_list = dst_hg_list,
+                kind             = "host group",
+                grp_name         = grp_name,
+            )
+
+            # ── Resolve template-group rights (with subgroup expansion) ─────────
+            raw_tg = (grp.get("templategroup_rights")
+                      or grp.get("template_group_rights")
+                      or [])
+            dst_tg_rights, missing_tg, expanded_tg = _expand_rights(
+                src_rights       = raw_tg,
+                src_id_to_name   = src_tg_map,
+                dst_name_id_list = dst_tg_list,
+                kind             = "template group",
+                grp_name         = grp_name,
+            )
+
+            # ── Log auto-expanded subgroups ────────────────────────────────────
+            for src_name, dst_name, plabel in expanded_hg:
+                logger.debug("Usergroup '%s': host group '%s' → also applied to "
+                             "subgroup '%s' [%s]", grp_name, src_name, dst_name, plabel)
+            for src_name, dst_name, plabel in expanded_tg:
+                logger.debug("Usergroup '%s': template group '%s' → also applied to "
+                             "subgroup '%s' [%s]", grp_name, src_name, dst_name, plabel)
+
+            # ── Print per-group missing rights immediately ─────────────────────
+            if missing_hg:
+                print(f"  [Usergroups] '{grp_name}': "
+                      f"{len(missing_hg)} host group(s) not in destination — skipped:")
+                for gname, plabel in missing_hg:
+                    print(f"      - {gname}  [{plabel}]")
+                    incomplete_rights.append((grp_name, "host", gname, plabel))
+
+            if missing_tg:
+                print(f"  [Usergroups] '{grp_name}': "
+                      f"{len(missing_tg)} template group(s) not in destination — skipped:")
+                for gname, plabel in missing_tg:
+                    print(f"      - {gname}  [{plabel}]")
+                    incomplete_rights.append((grp_name, "template", gname, plabel))
+
+            # ── Build 7.0 payload ──────────────────────────────────────────────
+            payload = {
+                "name":                 grp_name,
+                "gui_access":           grp.get("gui_access",   "0"),
+                "users_status":         grp.get("users_status", "0"),
+                "debug_mode":           grp.get("debug_mode",   "0"),
+                "hostgroup_rights":     dst_hg_rights,
+                "templategroup_rights": dst_tg_rights,
+            }
+
+            # ── Create or update ───────────────────────────────────────────────
+            try:
+                existing = self.dest.usergroup.get(
+                    filter={"name": grp_name}, output=["usrgrpid"])
+
+                if existing:
+                    payload["usrgrpid"] = existing[0]["usrgrpid"]
+                    self.dest.usergroup.update(**payload)
+                    action = "updated"
+                else:
+                    self.dest.usergroup.create(**payload)
+                    action = "created"
+
+                ok_count += 1
+                ok_names.append(grp_name)
+                logger.debug("Usergroup '%s' %s (hg_rights=%d, tg_rights=%d).",
+                             grp_name, action,
+                             len(dst_hg_rights), len(dst_tg_rights))
+
+            except Exception as exc:
+                fail_count += 1
+                reason = str(exc)
+                print(f"  [Usergroups] FAIL '{grp_name}': {reason}")
+                self.results["usergroups"]["errors"].append(
+                    {"name": grp_name, "reason": reason})
+                logger.debug("Usergroup '%s' failed: %s", grp_name, reason)
+
+        # ── End-of-run summary of incomplete rights ────────────────────────────
+        if incomplete_rights:
+            # Group by usergroup name for a clean table
+            from collections import defaultdict
+            by_grp: Dict[str, List[tuple]] = defaultdict(list)
+            for ug_name, kind, gname, plabel in incomplete_rights:
+                by_grp[ug_name].append((kind, gname, plabel))
+
+            print(f"\n  [Usergroups] ── Incomplete rights summary "
+                  f"({len(incomplete_rights)} right(s) dropped across "
+                  f"{len(by_grp)} usergroup(s)) ──")
+            for ug_name, entries in by_grp.items():
+                print(f"    Usergroup: {ug_name}")
+                for kind, gname, plabel in entries:
+                    kind_label = "Host group     " if kind == "host" else "Template group "
+                    print(f"      {kind_label} not in dest: {gname}  [{plabel}]")
+            print()
+
+        # ── Persist results ────────────────────────────────────────────────────
+        self.results["usergroups"]["migrated"] += ok_count
+        self.results["usergroups"]["skipped"]  += skip_count
+        self.results["usergroups"]["failed"]   += fail_count
+        self.results["usergroups"]["names"].extend(ok_names)
+
+        try:
+            self.counts["usergroups"]["dst_total"] = int(
+                self.dest.usergroup.get(countOutput=True))
+        except Exception:
+            pass
+
+        print(f"  [Usergroups] Done: {ok_count} created/updated, "
+              f"{skip_count} skipped, {fail_count} failed.")
+
+    # =======================================================================
+    # Utilities
+    # =======================================================================
+
+    def _ensure_groups_in_dest(
+            self, src_groups: List[Dict], name_key: str,
+            getter, creator, label: str):
+        """
+        Ensure every group from src_groups exists in destination.
+        Uses a single bulk fetch of all dest groups instead of one call per group,
+        to avoid session timeouts on large group lists.
+
+        getter(name) is still accepted for API compatibility but is NOT called
+        in a loop — it is only used as a fallback if the bulk path fails.
+        creator(name) -> result
+        """
+        # ── bulk approach: fetch all dest groups in one call then diff ───────
+        try:
+            # Derive the dest API object from the creator's closure isn't
+            # possible generically, so we call getter once with a sentinel to
+            # get the result type, then fall back to the loop if bulk fails.
+            # Instead, use the dest api directly via the label heuristic.
+            if "template group" in label:
+                dest_all = self.dest.templategroup.get(output=["name"])
+            elif "host group" in label:
+                dest_all = self.dest.hostgroup.get(output=["name"])
+            else:
+                raise ValueError("unknown label — use per-group fallback")
+
+            dest_names = {g["name"] for g in dest_all}
+            missing    = [g[name_key] for g in src_groups
+                          if g[name_key] not in dest_names]
+
+            created = 0
+            for name in missing:
+                try:
+                    creator(name)
+                    created += 1
+                    logger.debug("Created %s '%s' in destination.", label, name)
+                except Exception as exc:
+                    logger.debug("Could not create %s '%s': %s", label, name, exc)
+
+            if created:
+                print(f"    Created {created} missing {label}(s) in destination "
+                      f"({len(dest_names)} already existed).")
+            return
+
+        except Exception as bulk_exc:
+            logger.debug("Bulk group check failed (%s), falling back to per-group: %s",
+                         label, bulk_exc)
+
+        # ── per-group fallback (original behaviour) ───────────────────────────
+        created = skipped = 0
+        for grp in src_groups:
+            name = grp[name_key]
+            try:
+                if not getter(name):
+                    creator(name)
+                    logger.debug("Created %s '%s' in destination.", label, name)
+                    created += 1
+                else:
+                    skipped += 1
+            except Exception as exc:
+                logger.debug("Could not ensure %s '%s': %s", label, name, exc)
+        if created:
+            print(f"    Created {created} missing {label}(s) in destination "
+                  f"({skipped} already existed).")
+
+    def _fail(self, migration_type: str, msg: str, exc: Exception):
+        """Record a top-level failure for a migration type."""
+        full = f"{msg}: {exc}"
+        print(f"  [{migration_type.capitalize()}] ERROR: {full}")
+        self.results[migration_type]["failed"] += 1
+        self.results[migration_type]["errors"].append({"reason": full})
+
+    # =======================================================================
+    # Summary
+    # =======================================================================
+
+    # =======================================================================
+    # Update dashboard sharing (destination only)
+    # =======================================================================
+
+    def update_dashboard_sharing(
+            self,
+            dashboard_filter: Optional[str],
+            group_names: List[str]):
+        """
+        Find all dashboards in DESTINATION matching dashboard_filter,
+        then set (or add) the given usergroups as Read-Write sharing entries.
+
+        Existing sharing entries are preserved; the specified groups are merged
+        in (no duplicates). If a group name is not found in destination it is
+        reported and skipped.
+        """
+        import re as _re
+
+        def _norm(s: str) -> str:
+            return _re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+        print(f"  [UpdateSharing] Resolving {len(group_names)} group(s) in destination...")
+
+        # ── Resolve group names → usrgrpid ────────────────────────────────────
+        target_groups: List[Dict] = []
+        for gname in group_names:
+            try:
+                data = self.dest.usergroup.get(
+                    filter={"name": gname}, output=["usrgrpid", "name"])
+                if data:
+                    target_groups.append({
+                        "usrgrpid":   data[0]["usrgrpid"],
+                        "permission": PERM_READ_WRITE,
+                        "_name":      data[0]["name"],
+                    })
+                    print(f"    + Group '{gname}' found (id={data[0]['usrgrpid']})")
+                else:
+                    print(f"    ! Group '{gname}' NOT found in destination — skipped")
+            except Exception as exc:
+                print(f"    ! Error resolving group '{gname}': {exc}")
+
+        if not target_groups:
+            print("  [UpdateSharing] No valid groups found — aborting.")
+            return
+
+        # ── Fetch matching dashboards from destination ────────────────────────
+        try:
+            all_dashboards = self.dest.dashboard.get(
+                output=["dashboardid", "name"],
+                selectUserGroups="extend",
+                selectUsers="extend",
+            )
+        except Exception as exc:
+            print(f"  [UpdateSharing] ERROR: could not fetch dest dashboards: {exc}")
+            return
+
+        if dashboard_filter:
+            needle = _norm(dashboard_filter)
+            matched = [d for d in all_dashboards
+                       if _norm(d.get("name", "")) == needle
+                       or needle in _norm(d.get("name", ""))]
+        else:
+            matched = all_dashboards
+
+        print(f"  [UpdateSharing] {len(matched)} dashboard(s) matched "
+              f"filter '{dashboard_filter or '*'}'")
+
+        ok = 0
+        failed = 0
+        for dash in matched:
+            did   = dash["dashboardid"]
+            dname = dash["name"]
+
+            # Merge existing groups + new target groups (deduplicate by usrgrpid)
+            existing = list(dash.get("userGroups") or [])
+            existing_ids = {g["usrgrpid"] for g in existing}
+            added = []
+            for tg in target_groups:
+                if tg["usrgrpid"] not in existing_ids:
+                    existing.append({
+                        "usrgrpid":   tg["usrgrpid"],
+                        "permission": tg["permission"],
+                    })
+                    existing_ids.add(tg["usrgrpid"])
+                    added.append(tg["_name"])
+
+            try:
+                self.dest.dashboard.update(
+                    dashboardid=did,
+                    userGroups=existing,
+                )
+                status = (f"added {len(added)} group(s): {', '.join(added)}"
+                          if added else "already had all groups — no change")
+                print(f"    ✓ '{dname}' — {status}")
+                ok += 1
+            except Exception as exc:
+                print(f"    ✗ '{dname}' — update failed: {exc}")
+                failed += 1
+
+        print(f"  [UpdateSharing] Done: {ok} updated, {failed} failed.")
+
+    def print_summary(self, types_run: List[str]):
+        """Print per-type statistics to console only. All detail is in the log file."""
+        for t in types_run:
+            r = self.results[t]
+            c = self.counts.get(t, {})
+
+            # Source line
+            if t == "hosts":
+                src_line = (f"  [{'Source':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('src_total', '?'):5}  "
+                            f"Enabled: {c.get('src_enabled', '?'):5}  "
+                            f"Disabled: {c.get('src_disabled', '?'):5}")
+                dst_line = (f"  [{'Dest':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('dst_total', '?'):5}  "
+                            f"Enabled: {c.get('dst_enabled', '?'):5}  "
+                            f"Disabled: {c.get('dst_disabled', '?'):5}")
+            else:
+                src_line = (f"  [{'Source':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('src_total', '?'):5}")
+                dst_line = (f"  [{'Dest':8}] [{t.capitalize():12}] "
+                            f"Total: {c.get('dst_total', '?'):5}")
+
+            print(src_line)
+            print(dst_line)
+            print(f"  [{'Migration':8}] [{t.capitalize():12}] "
+                  f"Migrated: {r['migrated']:4}  "
+                  f"Skipped: {r['skipped']:4}  "
+                  f"Failed: {r['failed']:4}")
+
+            # Dashboard widget warnings
+            if t == "dashboards" and r.get("widget_warnings"):
+                print(f"  [{'Warnings':8}] [{t.capitalize():12}] "
+                      f"{len(r['widget_warnings'])} dashboard(s) created with "
+                      f"missing widget object(s):")
+                for ww in r["widget_warnings"]:
+                    print(f"    • {ww['name']}")
+                    for obj in ww["missing"]:
+                        print(f"        - {obj}")
+            print()
+
+
+# ---------------------------------------------------------------------------
+# Migration health-check comparator
+# ---------------------------------------------------------------------------
+
+# All valid section keys (used for --compare argument validation)
+COMPARE_ALL_SECTIONS = [
+    "hosts", "templates", "items", "item-types", "unsup-types",
+    "triggers", "discovery-rules", "unsup-items", "unsup-rules",
+    "graphs", "host-groups", "maps", "dashboards", "proxies", "user-groups",
+    # deep-validation sections (object-level diff, generate report file)
+    "hosts-missing", "hosts-templates", "hosts-groups",
+    "template-objects", "group-host-count", "agent-triggers",
+]
+
+# Item type IDs that exist in 6.4 but were unified in 7.0
+_ITEM_TYPE_NAMES = {
+    0:  "Zabbix agent",
+    1:  "SNMPv1",           # 6.4 only — maps to type 20 in 7.0
+    2:  "Zabbix trapper",
+    3:  "Simple check",
+    4:  "SNMPv2c",          # 6.4 only — maps to type 20 in 7.0
+    5:  "Zabbix internal",
+    6:  "SNMPv3",           # 6.4 only — maps to type 20 in 7.0
+    7:  "Zabbix agent (active)",
+    9:  "Web item",
+    10: "External check",
+    11: "Database monitor",
+    12: "IPMI agent",
+    13: "SSH agent",
+    14: "Telnet agent",
+    15: "Calculated",
+    16: "JMX agent",
+    17: "SNMP trap",
+    18: "Dependent",
+    19: "HTTP agent",
+    20: "SNMP (unified)",   # 7.0 only — replaces 1+4+6 from 6.4
+    21: "Script",
+}
+
+# Groups of (src_types, dst_types, label) for cross-version comparison.
+# Types 1/4/6 in 6.4 → type 20 in 7.0 (SNMP was split into three, then unified).
+_ITEM_TYPE_GROUPS = [
+    ((0,),    (0,),   "Zabbix agent"),
+    ((1,4,6), (20,),  "SNMP (v1+v2c+v3 → unified)"),
+    ((7,),    (7,),   "Zabbix agent (active)"),
+    ((2,),    (2,),   "Zabbix trapper"),
+    ((17,),   (17,),  "SNMP trap"),
+    ((5,),    (5,),   "Zabbix internal"),
+    ((3,),    (3,),   "Simple check"),
+    ((15,),   (15,),  "Calculated"),
+    ((18,),   (18,),  "Dependent"),
+    ((19,),   (19,),  "HTTP agent"),
+    ((21,),   (21,),  "Script"),
+    ((9,),    (9,),   "Web item"),
+    ((10,),   (10,),  "External check"),
+    ((11,),   (11,),  "Database monitor"),
+    ((12,),   (12,),  "IPMI agent"),
+    ((13,),   (13,),  "SSH agent"),
+    ((14,),   (14,),  "Telnet agent"),
+    ((16,),   (16,),  "JMX agent"),
+]
+
+
+class ZabbixComparator:
+    """
+    Collects monitoring statistics from two Zabbix instances (source 6.4 and
+    destination 7.0) and prints a side-by-side comparison to validate that a
+    migration is complete.
+
+    Usage:
+        comp = ZabbixComparator(src_api, dst_api, cia_name)
+        comp.run()                              # all sections
+        comp.run(["hosts", "items"])            # selected sections only
+    """
+
+    # ── colour helpers for terminal output ──────────────────────────────────
+    _RED    = "\033[91m"
+    _YEL    = "\033[93m"
+    _GRN    = "\033[92m"
+    _RST    = "\033[0m"
+
+    def __init__(self, src_api, dst_api, cia_name: str):
+        self.src  = src_api
+        self.dst  = dst_api
+        self.cia  = cia_name
+        self._warnings: List[str] = []
+
+    # ── public entry point ───────────────────────────────────────────────────
+
+    def run(self, sections: Optional[List[str]] = None):
+        """
+        sections: list of section keys from COMPARE_ALL_SECTIONS, or None = all.
+        Report sections (unsup-items, unsup-rules) print directly; they have no
+        src/dst table.
+        """
+        if sections is None or sections == []:
+            sections = COMPARE_ALL_SECTIONS
+
+        # Normalise: lowercase, strip spaces
+        sections = [s.lower().strip() for s in sections]
+        unknown = [s for s in sections if s not in COMPARE_ALL_SECTIONS]
+        if unknown:
+            print(f"  [WARN] Unknown compare section(s): {', '.join(unknown)}")
+            print(f"  Valid sections: {', '.join(COMPARE_ALL_SECTIONS)}")
+            sections = [s for s in sections if s in COMPARE_ALL_SECTIONS]
+
+        # Master list: (key, display-title, method, kind)
+        # kind = "table"  → method returns List[Tuple]; rendered with _print_table
+        # kind = "report" → method prints output itself (no src/dst symmetry needed)
+        all_sections = [
+            ("hosts",           "HOSTS",                          self._section_hosts,                 "table"),
+            ("templates",       "TEMPLATES",                      self._section_templates,             "table"),
+            ("items",           "ITEMS",                          self._section_items,                 "table"),
+            ("item-types",      "ITEM TYPES — enabled",           self._section_item_types,            "table"),
+            ("unsup-types",     "ITEM TYPES — unsupported",       self._section_unsupported_item_types,"table"),
+            ("triggers",        "TRIGGERS",                       self._section_triggers,              "table"),
+            ("discovery-rules", "DISCOVERY RULES",                self._section_discovery_rules,       "table"),
+            ("unsup-items",     "TOP UNSUPPORTED ITEMS (by tpl)", self._report_top_unsupported_items,  "report"),
+            ("unsup-rules",     "TOP UNSUPPORTED DISC. RULES",    self._report_top_unsupported_rules,  "report"),
+            ("graphs",          "GRAPHS (custom)",                self._section_graphs,                "table"),
+            ("host-groups",     "HOST GROUPS",                    self._section_host_groups,           "table"),
+            ("maps",            "MAPS",                           self._section_maps,                  "table"),
+            ("dashboards",      "DASHBOARDS",                     self._section_dashboards,            "table"),
+            ("proxies",         "PROXIES",                        self._section_proxies,               "table"),
+            ("user-groups",     "USER GROUPS",                    self._section_user_groups,           "table"),
+            # ── deep-validation sections ─────────────────────────────────
+            ("hosts-missing",    "HOSTS MISSING IN DEST",           self._report_hosts_missing,          "report"),
+            ("hosts-templates",  "HOST→TEMPLATE DRIFT",             self._report_hosts_templates,        "report"),
+            ("hosts-groups",     "HOST→HOSTGROUP DRIFT",            self._report_hosts_groups,           "report"),
+            ("template-objects", "TEMPLATE OBJECT COUNTS",          self._report_template_objects,       "report"),
+            ("group-host-count", "HOSTGROUP ENABLED-HOST COUNTS",   self._report_group_host_count,       "report"),
+            ("agent-triggers",   "AGENT-UNAVAILABLE TRIGGERS",      self._report_agent_triggers,         "report"),
+        ]
+
+        print(f"\n{'═' * 74}")
+        print(f"  Migration Health Check — CIA: {self.cia}")
+        active_keys = ", ".join(sections) if len(sections) < len(COMPARE_ALL_SECTIONS) else "all"
+        print(f"  Sections: {active_keys}")
+        print(f"{'═' * 74}")
+
+        for key, title, fn, kind in all_sections:
+            if key not in sections:
+                continue
+            print(f"\n  {'─' * 72}")
+            print(f"  {title}")
+            print(f"  {'─' * 72}")
+            try:
+                if kind == "table":
+                    rows = fn()
+                    self._print_table(rows)
+                else:
+                    fn()   # prints directly
+            except Exception as exc:
+                import traceback
+                print(f"  [ERROR in {title}: {exc}]")
+                print(traceback.format_exc())
+
+        if self._warnings:
+            print(f"\n  {'═' * 72}")
+            print(f"  ⚠  DISCREPANCIES  ({len(self._warnings)} found)")
+            print(f"  {'═' * 72}")
+            for w in self._warnings:
+                print(f"  {self._YEL}!{self._RST}  {w}")
+
+        print(f"\n{'═' * 74}")
+
+    # ── table rendering ──────────────────────────────────────────────────────
+
+    def _print_table(self, rows: List[Tuple]):
+        """
+        rows: list of (label, src_val, dst_val) or (label,) for separators.
+        Negative diff is always red + added to warnings.
+        Positive diff is yellow (informational; may be expected).
+        """
+        COL_LBL = 46
+        COL_VAL = 9
+
+        hdr = (f"  {'Metric':<{COL_LBL}}  "
+               f"{'Source':>{COL_VAL}}  {'Dest':>{COL_VAL}}  {'Diff':>{COL_VAL}}")
+        print(hdr)
+        print(f"  {'·' * (COL_LBL + COL_VAL * 3 + 8)}")
+
+        for row in rows:
+            if len(row) == 1:
+                print(f"  {row[0]}")
+                continue
+
+            label, src_v, dst_v = row
+
+            if isinstance(src_v, int) and isinstance(dst_v, int):
+                diff = dst_v - src_v
+                if diff == 0:
+                    diff_str = f"{'=':>{COL_VAL}}"
+                    colour   = self._GRN
+                elif diff > 0:
+                    diff_str = f"{'+' + str(diff):>{COL_VAL}}"
+                    colour   = self._YEL
+                else:
+                    diff_str = f"{str(diff):>{COL_VAL}}"
+                    colour   = self._RED
+                    self._warnings.append(f"{label}: src={src_v} dst={dst_v} (Δ{diff})")
+                print(f"  {label:<{COL_LBL}}  {src_v:>{COL_VAL}}  {dst_v:>{COL_VAL}}  "
+                      f"{colour}{diff_str}{self._RST}")
+            else:
+                match = "=" if str(src_v) == str(dst_v) else "≠"
+                print(f"  {label:<{COL_LBL}}  {str(src_v):>{COL_VAL}}  {str(dst_v):>{COL_VAL}}  "
+                      f"  {match}")
+
+    # ── stat-collection helpers ──────────────────────────────────────────────
+
+    def _cnt(self, api, method: str, **kwargs) -> int:
+        """Call <method> with countOutput=True and return the integer result."""
+        fn = api
+        for part in method.split("."):
+            fn = getattr(fn, part)
+        result = fn(countOutput=True, **kwargs)
+        return int(result)
+
+    @staticmethod
+    def _build_transitively_used_templates(api) -> set:
+        """
+        Return the set of templateids that are 'in use', defined as:
+          - directly linked to ≥1 regular host (flags=0), OR
+          - are an ancestor (parent/grandparent/…) of any such template.
+
+        This avoids counting nested/shared parent templates as orphans simply
+        because no host links to them directly.
+        """
+        # Fetch all templates with their parent template links
+        all_tpls = api.template.get(
+            output=["templateid"],
+            selectParentTemplates=["templateid"]
+        )
+        # Map: templateid → list of parent templateids (templates it inherits from)
+        tpl_parents: Dict[str, List[str]] = {
+            t["templateid"]: [p["templateid"] for p in t.get("parentTemplates", [])]
+            for t in all_tpls
+        }
+
+        # Seed: templates that are directly linked to at least one regular host
+        linked_tpls = api.template.get(
+            output=["templateid"],
+            filter={},
+            real_hosts=True          # only templates used by real hosts
+        )
+        used: set = {t["templateid"] for t in linked_tpls}
+
+        # Walk upward: if template T is used, all its parents are also used
+        queue = list(used)
+        while queue:
+            tid = queue.pop()
+            for parent_id in tpl_parents.get(tid, []):
+                if parent_id not in used:
+                    used.add(parent_id)
+                    queue.append(parent_id)
+
+        return used
+
+    # ── individual sections ──────────────────────────────────────────────────
+
+    def _section_hosts(self) -> List[Tuple]:
+        """
+        Counts regular hosts (flags=0) only.
+        Direct/proxy split:
+          - Source (6.4): proxyid=0 means no proxy
+          - Dest   (7.0): proxyid=0 AND proxy_groupid=0 means truly server-direct
+            (Zabbix 7.0 introduced proxy groups; hosts in a proxy group have
+             proxyid=0 but proxy_groupid≠0 — they'd be wrongly counted as "direct"
+             if we only filter on proxyid)
+        """
+        s_en  = self._cnt(self.src, "host.get", filter={"status": "0", "flags": "0"})
+        d_en  = self._cnt(self.dst, "host.get", filter={"status": "0", "flags": "0"})
+        s_dis = self._cnt(self.src, "host.get", filter={"status": "1", "flags": "0"})
+        d_dis = self._cnt(self.dst, "host.get", filter={"status": "1", "flags": "0"})
+
+        s_wtpl = self._cnt(self.src, "host.get",
+                           filter={"status": "0", "flags": "0"}, templated_hosts=True)
+        d_wtpl = self._cnt(self.dst, "host.get",
+                           filter={"status": "0", "flags": "0"}, templated_hosts=True)
+        s_lld  = self._cnt(self.src, "host.get", filter={"flags": "4"})
+        d_lld  = self._cnt(self.dst, "host.get", filter={"flags": "4"})
+
+        rows = [
+            ("Total (enabled)",                    s_en,             d_en),
+            ("Total (disabled)",                   s_dis,            d_dis),
+            ("  ↳ Enabled — with template(s)",     s_wtpl,           d_wtpl),
+            ("  ↳ Enabled — no templates",         max(0,s_en-s_wtpl), max(0,d_en-d_wtpl)),
+            ("Discovered by LLD (not migrated)",   s_lld,            d_lld),
+        ]
+
+        # Proxy breakdown
+        try:
+            src_proxy_ids = [p["proxyid"]
+                             for p in self.src.proxy.get(output=["proxyid"])]
+            s_proxy = (self._cnt(self.src, "host.get",
+                                 filter={"status": "0", "flags": "0"},
+                                 proxyids=src_proxy_ids)
+                       if src_proxy_ids else 0)
+
+            dst_proxy_ids = [p["proxyid"]
+                             for p in self.dst.proxy.get(output=["proxyid"])]
+            d_proxy = (self._cnt(self.dst, "host.get",
+                                 filter={"status": "0", "flags": "0"},
+                                 proxyids=dst_proxy_ids)
+                       if dst_proxy_ids else 0)
+
+            # Source 6.4: direct = proxyid=0
+            s_direct = self._cnt(self.src, "host.get",
+                                 filter={"status": "0", "flags": "0", "proxyid": "0"})
+            # Dest 7.0: direct = proxyid=0 AND proxy_groupid=0
+            # (proxy_groupid field exists only in 7.0; ignored on 6.4 side)
+            try:
+                d_direct = self._cnt(self.dst, "host.get",
+                                     filter={"status": "0", "flags": "0",
+                                             "proxyid": "0", "proxy_groupid": "0"})
+            except Exception:
+                d_direct = s_en - d_proxy  # fallback
+
+            rows += [
+                ("  ↳ Enabled — monitored via proxy",   s_proxy,  d_proxy),
+                ("  ↳ Enabled — direct (server only)",  s_direct, d_direct),
+            ]
+        except Exception:
+            pass  # proxy info is informational; don't fail the whole section
+
+        return rows
+
+    def _section_templates(self) -> List[Tuple]:
+        s_total = self._cnt(self.src, "template.get")
+        d_total = self._cnt(self.dst, "template.get")
+
+        # "In use" = linked to host directly OR as an ancestor of a linked template
+        s_used  = self._build_transitively_used_templates(self.src)
+        d_used  = self._build_transitively_used_templates(self.dst)
+
+        s_linked_direct = self._cnt(self.src, "template.get", real_hosts=True)
+        d_linked_direct = self._cnt(self.dst, "template.get", real_hosts=True)
+
+        s_used_cnt   = len(s_used)
+        d_used_cnt   = len(d_used)
+        s_orphan_cnt = s_total - s_used_cnt
+        d_orphan_cnt = d_total - d_used_cnt
+
+        return [
+            ("Total",                                  s_total,         d_total),
+            ("  ↳ Directly linked to ≥1 host",        s_linked_direct, d_linked_direct),
+            ("  ↳ Used (direct + nested ancestors)",   s_used_cnt,      d_used_cnt),
+            ("  ↳ True orphan (not used anywhere)",    s_orphan_cnt,    d_orphan_cnt),
+        ]
+
+    def _section_items(self) -> List[Tuple]:
+        """Regular items (flags=0) on non-LLD hosts."""
+        base = dict(host_flags=["0"])
+        s_en  = self._cnt(self.src, "item.get", filter={"status":"0","flags":"0"}, **base)
+        d_en  = self._cnt(self.dst, "item.get", filter={"status":"0","flags":"0"}, **base)
+        s_dis = self._cnt(self.src, "item.get", filter={"status":"1","flags":"0"}, **base)
+        d_dis = self._cnt(self.dst, "item.get", filter={"status":"1","flags":"0"}, **base)
+        s_uns = self._cnt(self.src, "item.get",
+                          filter={"status":"0","flags":"0","state":"1"}, **base)
+        d_uns = self._cnt(self.dst, "item.get",
+                          filter={"status":"0","flags":"0","state":"1"}, **base)
+        s_lld = self._cnt(self.src, "item.get", filter={"flags":"4"}, **base)
+        d_lld = self._cnt(self.dst, "item.get", filter={"flags":"4"}, **base)
+        s_tpl = self._cnt(self.src, "item.get",
+                          filter={"status":"0","flags":"0"}, templated=True, **base)
+        d_tpl = self._cnt(self.dst, "item.get",
+                          filter={"status":"0","flags":"0"}, templated=True, **base)
+        return [
+            ("Regular items — enabled",             s_en,           d_en),
+            ("Regular items — disabled",            s_dis,          d_dis),
+            ("  ↳ Enabled — unsupported",           s_uns,          d_uns),
+            ("  ↳ Enabled — from templates",        s_tpl,          d_tpl),
+            ("  ↳ Enabled — direct (no template)",  s_en - s_tpl,   d_en - d_tpl),
+            ("LLD-discovered items (all states)",   s_lld,          d_lld),
+        ]
+
+    def _section_item_types(self) -> List[Tuple]:
+        """Break down ENABLED regular items by monitoring type."""
+        rows = [("  (enabled regular items, non-LLD hosts)",)]
+        for src_types, dst_types, label in _ITEM_TYPE_GROUPS:
+            try:
+                s_cnt = sum(
+                    self._cnt(self.src, "item.get",
+                              filter={"status":"0","flags":"0","type":str(t)},
+                              host_flags=["0"])
+                    for t in src_types
+                )
+                d_cnt = sum(
+                    self._cnt(self.dst, "item.get",
+                              filter={"status":"0","flags":"0","type":str(t)},
+                              host_flags=["0"])
+                    for t in dst_types
+                )
+                if s_cnt > 0 or d_cnt > 0:
+                    rows.append((f"  {label}", s_cnt, d_cnt))
+            except Exception:
+                rows.append((f"  {label}", "?", "?"))
+        return rows
+
+    def _section_unsupported_item_types(self) -> List[Tuple]:
+        """Break down UNSUPPORTED items (state=1) by monitoring type."""
+        rows = [("  (unsupported items, non-LLD hosts)",)]
+        for src_types, dst_types, label in _ITEM_TYPE_GROUPS:
+            try:
+                s_cnt = sum(
+                    self._cnt(self.src, "item.get",
+                              filter={"status":"0","flags":"0","state":"1","type":str(t)},
+                              host_flags=["0"])
+                    for t in src_types
+                )
+                d_cnt = sum(
+                    self._cnt(self.dst, "item.get",
+                              filter={"status":"0","flags":"0","state":"1","type":str(t)},
+                              host_flags=["0"])
+                    for t in dst_types
+                )
+                if s_cnt > 0 or d_cnt > 0:
+                    rows.append((f"  {label}", s_cnt, d_cnt))
+            except Exception:
+                rows.append((f"  {label}", "?", "?"))
+        return rows
+
+    def _section_triggers(self) -> List[Tuple]:
+        s_en   = self._cnt(self.src, "trigger.get",
+                           filter={"status":"0","flags":"0"}, only_true=False)
+        d_en   = self._cnt(self.dst, "trigger.get",
+                           filter={"status":"0","flags":"0"}, only_true=False)
+        s_dis  = self._cnt(self.src, "trigger.get",
+                           filter={"status":"1","flags":"0"}, only_true=False)
+        d_dis  = self._cnt(self.dst, "trigger.get",
+                           filter={"status":"1","flags":"0"}, only_true=False)
+        s_prob = self._cnt(self.src, "trigger.get",
+                           filter={"status":"0","value":"1","flags":"0"}, only_true=False)
+        d_prob = self._cnt(self.dst, "trigger.get",
+                           filter={"status":"0","value":"1","flags":"0"}, only_true=False)
+        s_lld  = self._cnt(self.src, "trigger.get",
+                           filter={"flags":"4"}, only_true=False)
+        d_lld  = self._cnt(self.dst, "trigger.get",
+                           filter={"flags":"4"}, only_true=False)
+        return [
+            ("Enabled (regular)",         s_en,   d_en),
+            ("Disabled (regular)",        s_dis,  d_dis),
+            ("  ↳ Currently in PROBLEM",  s_prob, d_prob),
+            ("LLD-discovered triggers",   s_lld,  d_lld),
+        ]
+
+    def _section_discovery_rules(self) -> List[Tuple]:
+        s_en  = self._cnt(self.src, "discoveryrule.get", filter={"status":"0"})
+        d_en  = self._cnt(self.dst, "discoveryrule.get", filter={"status":"0"})
+        s_dis = self._cnt(self.src, "discoveryrule.get", filter={"status":"1"})
+        d_dis = self._cnt(self.dst, "discoveryrule.get", filter={"status":"1"})
+        s_uns = self._cnt(self.src, "discoveryrule.get",
+                          filter={"status":"0","state":"1"})
+        d_uns = self._cnt(self.dst, "discoveryrule.get",
+                          filter={"status":"0","state":"1"})
+        return [
+            ("Enabled",                   s_en,  d_en),
+            ("Disabled",                  s_dis, d_dis),
+            ("  ↳ Enabled — unsupported", s_uns, d_uns),
+        ]
+
+    def _section_graphs(self) -> List[Tuple]:
+        s_tot = self._cnt(self.src, "graph.get", filter={"flags":"0"})
+        d_tot = self._cnt(self.dst, "graph.get", filter={"flags":"0"})
+        return [("Custom graphs (flags=0)", s_tot, d_tot)]
+
+    def _section_host_groups(self) -> List[Tuple]:
+        s_tot  = self._cnt(self.src, "hostgroup.get", real_hosts=True)
+        d_tot  = self._cnt(self.dst, "hostgroup.get", real_hosts=True)
+        src_grps = self.src.hostgroup.get(output=["groupid"], real_hosts=True)
+        dst_grps = self.dst.hostgroup.get(output=["groupid"], real_hosts=True)
+        s_nonempty = sum(
+            1 for g in src_grps
+            if int(self.src.host.get(countOutput=True, groupids=g["groupid"],
+                                     filter={"status":"0","flags":"0"})) > 0
+        )
+        d_nonempty = sum(
+            1 for g in dst_grps
+            if int(self.dst.host.get(countOutput=True, groupids=g["groupid"],
+                                     filter={"status":"0","flags":"0"})) > 0
+        )
+        return [
+            ("Total (real-host groups)", s_tot,              d_tot),
+            ("  ↳ Non-empty",           s_nonempty,         d_nonempty),
+            ("  ↳ Empty",               s_tot-s_nonempty,   d_tot-d_nonempty),
+        ]
+
+    def _section_maps(self) -> List[Tuple]:
+        return [("Total", self._cnt(self.src,"map.get"), self._cnt(self.dst,"map.get"))]
+
+    def _section_dashboards(self) -> List[Tuple]:
+        return [("Total", self._cnt(self.src,"dashboard.get"), self._cnt(self.dst,"dashboard.get"))]
+
+    def _section_proxies(self) -> List[Tuple]:
+        try:
+            s_act = self._cnt(self.src, "proxy.get", filter={"status":"5"})
+            s_pas = self._cnt(self.src, "proxy.get", filter={"status":"6"})
+        except Exception:
+            s_act = self._cnt(self.src, "proxy.get"); s_pas = 0
+        try:
+            d_act = self._cnt(self.dst, "proxy.get", filter={"operating_mode":"0"})
+            d_pas = self._cnt(self.dst, "proxy.get", filter={"operating_mode":"1"})
+        except Exception:
+            d_act = self._cnt(self.dst, "proxy.get"); d_pas = 0
+        return [("Active proxies", s_act, d_act), ("Passive proxies", s_pas, d_pas)]
+
+    def _section_user_groups(self) -> List[Tuple]:
+        return [("Total", self._cnt(self.src,"usergroup.get"),
+                          self._cnt(self.dst,"usergroup.get"))]
+
+    # ── report sections (print directly, no src/dst table) ──────────────────
+
+    def _report_top_unsupported(self, fetch_fn_name: str,
+                                 label_singular: str,
+                                 top_n: int = 5):
+        """
+        Generic top-N unsupported object report, shown for both src and dst.
+        fetch_fn_name: 'item.get' or 'discoveryrule.get'
+        """
+        from collections import Counter
+
+        COL_T = 52
+        COL_C = 7
+
+        for tag, api in [("Source", self.src), ("Dest  ", self.dst)]:
+            fn = api
+            for part in fetch_fn_name.split("."):
+                fn = getattr(fn, part)
+
+            if fetch_fn_name == "item.get":
+                objects = fn(
+                    output=["name", "templateid"],
+                    filter={"status": "0", "flags": "0", "state": "1"},
+                    host_flags=["0"],
+                    limit=50000
+                )
+            else:  # discoveryrule.get
+                objects = fn(
+                    output=["name", "templateid"],
+                    filter={"status": "0", "state": "1"},
+                    limit=50000
+                )
+
+            total = len(objects)
+            if total == 0:
+                print(f"\n  [{tag}]  No unsupported {label_singular}s found.")
+                continue
+
+            counts: "Counter[str]" = Counter()
+            direct_cnt = 0
+            for obj in objects:
+                tid = obj.get("templateid", "0") or "0"
+                if tid != "0":
+                    counts[tid] += 1
+                else:
+                    direct_cnt += 1
+
+            # Resolve template names for top N
+            top_n_list = counts.most_common(top_n)
+            tids        = [t[0] for t, _ in [(x, None) for x in top_n_list]]
+            # Fix: most_common returns (key, count) tuples
+            top_n_list  = counts.most_common(top_n)
+            tids        = [tid for tid, _ in top_n_list]
+            tpl_names   = {}
+            if tids:
+                tpl_data = api.template.get(output=["name"], templateids=tids)
+                tpl_names = {t["templateid"]: t["name"] for t in tpl_data}
+
+            print(f"\n  [{tag}]  Total unsupported {label_singular}s: {total}"
+                  f"  (from templates: {total - direct_cnt}, direct: {direct_cnt})")
+            print(f"  {'─' * (COL_T + COL_C + 6)}")
+            print(f"  {'Template':<{COL_T}}  {'Count':>{COL_C}}")
+            print(f"  {'·' * (COL_T + COL_C + 4)}")
+            for tid, cnt in top_n_list:
+                tname = tpl_names.get(tid, f"<templateid {tid}>")
+                # Truncate long template names
+                if len(tname) > COL_T - 2:
+                    tname = tname[:COL_T - 5] + "..."
+                print(f"  {tname:<{COL_T}}  {cnt:>{COL_C}}")
+            if direct_cnt > 0:
+                print(f"  {'(direct — no template)':<{COL_T}}  {direct_cnt:>{COL_C}}")
+
+            # Bonus: also show the top 5 most-common item/rule *names* (what is broken)
+            name_counts: "Counter[str]" = Counter(
+                obj["name"] for obj in objects
+                if (obj.get("templateid") or "0") != "0"
+            )
+            top_names = name_counts.most_common(top_n)
+            if top_names:
+                print(f"\n  [{tag}]  Most common unsupported {label_singular} names:")
+                print(f"  {'·' * (COL_T + COL_C + 4)}")
+                for name, cnt in top_names:
+                    if len(name) > COL_T - 2:
+                        name = name[:COL_T - 5] + "..."
+                    print(f"  {name:<{COL_T}}  {cnt:>{COL_C}}")
+
+    def _report_top_unsupported_items(self):
+        self._report_top_unsupported("item.get", "item")
+
+    def _report_top_unsupported_rules(self):
+        self._report_top_unsupported("discoveryrule.get", "discovery rule")
+
+    # ── deep-validation report methods ───────────────────────────────────────
+
+    def _report_hosts_missing(self):
+        """
+        List every enabled host (flags=0) present in source but absent in dest.
+        Also lists hosts present in dest but absent in source (unexpected).
+        Writes a report file: compare_hosts_missing_<cia>.txt
+        """
+        print()
+        src_hosts = {h["host"]: h for h in self.src.host.get(
+            output=["hostid", "host", "name", "status", "flags"],
+            filter={"flags": "0"})}
+        dst_hosts = {h["host"]: h for h in self.dst.host.get(
+            output=["hostid", "host", "name", "status", "flags"],
+            filter={"flags": "0"})}
+
+        src_enabled = {k for k, v in src_hosts.items() if str(v["status"]) == "0"}
+        dst_enabled = {k for k, v in dst_hosts.items() if str(v["status"]) == "0"}
+        dst_all     = set(dst_hosts.keys())
+
+        missing      = sorted(src_enabled - dst_all)
+        unexpected   = sorted(dst_enabled - set(src_hosts.keys()))
+
+        print(f"  Source enabled hosts : {len(src_enabled)}")
+        print(f"  Dest   all hosts     : {len(dst_all)}")
+        print(f"  Missing in dest      : {len(missing)}")
+        print(f"  Unexpected in dest   : {len(unexpected)}")
+
+        lines = [
+            f"=== HOSTS MISSING IN DESTINATION  (CIA: {self.cia}) ===",
+            f"Source enabled : {len(src_enabled)}",
+            f"Dest all       : {len(dst_all)}",
+            "",
+        ]
+        if missing:
+            lines.append(f"MISSING ({len(missing)}):")
+            for h in missing:
+                lines.append(f"  - {h}")
+            self._warnings.append(f"hosts-missing: {len(missing)} host(s) absent from dest")
+        else:
+            lines.append("MISSING: none  ✓")
+
+        if unexpected:
+            lines += ["", f"UNEXPECTED IN DEST ({len(unexpected)}) — not in source:"]
+            for h in unexpected:
+                lines.append(f"  + {h}")
+
+        self._write_report("hosts_missing", lines)
+
+    def _report_hosts_templates(self):
+        """
+        For every enabled host in source, compare the set of linked templates
+        with the destination counterpart. Reports drift (added/removed templates).
+        """
+        print()
+        src_hosts = self.src.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectParentTemplates=["templateid", "name"])
+        dst_hosts = self.dst.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectParentTemplates=["templateid", "name"])
+
+        dst_by_name = {h["host"]: {t["name"] for t in h.get("parentTemplates", [])}
+                       for h in dst_hosts}
+
+        drifted = []
+        missing_in_dst = []
+        for h in src_hosts:
+            hname = h["host"]
+            src_tpls = {t["name"] for t in h.get("parentTemplates", [])}
+            if hname not in dst_by_name:
+                missing_in_dst.append(hname)
+                continue
+            dst_tpls = dst_by_name[hname]
+            added   = dst_tpls - src_tpls
+            removed = src_tpls - dst_tpls
+            if added or removed:
+                drifted.append((hname, sorted(removed), sorted(added)))
+
+        print(f"  Source enabled hosts checked : {len(src_hosts)}")
+        print(f"  Hosts missing in dest        : {len(missing_in_dst)}")
+        print(f"  Hosts with template drift    : {len(drifted)}")
+
+        lines = [
+            f"=== HOST→TEMPLATE DRIFT  (CIA: {self.cia}) ===",
+            f"Source enabled hosts : {len(src_hosts)}",
+            f"Missing in dest      : {len(missing_in_dst)}",
+            f"Template drift       : {len(drifted)}",
+            "",
+        ]
+        if drifted:
+            self._warnings.append(f"hosts-templates: {len(drifted)} host(s) with template drift")
+            for hname, removed, added in drifted:
+                lines.append(f"HOST: {hname}")
+                for t in removed:
+                    lines.append(f"  - REMOVED: {t}")
+                for t in added:
+                    lines.append(f"  + ADDED  : {t}")
+                lines.append("")
+        else:
+            lines.append("No template drift found  ✓")
+
+        self._write_report("hosts_templates", lines)
+
+    def _report_hosts_groups(self):
+        """
+        For every enabled host in source, compare the set of hostgroups
+        with the destination. Reports drift (added/removed groups).
+        """
+        print()
+        src_hosts = self.src.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectGroups=["groupid", "name"])
+        dst_hosts = self.dst.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectGroups=["groupid", "name"])
+
+        dst_by_name = {h["host"]: {g["name"] for g in h.get("groups", [])}
+                       for h in dst_hosts}
+
+        drifted = []
+        missing_in_dst = []
+        for h in src_hosts:
+            hname = h["host"]
+            src_grps = {g["name"] for g in h.get("groups", [])}
+            if hname not in dst_by_name:
+                missing_in_dst.append(hname)
+                continue
+            dst_grps = dst_by_name[hname]
+            added   = dst_grps - src_grps
+            removed = src_grps - dst_grps
+            if added or removed:
+                drifted.append((hname, sorted(removed), sorted(added)))
+
+        print(f"  Source enabled hosts checked : {len(src_hosts)}")
+        print(f"  Hosts missing in dest        : {len(missing_in_dst)}")
+        print(f"  Hosts with group drift       : {len(drifted)}")
+
+        lines = [
+            f"=== HOST→HOSTGROUP DRIFT  (CIA: {self.cia}) ===",
+            f"Source enabled hosts : {len(src_hosts)}",
+            f"Missing in dest      : {len(missing_in_dst)}",
+            f"Group drift          : {len(drifted)}",
+            "",
+        ]
+        if drifted:
+            self._warnings.append(f"hosts-groups: {len(drifted)} host(s) with hostgroup drift")
+            for hname, removed, added in drifted:
+                lines.append(f"HOST: {hname}")
+                for g in removed:
+                    lines.append(f"  - REMOVED: {g}")
+                for g in added:
+                    lines.append(f"  + ADDED  : {g}")
+                lines.append("")
+        else:
+            lines.append("No hostgroup drift found  ✓")
+
+        self._write_report("hosts_groups", lines)
+
+    def _report_template_objects(self):
+        """
+        For every template present in source, compare object counts
+        (items, triggers, graphs, discovery rules, httptests) with dest.
+        Reports templates with count differences.
+        """
+        print()
+        src_tpls = {t["name"]: t["templateid"] for t in self.src.template.get(
+            output=["templateid", "name"])}
+        dst_tpls = {t["name"]: t["templateid"] for t in self.dst.template.get(
+            output=["templateid", "name"])}
+
+        OBJECT_TYPES = [
+            ("items",          lambda api, tid: self._cnt(api, "item.get",          templateids=tid, filter={"flags":"0"})),
+            ("triggers",       lambda api, tid: self._cnt(api, "trigger.get",       templateids=tid, filter={"flags":"0"})),
+            ("graphs",         lambda api, tid: self._cnt(api, "graph.get",         templateids=tid, filter={"flags":"0"})),
+            ("discovery rules",lambda api, tid: self._cnt(api, "discoveryrule.get", templateids=tid)),
+            ("httptests",      lambda api, tid: self._cnt(api, "httptest.get",      templateids=tid)),
+        ]
+
+        drifted = []
+        missing_in_dst = []
+        src_total = len(src_tpls)
+
+        print(f"  Comparing {src_total} source templates...")
+        for tname, stid in sorted(src_tpls.items()):
+            if tname not in dst_tpls:
+                missing_in_dst.append(tname)
+                continue
+            dtid = dst_tpls[tname]
+            diffs = []
+            for obj_label, cnt_fn in OBJECT_TYPES:
+                try:
+                    sc = cnt_fn(self.src, stid)
+                    dc = cnt_fn(self.dst, dtid)
+                    if sc != dc:
+                        diffs.append((obj_label, sc, dc))
+                except Exception:
+                    pass
+            if diffs:
+                drifted.append((tname, diffs))
+
+        print(f"  Source templates          : {src_total}")
+        print(f"  Missing in dest           : {len(missing_in_dst)}")
+        print(f"  Templates with obj drift  : {len(drifted)}")
+
+        lines = [
+            f"=== TEMPLATE OBJECT COUNT DRIFT  (CIA: {self.cia}) ===",
+            f"Source templates : {src_total}",
+            f"Missing in dest  : {len(missing_in_dst)}",
+            f"Object drift     : {len(drifted)}",
+            "",
+        ]
+        if missing_in_dst:
+            lines.append(f"MISSING IN DEST ({len(missing_in_dst)}):")
+            for t in sorted(missing_in_dst):
+                lines.append(f"  - {t}")
+            lines.append("")
+            self._warnings.append(f"template-objects: {len(missing_in_dst)} template(s) missing in dest")
+
+        if drifted:
+            self._warnings.append(f"template-objects: {len(drifted)} template(s) with object count drift")
+            lines.append(f"OBJECT COUNT DRIFT ({len(drifted)} templates):")
+            for tname, diffs in drifted:
+                lines.append(f"  TEMPLATE: {tname}")
+                for obj_label, sc, dc in diffs:
+                    sign = "+" if dc > sc else "-"
+                    lines.append(f"    {obj_label:20s}  src={sc:5}  dst={dc:5}  ({sign}{abs(dc-sc)})")
+                lines.append("")
+        else:
+            lines.append("No object count drift found  ✓")
+
+        self._write_report("template_objects", lines)
+
+    def _report_group_host_count(self):
+        """
+        For every hostgroup that exists in source, compare the count of enabled
+        hosts (flags=0, status=0) between source and destination.
+        """
+        print()
+        src_groups = {g["name"]: g["groupid"] for g in self.src.hostgroup.get(
+            output=["groupid", "name"])}
+        dst_groups = {g["name"]: g["groupid"] for g in self.dst.hostgroup.get(
+            output=["groupid", "name"])}
+
+        drifted      = []
+        missing_grps = []
+
+        for gname, sgid in sorted(src_groups.items()):
+            if gname not in dst_groups:
+                # Only flag groups that had enabled hosts in source
+                sc = int(self.src.host.get(countOutput=True, groupids=sgid,
+                                           filter={"status": "0", "flags": "0"}))
+                if sc > 0:
+                    missing_grps.append((gname, sc))
+                continue
+            dgid = dst_groups[gname]
+            sc = int(self.src.host.get(countOutput=True, groupids=sgid,
+                                       filter={"status": "0", "flags": "0"}))
+            dc = int(self.dst.host.get(countOutput=True, groupids=dgid,
+                                       filter={"status": "0", "flags": "0"}))
+            if sc != dc:
+                drifted.append((gname, sc, dc))
+
+        print(f"  Source groups checked     : {len(src_groups)}")
+        print(f"  Groups missing in dest    : {len(missing_grps)}")
+        print(f"  Groups with count drift   : {len(drifted)}")
+
+        lines = [
+            f"=== HOSTGROUP ENABLED-HOST COUNT DRIFT  (CIA: {self.cia}) ===",
+            f"Source groups    : {len(src_groups)}",
+            f"Missing in dest  : {len(missing_grps)}",
+            f"Count drift      : {len(drifted)}",
+            "",
+        ]
+        if missing_grps:
+            self._warnings.append(f"group-host-count: {len(missing_grps)} group(s) missing in dest")
+            lines.append(f"GROUPS MISSING IN DEST (had enabled hosts):")
+            for gname, sc in sorted(missing_grps):
+                lines.append(f"  - {gname}  (src enabled={sc})")
+            lines.append("")
+
+        if drifted:
+            self._warnings.append(f"group-host-count: {len(drifted)} group(s) with enabled-host count drift")
+            lines.append(f"COUNT DRIFT ({len(drifted)} groups):")
+            COL = 50
+            for gname, sc, dc in drifted:
+                sign = "+" if dc > sc else "-"
+                lines.append(f"  {gname:<{COL}}  src={sc:5}  dst={dc:5}  ({sign}{abs(dc-sc)})")
+            lines.append("")
+        else:
+            lines.append("No host-count drift found  ✓")
+
+        self._write_report("group_host_count", lines)
+
+    def _report_agent_triggers(self):
+        """
+        Compare the count of agent-unavailability triggers currently in PROBLEM
+        state between source and destination.
+        Looks for triggers whose description contains typical agent-check keywords.
+        Also lists the individual problem trigger names on each side.
+        """
+        print()
+        KEYWORDS = ["unreachable", "unavailable", "zbx-agent", "zabbix agent"]
+
+        def _fetch_agent_problems(api):
+            try:
+                triggers = api.trigger.get(
+                    output=["triggerid", "description", "value"],
+                    filter={"status": "0", "value": "1"},   # enabled + in PROBLEM
+                    only_true=True,
+                    limit=10000)
+            except Exception as exc:
+                print(f"    [WARN] trigger.get failed: {exc}")
+                return []
+            return [
+                t for t in triggers
+                if any(kw in t["description"].lower() for kw in KEYWORDS)
+            ]
+
+        src_problems = _fetch_agent_problems(self.src)
+        dst_problems = _fetch_agent_problems(self.dst)
+
+        src_names = sorted({t["description"] for t in src_problems})
+        dst_names = sorted({t["description"] for t in dst_problems})
+
+        only_src = sorted(set(src_names) - set(dst_names))
+        only_dst = sorted(set(dst_names) - set(src_names))
+
+        print(f"  Agent problems in source   : {len(src_problems)}")
+        print(f"  Agent problems in dest     : {len(dst_problems)}")
+        print(f"  Only in source (resolved?) : {len(only_src)}")
+        print(f"  Only in dest   (new?)      : {len(only_dst)}")
+
+        lines = [
+            f"=== AGENT-UNAVAILABILITY TRIGGERS IN PROBLEM  (CIA: {self.cia}) ===",
+            f"Source problems : {len(src_problems)}",
+            f"Dest   problems : {len(dst_problems)}",
+            f"Only in source  : {len(only_src)}",
+            f"Only in dest    : {len(only_dst)}",
+            "",
+        ]
+        if len(src_problems) != len(dst_problems):
+            diff = len(dst_problems) - len(src_problems)
+            sign = "+" if diff > 0 else ""
+            self._warnings.append(
+                f"agent-triggers: src={len(src_problems)} dst={len(dst_problems)} "
+                f"({sign}{diff}) agent problems")
+
+        if only_src:
+            lines.append(f"ONLY IN SOURCE ({len(only_src)}) — possibly resolved in dest:")
+            for t in only_src:
+                lines.append(f"  SRC: {t}")
+            lines.append("")
+
+        if only_dst:
+            lines.append(f"ONLY IN DEST ({len(only_dst)}) — possibly new problems in dest:")
+            for t in only_dst:
+                lines.append(f"  DST: {t}")
+            lines.append("")
+
+        lines.append(f"--- ALL SOURCE AGENT PROBLEMS ({len(src_names)}) ---")
+        for t in src_names:
+            lines.append(f"  {t}")
+        lines.append("")
+        lines.append(f"--- ALL DEST AGENT PROBLEMS ({len(dst_names)}) ---")
+        for t in dst_names:
+            lines.append(f"  {t}")
+
+        self._write_report("agent_triggers", lines)
+
+    def _write_report(self, section_key: str, lines: List[str]):
+        """Write report lines to a timestamped file next to the script."""
+        import os as _os
+        from datetime import datetime as _dt
+        ts      = _dt.now().strftime("%Y%m%d_%H%M%S")
+        fname   = f"compare_{section_key}_{self.cia}_{ts}.txt"
+        path    = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), fname)
+        content = "\n".join(lines) + "\n"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"  Report written: {path}")
+        except Exception as exc:
+            print(f"  [WARN] Could not write report: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Status sync — disable in destination what's already disabled in source
+# ---------------------------------------------------------------------------
+
+class ZabbixStatusSync:
+    """
+    HOST_IMPORT_RULES imports items/triggers/discoveryRules with
+    updateExisting=False, so once a host is migrated, disabling one of these
+    later on the 6.4 source never propagates to the 7.0 destination — it
+    keeps alerting there. This pass fixes that drift, scoped to hosts only:
+
+    For every host that exists on both source and destination, items,
+    triggers and discovery rules are matched by name. Whenever an object is
+    disabled on source but still enabled on destination, it gets disabled on
+    destination too. One-directional: never re-enables anything, and never
+    touches objects that are enabled on source.
+    """
+
+    STATUS_DISABLED = "1"
+    STATUS_ENABLED  = "0"
+
+    # (kind label, API root (item/discoveryrule/trigger), ID field name,
+    #  display-name field, extra .get() filter)
+    # itemid is shared by items and discovery rules (both live in Zabbix's
+    # items table); triggers use their own triggerid. Triggers also expose
+    # their display name as "description", not "name".
+    # Order: triggers, then items, then discovery rules.
+    _OBJECT_KINDS = [
+        ("triggers",        "trigger",       "triggerid", "description", {"flags": ["0", "4"]}),
+        ("items",           "item",          "itemid",    "name",        {"flags": ["0", "4"]}),
+        ("discovery-rules", "discoveryrule", "itemid",    "name",        None),
+    ]
+
+    def __init__(self, src_api, dst_api, cia_name: str,
+                 host_filter: Optional[str] = None,
+                 hostgroup_filter: Optional[str] = None,
+                 dry_run: bool = False):
+        self.src = src_api
+        self.dst = dst_api
+        self.cia = cia_name
+        self.host_filter      = host_filter
+        self.hostgroup_filter = hostgroup_filter
+        self.dry_run = dry_run
+        self.totals: Dict[str, Dict[str, int]] = {
+            kind: {"disabled": 0, "already": 0, "missing": 0,
+                   "ambiguous": 0, "errors": 0}
+            for kind, _, _, _, _ in self._OBJECT_KINDS
+        }
+        self.hosts_skipped_not_in_dest: List[str] = []
+        # Every object actually disabled on destination this run — enough to
+        # re-enable them later. Populated only on real (non-dry-run) changes.
+        self.changes: List[Dict] = []
+        self.rollback_path: Optional[str] = None
+
+    # ── public entry point ───────────────────────────────────────────────────
+
+    def run(self):
+        print(f"\n  Resolving target host(s) for CIA '{self.cia}'...")
+        pairs = self._resolve_host_pairs()
+        if not pairs:
+            print("  No matching host(s) found on both source and destination.")
+            return
+
+        print(f"  Processing {len(pairs)} host(s)"
+              f"{' [DRY-RUN]' if self.dry_run else ''}...")
+        for src_host, dst_host in pairs:
+            host_name = src_host["name"]
+            for kind, root, id_field, name_field, extra_filter in self._OBJECT_KINDS:
+                self._sync_objects(
+                    src_id=src_host["hostid"], dst_id=dst_host["hostid"],
+                    host_name=host_name, root=root, id_field=id_field,
+                    name_field=name_field, extra_filter=extra_filter, kind=kind,
+                )
+
+        self._print_summary()
+        if self.changes:
+            self._write_rollback_file()
+
+    # ── host resolution ──────────────────────────────────────────────────────
+
+    def _find_host(self, api, name: str) -> Optional[Dict]:
+        data = api.host.get(filter={"name": name}, output=["hostid", "name"])
+        return data[0] if data else None
+
+    def _resolve_host_pairs(self) -> List[Tuple[Dict, Dict]]:
+        if self.host_filter:
+            src_host = self._find_host(self.src, self.host_filter)
+            if not src_host:
+                print(f"  Host '{self.host_filter}' not found on source.")
+                return []
+            dst_host = self._find_host(self.dst, self.host_filter)
+            if not dst_host:
+                print(f"  Host '{self.host_filter}' not found on destination "
+                      f"(not migrated yet?).")
+                return []
+            return [(src_host, dst_host)]
+
+        if self.hostgroup_filter:
+            groups = self.src.hostgroup.get(
+                filter={"name": self.hostgroup_filter},
+                selectHosts=["hostid", "name", "flags"],
+            )
+            if not groups:
+                print(f"  Host group '{self.hostgroup_filter}' not found on source.")
+                return []
+            src_hosts = [h for h in groups[0].get("hosts", [])
+                         if str(h.get("flags", "0")) == "0"]
+        else:
+            src_hosts = self.src.host.get(
+                output=["hostid", "name"], filter={"flags": "0"})
+
+        dst_hosts  = self.dst.host.get(output=["hostid", "name"], filter={"flags": "0"})
+        dst_by_name = {h["name"]: h for h in dst_hosts}
+
+        pairs: List[Tuple[Dict, Dict]] = []
+        for h in src_hosts:
+            dst_host = dst_by_name.get(h["name"])
+            if dst_host:
+                pairs.append((h, dst_host))
+            else:
+                self.hosts_skipped_not_in_dest.append(h["name"])
+
+        if self.hosts_skipped_not_in_dest:
+            print(f"  Skipping {len(self.hosts_skipped_not_in_dest)} host(s) "
+                  f"not present on destination (not migrated yet).")
+        return pairs
+
+    # ── per-host, per-kind comparison ────────────────────────────────────────
+
+    def _by_name(self, api, root: str, id_field: str, name_field: str, host_id: str,
+                 extra_filter: Optional[Dict], host_name: str, kind: str) -> Dict[str, Dict]:
+        """Return {name: object} for unambiguous (non-duplicate) names."""
+        getter = getattr(api, root)
+        objects = getter.get(
+            hostids=[host_id], output=[id_field, name_field, "status"],
+            filter=extra_filter or {},
+        )
+        by_name: Dict[str, List[Dict]] = {}
+        for obj in objects:
+            by_name.setdefault(obj[name_field], []).append(obj)
+
+        result: Dict[str, Dict] = {}
+        for name, objs in by_name.items():
+            if len(objs) > 1:
+                self.totals[kind]["ambiguous"] += 1
+                logger.debug("[StatusSync] Host '%s': ambiguous %s name '%s' "
+                             "(%d objects) — skipped.", host_name, kind, name, len(objs))
+                continue
+            result[name] = objs[0]
+        return result
+
+    def _sync_objects(self, src_id: str, dst_id: str, host_name: str,
+                       root: str, id_field: str, name_field: str,
+                       extra_filter: Optional[Dict], kind: str):
+        try:
+            src_objs = self._by_name(self.src, root, id_field, name_field, src_id, extra_filter, host_name, kind)
+            dst_objs = self._by_name(self.dst, root, id_field, name_field, dst_id, extra_filter, host_name, kind)
+        except Exception as exc:
+            print(f"    x [{kind}] Host '{host_name}': fetch failed: {exc}")
+            self.totals[kind]["errors"] += 1
+            return
+
+        updater = getattr(self.dst, root)
+        for name, src_obj in src_objs.items():
+            if str(src_obj.get("status")) != self.STATUS_DISABLED:
+                continue   # enabled on source — nothing to do
+
+            dst_obj = dst_objs.get(name)
+            if dst_obj is None:
+                self.totals[kind]["missing"] += 1
+                continue
+            if str(dst_obj.get("status")) == self.STATUS_DISABLED:
+                self.totals[kind]["already"] += 1
+                continue
+
+            # Disabled on source, still enabled on destination — fix it.
+            if self.dry_run:
+                print(f"    ~ [DRY-RUN] would disable {kind} '{name}' "
+                      f"on host '{host_name}'")
+                self.totals[kind]["disabled"] += 1
+                continue
+
+            try:
+                updater.update(**{id_field: dst_obj[id_field], "status": self.STATUS_DISABLED})
+                print(f"    ✓ Disabled {kind} '{name}' on host '{host_name}'")
+                self.totals[kind]["disabled"] += 1
+                self.changes.append({
+                    "kind": kind, "root": root, "id_field": id_field,
+                    "dest_id": dst_obj[id_field],
+                    "host": host_name, "name": name,
+                })
+            except Exception as exc:
+                print(f"    x Failed to disable {kind} '{name}' "
+                      f"on host '{host_name}': {exc}")
+                self.totals[kind]["errors"] += 1
+
+    # ── summary ──────────────────────────────────────────────────────────────
+
+    def _print_summary(self):
+        print(f"\n  Status-sync summary for CIA '{self.cia}'"
+              f"{' [DRY-RUN — nothing applied]' if self.dry_run else ''}:")
+        for kind, _, _, _, _ in self._OBJECT_KINDS:
+            t = self.totals[kind]
+            print(f"  [{kind:16}] "
+                  f"Disabled: {t['disabled']:4}  "
+                  f"Already-disabled: {t['already']:4}  "
+                  f"Missing-in-dest: {t['missing']:4}  "
+                  f"Ambiguous: {t['ambiguous']:4}  "
+                  f"Errors: {t['errors']:4}")
+
+    # ── rollback file ────────────────────────────────────────────────────────
+
+    def _write_rollback_file(self):
+        """
+        Write every object actually disabled this run to a JSON file, so a
+        rollback (re-enable) is possible later via:
+          --rollback-file <path>
+        """
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cia_slug = self.cia.replace("/", "_").replace(" ", "_")
+        filename = f"rollback_sync_disabled_status_{cia_slug}_{ts}.json"
+        path     = os.path.join(BASE_DIR, filename)
+
+        payload = {
+            "cia":       self.cia,
+            "generated": datetime.now().isoformat(),
+            "changes":   self.changes,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        self.rollback_path = path
+        print(f"\n  Rollback file written: {path}")
+        print(f"  ({len(self.changes)} object(s) disabled — re-enable them if "
+              f"needed with: --rollback-file \"{path}\")")
+
+
+def rollback_status_sync(dst_api, cia_name: str, path: str):
+    """
+    Re-enable every object recorded in a rollback file written by
+    ZabbixStatusSync._write_rollback_file(). Only applies entries whose
+    "cia" matches cia_name — safe to run with --cia all without cross-CIA
+    side effects.
+    """
+    if not os.path.exists(path):
+        print(f"  ERROR: rollback file not found: {path}")
+        return
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if data.get("cia") != cia_name:
+        print(f"  Skipping rollback file '{path}' — recorded for CIA "
+              f"'{data.get('cia')}', not '{cia_name}'.")
+        return
+
+    changes = data.get("changes", [])
+    print(f"  Re-enabling {len(changes)} object(s) from '{path}' "
+          f"(CIA '{cia_name}')...")
+
+    re_enabled = 0
+    errors     = 0
+    for ch in changes:
+        try:
+            updater = getattr(dst_api, ch["root"])
+            updater.update(**{ch["id_field"]: ch["dest_id"],
+                               "status": ZabbixStatusSync.STATUS_ENABLED})
+            print(f"    ✓ Re-enabled {ch['kind']} '{ch['name']}' "
+                  f"on host '{ch['host']}'")
+            re_enabled += 1
+        except Exception as exc:
+            print(f"    x Failed to re-enable {ch['kind']} '{ch['name']}' "
+                  f"on host '{ch['host']}': {exc}")
+            errors += 1
+
+    print(f"\n  Rollback done: {re_enabled} re-enabled, {errors} failed.")
+
+
+# ---------------------------------------------------------------------------
+# 7. HOST GROUP SYNC
+# ---------------------------------------------------------------------------
+
+class ZabbixHostGroupSync:
+    """
+    For every host present on both source and destination, fetch the hostgroups
+    assigned to it on the source. Any group present on source but absent on
+    destination is added to the host on destination (creating the group first
+    if it does not yet exist there). One-directional: never removes groups.
+    """
+
+    def __init__(self, src_api, dst_api, cia_name: str,
+                 host_filter: Optional[str] = None,
+                 hostgroup_filter: Optional[str] = None,
+                 dry_run: bool = False):
+        self.src = src_api
+        self.dst = dst_api
+        self.cia = cia_name
+        self.host_filter      = host_filter
+        self.hostgroup_filter = hostgroup_filter
+        self.dry_run = dry_run
+        self.totals = {
+            "assigned": 0, "groups_created": 0,
+            "hosts_changed": 0, "errors": 0,
+        }
+        self.hosts_skipped_not_in_dest: List[str] = []
+
+    # ── public entry point ───────────────────────────────────────────────────
+
+    def run(self):
+        print(f"\n  Resolving target host(s) for CIA '{self.cia}'...")
+        pairs = self._resolve_host_pairs()
+        if not pairs:
+            print("  No matching host(s) found on both source and destination.")
+            return
+
+        print(f"  Processing {len(pairs)} host(s)"
+              f"{' [DRY-RUN]' if self.dry_run else ''}...")
+        for src_host, dst_host in pairs:
+            self._sync_groups(src_host, dst_host)
+
+        self._print_summary()
+
+    # ── host resolution ──────────────────────────────────────────────────────
+
+    def _find_host(self, api, name: str) -> Optional[Dict]:
+        data = api.host.get(filter={"name": name}, output=["hostid", "name"])
+        return data[0] if data else None
+
+    def _resolve_host_pairs(self) -> List[Tuple[Dict, Dict]]:
+        if self.host_filter:
+            src_host = self._find_host(self.src, self.host_filter)
+            if not src_host:
+                print(f"  Host '{self.host_filter}' not found on source.")
+                return []
+            dst_host = self._find_host(self.dst, self.host_filter)
+            if not dst_host:
+                print(f"  Host '{self.host_filter}' not found on destination "
+                      f"(not migrated yet?).")
+                return []
+            return [(src_host, dst_host)]
+
+        if self.hostgroup_filter:
+            groups = self.src.hostgroup.get(
+                filter={"name": self.hostgroup_filter},
+                selectHosts=["hostid", "name", "flags"],
+            )
+            if not groups:
+                print(f"  Host group '{self.hostgroup_filter}' not found on source.")
+                return []
+            src_hosts = [h for h in groups[0].get("hosts", [])
+                         if str(h.get("flags", "0")) == "0"]
+        else:
+            src_hosts = self.src.host.get(
+                output=["hostid", "name"], filter={"flags": "0"})
+
+        dst_hosts   = self.dst.host.get(output=["hostid", "name"], filter={"flags": "0"})
+        dst_by_name = {h["name"]: h for h in dst_hosts}
+
+        pairs: List[Tuple[Dict, Dict]] = []
+        for h in src_hosts:
+            dst_host = dst_by_name.get(h["name"])
+            if dst_host:
+                pairs.append((h, dst_host))
+            else:
+                self.hosts_skipped_not_in_dest.append(h["name"])
+
+        if self.hosts_skipped_not_in_dest:
+            print(f"  Skipping {len(self.hosts_skipped_not_in_dest)} host(s) "
+                  f"not present on destination (not migrated yet).")
+        return pairs
+
+    # ── per-host group comparison ────────────────────────────────────────────
+
+    def _sync_groups(self, src_host: Dict, dst_host: Dict):
+        host_name = src_host["name"]
+        src_id    = src_host["hostid"]
+        dst_id    = dst_host["hostid"]
+
+        try:
+            src_data = self.src.host.get(
+                hostids=[src_id], output=["hostid"],
+                selectGroups=["groupid", "name"],
+            )
+            dst_data = self.dst.host.get(
+                hostids=[dst_id], output=["hostid"],
+                selectGroups=["groupid", "name"],
+            )
+        except Exception as exc:
+            print(f"    x Host '{host_name}': fetch failed: {exc}")
+            self.totals["errors"] += 1
+            return
+
+        if not src_data or not dst_data:
+            return
+
+        src_group_names    = {g["name"] for g in src_data[0].get("groups", [])}
+        dst_groups_by_name = {g["name"]: g for g in dst_data[0].get("groups", [])}
+
+        missing = sorted(src_group_names - set(dst_groups_by_name.keys()))
+        if not missing:
+            return  # all source groups already present on destination host
+
+        # Base payload for host.update — must include all currently-assigned groups
+        groups_payload: List[Dict] = [
+            {"groupid": g["groupid"]} for g in dst_data[0].get("groups", [])
+        ]
+        newly_assigned: List[str] = []
+
+        for gname in missing:
+            if self.dry_run:
+                try:
+                    exists = self.dst.hostgroup.get(
+                        filter={"name": gname}, output=["groupid"])
+                    action = "assign" if exists else "create + assign"
+                except Exception:
+                    action = "create + assign"
+                print(f"    ~ [DRY-RUN] would {action} group '{gname}' "
+                      f"to host '{host_name}'")
+                self.totals["assigned"] += 1
+                continue
+
+            try:
+                existing = self.dst.hostgroup.get(
+                    filter={"name": gname}, output=["groupid"])
+                if existing:
+                    gid = existing[0]["groupid"]
+                else:
+                    result = self.dst.hostgroup.create(name=gname)
+                    gid    = result["groupids"][0]
+                    print(f"    + Created hostgroup '{gname}'")
+                    self.totals["groups_created"] += 1
+                groups_payload.append({"groupid": gid})
+                newly_assigned.append(gname)
+            except Exception as exc:
+                print(f"    x Failed to resolve group '{gname}' "
+                      f"for host '{host_name}': {exc}")
+                self.totals["errors"] += 1
+
+        if not self.dry_run and newly_assigned:
+            try:
+                self.dst.host.update(hostid=dst_id, groups=groups_payload)
+                for gname in newly_assigned:
+                    print(f"    ✓ Assigned '{gname}' → host '{host_name}'")
+                    self.totals["assigned"] += 1
+                self.totals["hosts_changed"] += 1
+            except Exception as exc:
+                print(f"    x Host '{host_name}': failed to apply group "
+                      f"assignments: {exc}")
+                self.totals["errors"] += len(newly_assigned)
+
+    # ── summary ──────────────────────────────────────────────────────────────
+
+    def _print_summary(self):
+        t = self.totals
+        print(f"\n  Host-group sync summary for CIA '{self.cia}'"
+              f"{' [DRY-RUN — nothing applied]' if self.dry_run else ''}:")
+        print(f"  Hosts modified  : {t['hosts_changed']}")
+        print(f"  Groups assigned : {t['assigned']}")
+        print(f"  Groups created  : {t['groups_created']}")
+        print(f"  Errors          : {t['errors']}")
+
+
+# ---------------------------------------------------------------------------
+# Custom exception
+# ---------------------------------------------------------------------------
+
+class MissingObjectsError(Exception):
+    def __init__(self, missing_objects: List[str]):
+        self.missing_objects = missing_objects
+        super().__init__(f"Missing {len(missing_objects)} objects")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_migrate_types(raw: List[str]) -> List[str]:
+    """Expand 'all' and deduplicate while preserving MIGRATION_ORDER.
+    Note: 'all' does NOT include 'usergroups' — run that explicitly.
+    """
+    expanded = set()
+    for item in raw:
+        if item == "all":
+            expanded.update(MIGRATION_ALL)
+        else:
+            expanded.add(item)
+    return [t for t in MIGRATION_ORDER if t in expanded]
+
+
+def move_groups(zapi, from_prefix: str, into_parent: str,
+                group_type: str = "host"):
+    """
+    Rename all host groups (or template groups) whose name equals from_prefix
+    or starts with from_prefix + "/" by prepending into_parent + "/" to them.
+
+    group_type: "host" or "template"
+
+    Example:
+      from_prefix  = "PRD-APP-MYS-WORKFLOW"
+      into_parent  = "PRD-APP-AGENCES-WORKFLOW"
+
+      "PRD-APP-MYS-WORKFLOW"                            -> "PRD-APP-AGENCES-WORKFLOW/PRD-APP-MYS-WORKFLOW"
+      "PRD-APP-MYS-WORKFLOW/VAL/STANDARD/CEEP8_ANCODOC" -> "PRD-APP-AGENCES-WORKFLOW/PRD-APP-MYS-WORKFLOW/VAL/STANDARD/CEEP8_ANCODOC"
+    """
+    if group_type == "template":
+        getter = zapi.templategroup
+        id_key = "groupid"
+    else:
+        getter = zapi.hostgroup
+        id_key = "groupid"
+
+    print(f"  Fetching all {group_type} groups...")
+    try:
+        all_groups = getter.get(output=["groupid", "name"])
+    except Exception as exc:
+        print(f"  ERROR: could not fetch {group_type} groups: {exc}")
+        return
+
+    prefix_exact = from_prefix
+    prefix_child = from_prefix + "/"
+
+    to_rename = [
+        g for g in all_groups
+        if g["name"] == prefix_exact or g["name"].startswith(prefix_child)
+    ]
+
+    if not to_rename:
+        print(f"  No {group_type} groups found matching '{from_prefix}' or '{from_prefix}/*'.")
+        return
+
+    print(f"  Found {len(to_rename)} group(s) to rename:")
+    renamed  = 0
+    skipped  = 0
+    failed   = 0
+
+    for grp in sorted(to_rename, key=lambda g: g["name"]):
+        old_name = grp["name"]
+        new_name = into_parent + "/" + old_name
+        gid      = grp[id_key]
+
+        # Check if the new name already exists
+        try:
+            existing = getter.get(filter={"name": new_name}, output=["groupid"])
+            if existing:
+                print(f"    ~ SKIP  '{old_name}' → '{new_name}' (already exists)")
+                skipped += 1
+                continue
+        except Exception:
+            pass
+
+        try:
+            getter.update(**{id_key: gid, "name": new_name})
+            print(f"    ✓ '{old_name}'")
+            print(f"      → '{new_name}'")
+            renamed += 1
+        except Exception as exc:
+            print(f"    ✗ '{old_name}' → '{new_name}': {exc}")
+            failed += 1
+
+    print(f"\n  Done: {renamed} renamed, {skipped} skipped (already exist), "
+          f"{failed} failed.")
+
+
+def _ask_apply_after_dryrun() -> bool:
+    """Return True if running in an interactive terminal and user answers 'y'."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        ans = input("\n  Apply changes now? [y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return ans == "y"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Migrate Zabbix objects from 6.4 to 7.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Migration order when 'all' is selected:
+  1. templates  2. hosts  3. maps  4. dashboards
+
+Examples:
+  # Pull latest code from Bitbucket (standalone)
+  python zabbix_migration_70.py --pull-repository
+
+  # Pull then immediately run a full migration
+  python zabbix_migration_70.py --pull-repository --env ppr --cia biz01 --migrate all
+
+  # Migrate everything for one CIA
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all
+
+  # Migrate only templates and hosts
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate templates hosts
+
+  # Migrate dashboards for all CIAs, skip existing ones
+  python zabbix_migration_70.py --env prd --cia all --migrate dashboards --skip-existing
+
+  # Migrate a specific dashboard by name
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate dashboards \\
+      --dashboard "CVS UAT Monitoring"
+
+  # Full migration with debug output
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --debug
+
+  # Health-check only: compare source vs destination stats (no migration)
+  python zabbix_migration_70.py --env ppr --cia biz01 --compare
+
+  # Migrate everything then immediately run the health-check
+  python zabbix_migration_70.py --env ppr --cia biz01 --migrate all --compare
+
+  # Preview which triggers/items/discovery rules would be disabled on
+  # destination (disabled on source, still enabled on destination), for one host
+  python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
+      --host SRV01 --dry-run
+
+  # Apply that sync for every host in a host group — writes a rollback JSON
+  # file next to the script listing everything it disabled
+  python zabbix_migration_70.py --env ppr --cia biz01 --sync-disabled-status \\
+      --hostgroup "PRD-APP-MYS-WORKFLOW"
+
+  # Undo it later if needed: re-enable everything from that rollback file
+  python zabbix_migration_70.py --env ppr --cia biz01 \\
+      --rollback-file rollback_sync_disabled_status_biz01_20260629_120000.json
+
+Config files (same directory as this script):
+  zabbix_credential.yml          username / password
+  zabbix_instances_ppr.yml       CIA source/destination URLs for PPR
+  zabbix_instances_prd.yml       CIA source/destination URLs for PRD
+  ../projects_branch.yml         repo name + branch for --pull-repository
+        """
+    )
+    parser.add_argument(
+        "--pull-repository", nargs="?", const="", metavar="PROJECT_NAME",
+        help=(
+            "Pull latest code from Bitbucket before running. "
+            "Optionally pass the project name (e.g. --pull-repository zabbix-python-scripts); "
+            "if omitted, the current folder name is used. "
+            "Branch is read from projects_branch.yml found by walking up from the script dir. "
+            "Can be used standalone or combined with --env / --cia / --migrate."
+        )
+    )
+    parser.add_argument(
+        "--env", default=None, choices=["ppr", "prd"],
+        help="Target environment (ppr or prd) — required when --migrate is used"
+    )
+    parser.add_argument(
+        "--cia", default=None,
+        help="CIA name (e.g. biz01) or 'all' — required when --migrate is used"
+    )
+    parser.add_argument(
+        "--migrate", default=None, nargs="+",
+        choices=["regexps", "templates", "hosts", "maps", "dashboards", "usergroups", "all"],
+        # Note: 'all' expands to templates+hosts+maps+dashboards only.
+        metavar="TYPE",
+        help="Object type(s) to migrate: templates hosts maps dashboards usergroups all"
+    )
+    parser.add_argument(
+        "--dashboard", default=None, metavar="NAME",
+        help="(dashboards only) Migrate a single dashboard by exact name"
+    )
+    parser.add_argument(
+        "--host", default=None, metavar="NAME",
+        help=(
+            "(hosts / --sync-disabled-status) Migrate a single host by exact "
+            "name, or scope --sync-disabled-status to that host"
+        )
+    )
+    parser.add_argument(
+        "--hostgroup", default=None, metavar="NAME",
+        help=(
+            "(--sync-disabled-status / --sync-hostgroups) "
+            "Limit to hosts in this host group."
+        )
+    )
+    parser.add_argument(
+        "--usergroup", default=None, metavar="NAME",
+        help="(usergroups only) Migrate a single user group by exact name"
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip objects that already exist in destination (applies to all types)"
+    )
+    parser.add_argument(
+        "--compare", nargs="*", default=None,
+        metavar="SECTION",
+        help=(
+            "Run a migration health-check comparing source vs destination stats. "
+            "Pass no value for all sections, or specify one or more section names. "
+            f"Available: {', '.join(COMPARE_ALL_SECTIONS)}.  "
+            "Examples: --compare   OR   --compare hosts items unsup-items"
+        )
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable verbose debug logging"
+    )
+    parser.add_argument(
+        "--include-disabled-hosts", action="store_true",
+        help=(
+            "Also migrate hosts that are disabled in the source. "
+            "By default only enabled hosts (status=0) are migrated."
+        )
+    )
+    parser.add_argument(
+        "--debug-json", action="store_true",
+        help=(
+            "Dump the raw JSON payload sent to the API into debug_payload.json "
+            "before each import call — useful to diagnose serialization errors"
+        )
+    )
+    parser.add_argument(
+        "--debug-widget-fields", action="store_true",
+        help=(
+            "Dump all widget field values at each pipeline stage to JSON files: "
+            "stage 1=raw source, 2=after ID→name, 3=after name→dest ID, "
+            "4=final API payload. Files are written next to the script."
+        )
+    )
+    parser.add_argument(
+        "--debug-dashboard", action="store_true",
+        help=(
+            "After each dashboard is created, fetch full dashboard.get output "
+            "from both source and destination and write them side-by-side to "
+            "dashboard_debug_<name>.json next to the script. Use this to compare "
+            "widget positions/sizes between the two versions."
+        )
+    )
+    parser.add_argument(
+        "--update-sharing", action="store_true",
+        help=(
+            "Update sharing of dashboards in DESTINATION matching --dashboard "
+            "filter. Requires --share-group. Does not re-migrate."
+        )
+    )
+    parser.add_argument(
+        "--share-group", dest="share_groups", action="append", default=[],
+        metavar="GROUP_NAME",
+        help=(
+            "Usergroup to grant Read-Write sharing on matched dashboards. "
+            "Can be specified multiple times. Used with --update-sharing."
+        )
+    )
+    parser.add_argument(
+        "--move-groups", nargs=2, metavar=("FROM_PREFIX", "INTO_PARENT"),
+        help=(
+            "Rename host/template groups: prepend INTO_PARENT/ to every group "
+            "whose name equals FROM_PREFIX or starts with FROM_PREFIX/. "
+            "Example: --move-groups PRD-APP-MYS-WORKFLOW PRD-APP-AGENCES-WORKFLOW "
+            "renames 'PRD-APP-MYS-WORKFLOW/X' -> 'PRD-APP-AGENCES-WORKFLOW/PRD-APP-MYS-WORKFLOW/X'. "
+            "Requires --env, --cia and --target (source|dest)."
+        )
+    )
+    parser.add_argument(
+        "--move-groups-target", choices=["source", "dest"], default="dest",
+        metavar="source|dest",
+        help="Which Zabbix instance to apply --move-groups on (default: dest)."
+    )
+    parser.add_argument(
+        "--sync-disabled-status", action="store_true",
+        help=(
+            "For hosts that exist in both source and destination, disable "
+            "items, triggers and discovery rules on destination that are "
+            "disabled on source but still enabled on destination. Never "
+            "re-enables anything. Scope with --host or --hostgroup; with "
+            "neither, all common hosts are processed."
+        )
+    )
+    parser.add_argument(
+        "--sync-hostgroups", action="store_true",
+        help=(
+            "For hosts that exist in both source and destination, ensure the "
+            "destination host belongs to every hostgroup the source host belongs "
+            "to. Creates missing groups on destination if needed. Never removes "
+            "groups. Scope with --host or --hostgroup; with neither, all common "
+            "hosts are processed."
+        )
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "(--sync-disabled-status / --sync-hostgroups) "
+            "Preview changes without applying them."
+        )
+    )
+    parser.add_argument(
+        "--rollback-file", default=None, metavar="FILE",
+        help=(
+            "Re-enable every object recorded in a rollback JSON file "
+            "previously written by --sync-disabled-status (only applies "
+            "entries matching the current --cia). Does not run the sync itself."
+        )
+    )
+    args = parser.parse_args()
+
+    # Logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(levelname)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+
+    # ── --pull-repository ────────────────────────────────────────────────────
+    if args.pull_repository is not None:
+        print("\n" + "=" * 70)
+        print("  Git Pull")
+        print("=" * 70)
+        ok = pull_repository(repo_name=args.pull_repository or None)
+        print("=" * 70)
+        if not ok:
+            sys.exit(1)
+        if not args.migrate:
+            sys.exit(0)
+
+    # ── Validate migration/compare args ─────────────────────────────────────
+    if (args.migrate or args.compare is not None or args.update_sharing
+            or args.move_groups or args.sync_disabled_status or args.rollback_file
+            or args.sync_hostgroups):
+        missing = []
+        if not args.env:
+            missing.append("--env")
+        if not args.cia:
+            missing.append("--cia")
+        if args.update_sharing and not args.share_groups:
+            print("ERROR: --update-sharing requires at least one --share-group.", file=sys.stderr)
+            sys.exit(1)
+        if args.move_groups and not args.env:
+            print("ERROR: --move-groups requires --env and --cia.", file=sys.stderr)
+            sys.exit(1)
+        if missing:
+            print(
+                f"ERROR: {' and '.join(missing)} "
+                f"{'is' if len(missing) == 1 else 'are'} required when --migrate, "
+                f"--compare, --update-sharing, --sync-disabled-status, "
+                f"--sync-hostgroups or --rollback-file is used.",
+                file=sys.stderr
+            )
+            sys.exit(1)
+    else:
+        # None of the action flags were given
+        if args.pull_repository is None:
+            parser.print_help()
+            sys.exit(1)
+        sys.exit(0)
+
+    # Determine which migration types to run (in canonical order)
+    types_to_run = parse_migrate_types(args.migrate) if args.migrate else []
+    if args.migrate and not types_to_run:
+        print("ERROR: no valid migration types specified.", file=sys.stderr)
+        sys.exit(1)
+
+    # Load config
+    try:
+        creds = load_credentials()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        config = load_instances(args.env)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    cia_map: Dict = config["cia"]
+
+    if args.cia == "all":
+        cia_names = list(cia_map.keys())
+    else:
+        if args.cia not in cia_map:
+            print(
+                f"ERROR: CIA '{args.cia}' not found. "
+                f"Available: {', '.join(cia_map.keys())}",
+                file=sys.stderr
+            )
+            sys.exit(1)
+        cia_names = [args.cia]
+
+    # Header
+    print("\n" + "=" * 70)
+    print(f"  Zabbix Migration 6.4 -> 7.0   [v{SCRIPT_VERSION}]")
+    print(f"  env={args.env}  cia={args.cia}", end="")
+    if types_to_run:
+        print(f"  migrate={' '.join(types_to_run)}", end="")
+    if args.compare is not None:
+        sections_disp = ", ".join(args.compare) if args.compare else "all"
+        print(f"  compare={sections_disp}", end="")
+    print()
+    if args.dashboard:
+        print(f"  dashboard filter='{args.dashboard}'")
+    if args.host:
+        print(f"  host filter='{args.host}'")
+    if args.hostgroup:
+        print(f"  hostgroup filter='{args.hostgroup}'")
+    if args.usergroup:
+        print(f"  usergroup filter='{args.usergroup}'")
+    if args.skip_existing:
+        print("  mode=skip-existing")
+    if args.include_disabled_hosts:
+        print("  mode=include-disabled-hosts")
+    if args.update_sharing:
+        print(f"  update-sharing groups: {', '.join(args.share_groups)}")
+    if args.sync_disabled_status:
+        print(f"  sync-disabled-status=on{'  mode=dry-run' if args.dry_run else ''}")
+    if args.sync_hostgroups:
+        print(f"  sync-hostgroups=on{'  mode=dry-run' if args.dry_run else ''}")
+    if args.rollback_file:
+        print(f"  rollback-file='{args.rollback_file}'")
+    print("=" * 70)
+
+    # Global totals
+    global_results: Dict[str, Dict] = {
+        t: {"migrated": 0, "skipped": 0, "failed": 0}
+        for t in MIGRATION_ORDER
+    }
+    global_counts: Dict[str, Dict] = {t: {} for t in MIGRATION_ORDER}
+
+    mlog = MigrationLog(
+        env=args.env,
+        cia=args.cia,
+        types_run=types_to_run,
+        dashboard_filter=args.dashboard,
+    )
+
+    for cia_name in cia_names:
+        cfg        = cia_map[cia_name]
+        source_url = cfg["url_export"]
+        dest_url   = cfg["url_import"]
+
+        print(f"\n{'─' * 70}")
+        print(f"  CIA   : {cia_name}")
+        print(f"  Source: {source_url}")
+        print(f"  Dest  : {dest_url}")
+        print(f"{'─' * 70}")
+
+        migrator = None
+        try:
+            migrator = ZabbixMigrator(
+                source_url=source_url,
+                dest_url=dest_url,
+                username=creds["username"],
+                password=creds["password"],
+                cia_name=cia_name,
+                skip_existing=args.skip_existing,
+                dashboard_filter=args.dashboard,
+                host_filter=args.host,
+                usergroup_filter=args.usergroup,
+                debug_json=args.debug_json,
+                debug_dashboard=args.debug_dashboard,
+                include_disabled_hosts=args.include_disabled_hosts,
+                debug_widget_fields=args.debug_widget_fields,
+                pilalert_token=creds.get("pilalert_token", ""),
+            )
+
+            # ── --move-groups ──────────────────────────────────────────────
+            if args.move_groups:
+                from_prefix = args.move_groups[0]
+                into_parent = args.move_groups[1]
+                target      = args.move_groups_target
+                zapi        = migrator.dest if target == "dest" else migrator.source
+                print(f"\n  -- MOVE GROUPS ({target.upper()}) --")
+                print(f"  From prefix : '{from_prefix}'")
+                print(f"  Into parent : '{into_parent}'")
+                for gtype in ("host", "template"):
+                    print(f"\n  [{gtype.capitalize()} groups]")
+                    move_groups(zapi, from_prefix, into_parent, group_type=gtype)
+
+            for mtype in types_to_run:
+                print(f"\n  -- {mtype.upper()} --")
+                if mtype == "regexps":
+                    migrator.migrate_regexps()
+                elif mtype == "templates":
+                    migrator.migrate_templates()
+                elif mtype == "hosts":
+                    migrator.migrate_hosts()
+                elif mtype == "maps":
+                    migrator.migrate_maps()
+                elif mtype == "dashboards":
+                    migrator.migrate_dashboards()
+                elif mtype == "usergroups":
+                    migrator.migrate_usergroups()
+
+            if args.update_sharing:
+                print(f"\n  -- UPDATE SHARING --")
+                migrator.update_dashboard_sharing(
+                    dashboard_filter=args.dashboard,
+                    group_names=args.share_groups,
+                )
+
+            if args.sync_disabled_status:
+                print(f"\n  -- SYNC DISABLED STATUS (triggers + items + discovery rules) --")
+                syncer = ZabbixStatusSync(
+                    src_api=migrator.source, dst_api=migrator.dest, cia_name=cia_name,
+                    host_filter=args.host, hostgroup_filter=args.hostgroup,
+                    dry_run=args.dry_run,
+                )
+                syncer.run()
+                if args.dry_run and _ask_apply_after_dryrun():
+                    print(f"\n  -- SYNC DISABLED STATUS (applying) --")
+                    ZabbixStatusSync(
+                        src_api=migrator.source, dst_api=migrator.dest, cia_name=cia_name,
+                        host_filter=args.host, hostgroup_filter=args.hostgroup,
+                        dry_run=False,
+                    ).run()
+
+            if args.sync_hostgroups:
+                print(f"\n  -- SYNC HOSTGROUPS --")
+                hg_syncer = ZabbixHostGroupSync(
+                    src_api=migrator.source, dst_api=migrator.dest,
+                    cia_name=cia_name,
+                    host_filter=args.host, hostgroup_filter=args.hostgroup,
+                    dry_run=args.dry_run,
+                )
+                hg_syncer.run()
+                if args.dry_run and _ask_apply_after_dryrun():
+                    print(f"\n  -- SYNC HOSTGROUPS (applying) --")
+                    ZabbixHostGroupSync(
+                        src_api=migrator.source, dst_api=migrator.dest,
+                        cia_name=cia_name,
+                        host_filter=args.host, hostgroup_filter=args.hostgroup,
+                        dry_run=False,
+                    ).run()
+
+            if args.rollback_file:
+                print(f"\n  -- ROLLBACK from '{args.rollback_file}' --")
+                rollback_status_sync(
+                    dst_api=migrator.dest, cia_name=cia_name, path=args.rollback_file,
+                )
+
+            # Run comparison after migration (or standalone when no --migrate given)
+            if args.compare is not None:
+                comp = ZabbixComparator(
+                    src_api=migrator.source,
+                    dst_api=migrator.dest,
+                    cia_name=cia_name,
+                )
+                # args.compare == [] means --compare with no args → all sections
+                # args.compare == ["hosts", ...] → selected sections only
+                comp.run(sections=args.compare if args.compare else None)
+
+        except Exception as exc:
+            print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
+            for t in types_to_run:
+                global_results[t]["failed"] += 1
+
+        finally:
+            if migrator:
+                print(f"\n  Summary for CIA '{cia_name}':")
+                migrator.print_summary(types_to_run)
+                mlog.section(cia_name, migrator)
+                for t in types_to_run:
+                    for k in ("migrated", "skipped", "failed"):
+                        global_results[t][k] += migrator.results[t][k]
+                    # Aggregate source/dest counts (sum totals across CIAs)
+                    for k, v in migrator.counts.get(t, {}).items():
+                        if isinstance(v, int) and v >= 0:
+                            global_counts[t][k] = global_counts[t].get(k, 0) + v
+                migrator.logout()
+
+    # Global migration summary — only if migration was actually run
+    if types_to_run:
+        print("\n" + "=" * 70)
+        print("  Global Summary")
+        print("=" * 70)
+        for t in types_to_run:
+            r  = global_results[t]
+            gc = global_counts[t]
+            if t == "hosts":
+                print(f"  [Source   ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('src_total','?'):5}  "
+                      f"Enabled: {gc.get('src_enabled','?'):5}  "
+                      f"Disabled: {gc.get('src_disabled','?'):5}")
+                print(f"  [Dest     ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('dst_total','?'):5}  "
+                      f"Enabled: {gc.get('dst_enabled','?'):5}  "
+                      f"Disabled: {gc.get('dst_disabled','?'):5}")
+            else:
+                print(f"  [Source   ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('src_total','?'):5}")
+                print(f"  [Dest     ] [{t.capitalize():12}] "
+                      f"Total: {gc.get('dst_total','?'):5}")
+            print(f"  [Migration] [{t.capitalize():12}] "
+                  f"Migrated: {r['migrated']:4}  "
+                  f"Skipped: {r['skipped']:4}  "
+                  f"Failed: {r['failed']:4}")
+            print()
+        print("=" * 70)
+
+    # Always flush full detail to log file
+    if types_to_run:
+        mlog.write(global_results)
+
+
+if __name__ == "__main__":
+    main()
