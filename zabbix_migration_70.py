@@ -101,7 +101,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.2"
+SCRIPT_VERSION = "2026-07-02.3"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5614,7 +5614,7 @@ Config files (same directory as this script):
     # ── Validate migration/compare args ─────────────────────────────────────
     if (args.migrate or args.compare is not None or args.update_sharing
             or args.move_groups or args.sync_disabled_status or args.rollback_file
-            or args.sync_hostgroups):
+            or args.sync_hostgroups or args.fix_templates):
         missing = []
         if not args.env:
             missing.append("--env")
