@@ -101,7 +101,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.3"
+SCRIPT_VERSION = "2026-07-02.4"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -541,6 +541,7 @@ class ZabbixMigrator:
                  skip_existing: bool = False,
                  dashboard_filter: Optional[str] = None,
                  host_filter: Optional[str] = None,
+                 template_filter: Optional[str] = None,
                  usergroup_filter: Optional[str] = None,
                  debug_json: bool = False,
                  debug_dashboard: bool = False,
@@ -551,6 +552,7 @@ class ZabbixMigrator:
         self.skip_existing          = skip_existing
         self.dashboard_filter       = dashboard_filter
         self.host_filter            = host_filter
+        self.template_filter        = template_filter
         self.usergroup_filter       = usergroup_filter
         self.debug_json             = debug_json
         self.debug_dashboard        = debug_dashboard
@@ -739,6 +741,23 @@ class ZabbixMigrator:
             return
 
         needed_list = [t for t in all_templates if t["templateid"] in needed_ids]
+
+        # ── template_filter: restrict to a single template by name ───────────
+        if self.template_filter:
+            match = [t for t in needed_list if t["name"] == self.template_filter]
+            if not match:
+                # Also try outside the "needed" set (template exists but has no host)
+                match_any = [t for t in all_templates if t["name"] == self.template_filter]
+                if match_any:
+                    print(f"  [Templates] WARNING: '{self.template_filter}' exists in source "
+                          f"but has no enabled host linked — migrating anyway (forced).")
+                    match = match_any
+                else:
+                    print(f"  [Templates] Template '{self.template_filter}' not found in source.")
+                    return
+            needed_list = match
+            needed_ids  = {t["templateid"] for t in needed_list}
+            print(f"  [Templates] Filtered to single template: '{self.template_filter}'.")
 
         # ── skip_existing: remove templates already in destination ───────────
         if self.skip_existing and needed_list:
@@ -5467,6 +5486,14 @@ Config files (same directory as this script):
         help="(usergroups only) Migrate a single user group by exact name"
     )
     parser.add_argument(
+        "--template", default=None, metavar="NAME",
+        help=(
+            "(templates only) Migrate a single template by exact name. "
+            "If the template has no enabled host linked it is migrated anyway (forced). "
+            "Example: --migrate templates --template 'TPL.LNX.LINUX'"
+        )
+    )
+    parser.add_argument(
         "--skip-existing", action="store_true",
         help="Skip objects that already exist in destination (applies to all types)"
     )
@@ -5745,6 +5772,7 @@ Config files (same directory as this script):
                 skip_existing=args.skip_existing,
                 dashboard_filter=args.dashboard,
                 host_filter=args.host,
+                template_filter=args.template,
                 usergroup_filter=args.usergroup,
                 debug_json=args.debug_json,
                 debug_dashboard=args.debug_dashboard,
