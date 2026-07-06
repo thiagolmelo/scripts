@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.12-debug"
+SCRIPT_VERSION = "2026-07-02.12"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -4739,44 +4739,70 @@ class ZabbixComparator:
                                 data["error"].get("message", str(data["error"])))
             return data.get("result", [])
 
-        def _count_objects(result_list) -> dict:
+        def _count_objects(result_data) -> dict:
             """
             Parse importcompare result into counts per object type.
 
-            Zabbix 7.0 importcompare result entries can be:
-              - dict: {"type":"...", "name":"...", "data":{"new":{}, "current":{}}}
-              - str:  path like ".../items/item(3)" when template is new in dest
+            Zabbix 7.0 importcompare returns a DICT keyed by object type:
+              {
+                "templates": [{"name": "...", "data": {"new": {...}}}, ...],
+                "items":     [{"name": "...", "data": {"new": {...}, "current": {...}}}, ...],
+                "triggers":  [...],
+                ...
+              }
+
+            An entry with only "new" key in data = object is new in source.
+            An entry with both "new" and "current" keys = object exists but changed.
 
             Returns {type_label: {"new": n, "changed": n}}.
             """
-            if not result_list:
+            if not result_data:
                 return {}
+
             counts: dict = {}
-            for entry in result_list:
-                if isinstance(entry, str):
-                    # Extract type from path e.g. ".../items/item(3)" -> "items"
-                    import re as _re2
-                    m = _re2.search(r'/([^/]+)/[^/]+[(][0-9]+[)]$', entry)
-                    otype = m.group(1) if m else "unknown"
-                    if otype not in counts:
-                        counts[otype] = {"new": 0, "changed": 0}
-                    counts[otype]["new"] += 1
-                elif isinstance(entry, dict):
-                    otype = entry.get("type", "unknown")
-                    data  = entry.get("data", {})
-                    if otype not in counts:
-                        counts[otype] = {"new": 0, "changed": 0}
-                    if not isinstance(data, dict) or "current" not in data:
+
+            # Handle dict structure (normal case)
+            if isinstance(result_data, dict):
+                for otype, entries in result_data.items():
+                    if not isinstance(entries, list):
+                        continue
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        data = entry.get("data", {})
+                        if otype not in counts:
+                            counts[otype] = {"new": 0, "changed": 0}
+                        if isinstance(data, dict) and "current" in data:
+                            counts[otype]["changed"] += 1
+                        else:
+                            counts[otype]["new"] += 1
+                return counts
+
+            # Fallback: flat list (older API versions)
+            if isinstance(result_data, list):
+                for entry in result_data:
+                    if isinstance(entry, str):
+                        import re as _re2
+                        m = _re2.search(r'/([^/]+)/[^/]+[(][0-9]+[)]$', entry)
+                        otype = m.group(1) if m else "unknown"
+                        if otype not in counts:
+                            counts[otype] = {"new": 0, "changed": 0}
                         counts[otype]["new"] += 1
-                    else:
-                        counts[otype]["changed"] += 1
+                    elif isinstance(entry, dict):
+                        otype = entry.get("type", "unknown")
+                        data  = entry.get("data", {})
+                        if otype not in counts:
+                            counts[otype] = {"new": 0, "changed": 0}
+                        if isinstance(data, dict) and "current" in data:
+                            counts[otype]["changed"] += 1
+                        else:
+                            counts[otype]["new"] += 1
+
             return counts
 
-        drifted        = []
-        errors         = []
-        ok_count       = 0
-        _debug_dumped  = [False]   # mutable flag for first-result debug
-        _debug_sample  = [None]    # first 5 entries of first non-empty result
+        drifted  = []
+        errors   = []
+        ok_count = 0
 
         for i, (tname, tid) in enumerate(to_compare, 1):
             if i % 50 == 0 or i == len(to_compare):
@@ -4786,9 +4812,6 @@ class ZabbixComparator:
                 exported = _raw_export_src(tid)
                 result   = _importcompare(exported)
                 # Debug: dump first non-empty result to understand real structure
-                if not _debug_dumped[0]:
-                    _debug_dumped[0] = True
-                    _debug_sample[0] = result
                 counts   = _count_objects(result)
                 if counts:
                     drifted.append((tname, counts))
@@ -4798,18 +4821,6 @@ class ZabbixComparator:
                 errors.append((tname, str(exc)))
                 continue
 
-        if _debug_sample[0] is not None:
-            import json as _jdp
-            _ds = _debug_sample[0]
-            print(f"  [DEBUG] result type={type(_ds).__name__}  len/keys={len(_ds) if hasattr(_ds,'__len__') else '?'}")
-            if isinstance(_ds, dict):
-                for _k, _v in list(_ds.items())[:3]:
-                    print(f"    key={_k!r}  val_type={type(_v).__name__}  val={repr(_v)[:300]}")
-            elif isinstance(_ds, list):
-                for _e in _ds[:3]:
-                    print(f"    entry type={type(_e).__name__}  repr={repr(_e)[:300]}")
-            else:
-                print(f"    raw={repr(_ds)[:500]}")
         print(f"  Templates identical       : {ok_count}")
         print(f"  Templates with drift      : {len(drifted)}")
         print(f"  Errors during compare     : {len(errors)}")
