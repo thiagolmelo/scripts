@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.10"
+SCRIPT_VERSION = "2026-07-02.11"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -3940,10 +3940,16 @@ class ZabbixComparator:
     _GRN    = "\033[92m"
     _RST    = "\033[0m"
 
-    def __init__(self, src_api, dst_api, cia_name: str):
-        self.src  = src_api
-        self.dst  = dst_api
-        self.cia  = cia_name
+    def __init__(self, src_api, dst_api, cia_name: str,
+                 dst_url: str = "", dst_token: str = "",
+                 src_url: str = "", src_token: str = ""):
+        self.src        = src_api
+        self.dst        = dst_api
+        self.cia        = cia_name
+        self._dst_url   = dst_url
+        self._dst_token = dst_token
+        self._src_url   = src_url
+        self._src_token = src_token
         self._warnings: List[str] = []
 
     # ── public entry point ───────────────────────────────────────────────────
@@ -4660,7 +4666,6 @@ class ZabbixComparator:
                           if name in dst_tpl_names]
 
         print(f"  Used templates in source  : {src_total}")
-        print(f"  Missing in dest           : {len(missing_in_dst)}")
         print(f"  To compare via importcompare: {len(to_compare)}")
 
         # importcompare rules — enable all object types so every diff is captured
@@ -4677,19 +4682,46 @@ class ZabbixComparator:
             "valueMaps":          {"createMissing": True, "updateExisting": True},
         }
 
-        # dest raw API details (for direct HTTP call — importcompare not in pyzabbix)
-        dst_url   = self.dst._base_url if hasattr(self.dst, "_base_url") else None
-        dst_token = None
-        # Try to get token from pyzabbix internals
-        for attr in ("_ZabbixAPI__token", "token", "_token", "auth"):
-            if hasattr(self.dst, attr):
-                dst_token = getattr(self.dst, attr)
-                break
+        dst_url   = self._dst_url
+        dst_token = self._dst_token
+        src_url   = self._src_url
+        src_token = self._src_token
+
+        def _raw_export_src(tid: str) -> str:
+            api_url = src_url.rstrip("/") + "/api_jsonrpc.php"
+            payload = _json.dumps({
+                "jsonrpc": "2.0", "method": "configuration.export",
+                "id": 1, "auth": src_token,
+                "params": {"format": "yaml", "options": {"templates": [tid]}}
+            })
+            r = _req.post(api_url, data=payload,
+                          headers={"Content-Type": "application/json"},
+                          timeout=120, verify=False)
+            r.raise_for_status()
+            rd = r.json()
+            if "error" in rd:
+                raise Exception(rd["error"].get("data") or
+                                rd["error"].get("message", str(rd["error"])))
+            raw = rd.get("result", "")
+            if not isinstance(raw, str):
+                raw = _json.dumps(raw)
+            # Apply YAML colour + bool fix and formulaid fix
+            import re as _rclr
+            raw = _rclr.sub(
+                r'^(\s*(?:-\s+)?\w*color\s*:\s*)([0-9A-Fa-f]{6})\s*$',
+                lambda m: m.group(1) + "'" + m.group(2) + "'",
+                raw, flags=_rclr.MULTILINE | _rclr.IGNORECASE)
+            raw = _rclr.sub(
+                r'^(\s*(?:-\s+)?\w+\s*:\s*)(YES|NO)\s*$',
+                lambda m: m.group(1) + "'" + m.group(2) + "'",
+                raw, flags=_rclr.MULTILINE)
+            raw, _ = _fix_yaml_lld_formulaid(raw)
+            return raw
 
         def _importcompare(exported_yaml: str):
-            """Call configuration.importcompare on dest and return result list."""
-            if dst_url is None or dst_token is None:
-                raise RuntimeError("Cannot determine dest URL or token for importcompare")
+            """Call configuration.importcompare on dest; return result list."""
+            if not dst_url or not dst_token:
+                raise RuntimeError("dst_url/dst_token not set on ZabbixComparator")
             api_url = dst_url.rstrip("/") + "/api_jsonrpc.php"
             payload = _json.dumps({
                 "jsonrpc": "2.0", "method": "configuration.importcompare",
@@ -4749,9 +4781,7 @@ class ZabbixComparator:
                 print(f"  Progress: {i}/{len(to_compare)} "
                       f"({len(drifted)} with drift so far)...")
             try:
-                # Use _raw_export — reliable HTTP direct call,
-                # already applies _prequote_zabbix_yaml + _fix_yaml_lld_formulaid
-                exported = self._raw_export("templates", [tid], fmt="yaml")
+                exported = _raw_export_src(tid)
                 result   = _importcompare(exported)
                 counts   = _count_objects(result)
                 if counts:
@@ -4769,7 +4799,6 @@ class ZabbixComparator:
         lines = [
             f"=== TEMPLATE OBJECT DRIFT (via importcompare)  (CIA: {self.cia}) ===",
             f"Used templates in source : {src_total}",
-            f"Missing in dest          : {len(missing_in_dst)}",
             f"Identical                : {ok_count}",
             f"With object drift        : {len(drifted)}",
             f"Compare errors           : {len(errors)}",
@@ -4781,13 +4810,7 @@ class ZabbixComparator:
             "",
         ]
 
-        if missing_in_dst:
-            self._warnings.append(
-                f"template-objects: {len(missing_in_dst)} template(s) missing in dest")
-            lines.append(f"MISSING IN DEST ({len(missing_in_dst)}):")
-            for t in missing_in_dst:
-                lines.append(f"  - {t}")
-            lines.append("")
+        # MISSING IN DEST not reported here (use --list-orphan-templates)
 
         if drifted:
             self._warnings.append(
@@ -6100,6 +6123,10 @@ Config files (same directory as this script):
                     src_api=migrator.source,
                     dst_api=migrator.dest,
                     cia_name=cia_name,
+                    dst_url=migrator._dest_url,
+                    dst_token=migrator._dest_token,
+                    src_url=migrator._source_url,
+                    src_token=migrator._src_token,
                 )
                 # args.compare == [] means --compare with no args → all sections
                 # args.compare == ["hosts", ...] → selected sections only
