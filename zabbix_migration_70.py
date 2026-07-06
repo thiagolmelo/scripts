@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.11"
+SCRIPT_VERSION = "2026-07-02.12-debug"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -4772,9 +4772,11 @@ class ZabbixComparator:
                         counts[otype]["changed"] += 1
             return counts
 
-        drifted      = []
-        errors       = []
-        ok_count     = 0
+        drifted        = []
+        errors         = []
+        ok_count       = 0
+        _debug_dumped  = [False]   # mutable flag for first-result debug
+        _debug_sample  = [None]    # first 5 entries of first non-empty result
 
         for i, (tname, tid) in enumerate(to_compare, 1):
             if i % 50 == 0 or i == len(to_compare):
@@ -4783,6 +4785,11 @@ class ZabbixComparator:
             try:
                 exported = _raw_export_src(tid)
                 result   = _importcompare(exported)
+                # Debug: dump first non-empty result to understand real structure
+                if result and not _debug_dumped[0]:
+                    import json as _jd
+                    _debug_dumped[0] = True
+                    _debug_sample[0] = result[:5]  # first 5 entries
                 counts   = _count_objects(result)
                 if counts:
                     drifted.append((tname, counts))
@@ -4792,6 +4799,11 @@ class ZabbixComparator:
                 errors.append((tname, str(exc)))
                 continue
 
+        if _debug_sample[0]:
+            import json as _jdp
+            print("  [DEBUG] importcompare sample (first 5 entries):")
+            for _e in _debug_sample[0]:
+                print(f"    type={type(_e).__name__}  repr={repr(_e)[:200]}")
         print(f"  Templates identical       : {ok_count}")
         print(f"  Templates with drift      : {len(drifted)}")
         print(f"  Errors during compare     : {len(errors)}")
