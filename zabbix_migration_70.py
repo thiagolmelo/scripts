@@ -4786,10 +4786,9 @@ class ZabbixComparator:
                 exported = _raw_export_src(tid)
                 result   = _importcompare(exported)
                 # Debug: dump first non-empty result to understand real structure
-                if result and not _debug_dumped[0]:
-                    import json as _jd
+                if not _debug_dumped[0]:
                     _debug_dumped[0] = True
-                    _debug_sample[0] = result[:5]  # first 5 entries
+                    _debug_sample[0] = result
                 counts   = _count_objects(result)
                 if counts:
                     drifted.append((tname, counts))
@@ -4799,11 +4798,18 @@ class ZabbixComparator:
                 errors.append((tname, str(exc)))
                 continue
 
-        if _debug_sample[0]:
+        if _debug_sample[0] is not None:
             import json as _jdp
-            print("  [DEBUG] importcompare sample (first 5 entries):")
-            for _e in _debug_sample[0]:
-                print(f"    type={type(_e).__name__}  repr={repr(_e)[:200]}")
+            _ds = _debug_sample[0]
+            print(f"  [DEBUG] result type={type(_ds).__name__}  len/keys={len(_ds) if hasattr(_ds,'__len__') else '?'}")
+            if isinstance(_ds, dict):
+                for _k, _v in list(_ds.items())[:3]:
+                    print(f"    key={_k!r}  val_type={type(_v).__name__}  val={repr(_v)[:300]}")
+            elif isinstance(_ds, list):
+                for _e in _ds[:3]:
+                    print(f"    entry type={type(_e).__name__}  repr={repr(_e)[:300]}")
+            else:
+                print(f"    raw={repr(_ds)[:500]}")
         print(f"  Templates identical       : {ok_count}")
         print(f"  Templates with drift      : {len(drifted)}")
         print(f"  Errors during compare     : {len(errors)}")
