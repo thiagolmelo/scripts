@@ -102,93 +102,103 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
     Workaround for Zabbix bug ZBX-19968:
       "Invalid tag .../filter/conditions/condition(N): the tag 'formulaid' is missing"
 
-    When importing templates/hosts exported from older Zabbix versions (2.x–6.4)
-    into Zabbix 7.0, LLD rule filter conditions that were created with evaltype=0
-    (AND_OR) may have their 'formulaid' field missing. Zabbix 7.0 requires it.
+    When importing templates/hosts exported from older Zabbix versions (2.x-6.4)
+    into Zabbix 7.0, LLD rule filter conditions may have their 'formulaid' field
+    missing. Zabbix 7.0 requires it.
 
-    Fix: parse the YAML, walk every discovery_rule.filter.conditions list, and
-    inject 'formulaid: A', 'formulaid: B', ... for any condition that lacks it.
-    The formulaid is only meaningful when evaltype is CUSTOM_EXPRESSION (1);
-    for AND_OR (0) Zabbix itself assigns A/B/C/... sequentially, so we mirror
-    that logic.
+    Implementation: pure regex/text manipulation — deliberately avoids
+    yaml.safe_load + yaml.dump because PyYAML re-serialisation corrupts hex
+    colour values (e.g. '00AA00' loses its quotes and becomes a bare string
+    that later passes through the pipeline unprotected).
 
-    Returns (fixed_yaml_text, n_fixed) where n_fixed is the number of conditions
-    patched. If n_fixed == 0 the original text is returned unchanged.
+    Injects 'formulaid: A', 'formulaid: B', ... into every condition item
+    inside a 'conditions:' block that does not already have formulaid.
+
+    Returns (fixed_yaml_text, n_fixed).  n_fixed == 0 means no change.
     """
-    import yaml as _yaml
-
-    # Fast path — skip YAML parse if no conditions block present at all
-    if "formulaid" in yaml_text or "conditions:" not in yaml_text:
-        # Already has formulaid everywhere, or no conditions block — nothing to do
-        # (still need to check in case some conditions have it and others don't)
-        if "formulaid" in yaml_text and yaml_text.count("conditions:") == yaml_text.count("formulaid"):
-            return yaml_text, 0
-
-    try:
-        data = _yaml.safe_load(yaml_text)
-    except Exception:
-        # If YAML parse fails, return as-is — _raw_import will surface the real error
+    if "conditions:" not in yaml_text:
         return yaml_text, 0
 
-    if not isinstance(data, dict):
-        return yaml_text, 0
-
+    lines   = yaml_text.splitlines(keepends=True)
+    out     = []
     n_fixed = 0
-    root    = data.get("zabbix_export", data)
+    i       = 0
 
-    def _fix_conditions(conditions: list) -> int:
-        """Inject formulaid A/B/C/... into conditions that lack it. Returns fix count."""
-        fixed = 0
-        for idx, cond in enumerate(conditions):
-            if isinstance(cond, dict) and "formulaid" not in cond:
-                # Assign A, B, C, ... (wrap at Z with AA, AB, ... — extremely unlikely)
-                label_idx = idx % 26
-                label     = chr(ord("A") + label_idx)
-                cond["formulaid"] = label
-                fixed += 1
-        return fixed
+    while i < len(lines):
+        line = lines[i]
 
-    def _walk(obj):
-        nonlocal n_fixed
-        if isinstance(obj, dict):
-            # discovery_rules can appear under templates, hosts
-            for dr_list_key in ("discovery_rules",):
-                dr_list = obj.get(dr_list_key)
-                if isinstance(dr_list, list):
-                    for dr in dr_list:
-                        if isinstance(dr, dict):
-                            flt = dr.get("filter")
-                            if isinstance(flt, dict):
-                                conds = flt.get("conditions")
-                                if isinstance(conds, list) and conds:
-                                    n_fixed += _fix_conditions(conds)
-            # Recurse into all values
-            for v in obj.values():
-                _walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _walk(item)
+        # Detect "conditions:" block
+        m_cond = re.match(r'^(\s*)conditions:\s*$', line)
+        if m_cond:
+            out.append(line)
+            i += 1
+            base_indent      = len(m_cond.group(1))
+            condition_letter = 0
 
-    _walk(root)
+            while i < len(lines):
+                cline     = lines[i]
+                stripped  = cline.lstrip()
+                cur_indent = len(cline) - len(stripped)
 
-    if n_fixed == 0:
-        return yaml_text, 0
+                # Blank line — keep, continue
+                if not stripped:
+                    out.append(cline)
+                    i += 1
+                    continue
 
-    # Re-serialise — use yaml.dump which produces clean YAML
-    # Preserve the original structure; only re-dump if we actually patched something
-    try:
-        fixed_text = _yaml.dump(data, allow_unicode=True, default_flow_style=False,
-                                sort_keys=False, width=4096)
-        return fixed_text, n_fixed
-    except Exception:
-        return yaml_text, 0
+                # Left the conditions block
+                if cur_indent <= base_indent and not stripped.startswith("-"):
+                    break
+
+                # New condition item: "- " at expected indent
+                if stripped.startswith("- ") and cur_indent == base_indent + 2:
+                    # Collect all lines belonging to this condition item
+                    item_lines = [cline]
+                    i += 1
+                    while i < len(lines):
+                        nl        = lines[i]
+                        nstripped = nl.lstrip()
+                        nindent   = len(nl) - len(nstripped)
+                        # Next item or end of block
+                        if (nstripped.startswith("- ") and nindent == base_indent + 2):
+                            break
+                        if (nindent <= base_indent and nstripped
+                                and not nstripped.startswith("#")):
+                            break
+                        item_lines.append(nl)
+                        i += 1
+
+                    has_formulaid = any("formulaid:" in l for l in item_lines)
+                    if not has_formulaid:
+                        # Determine property indent from first non-dash content line
+                        prop_indent = base_indent + 4
+                        for il in item_lines:
+                            s = il.lstrip()
+                            if s and not s.startswith("-"):
+                                prop_indent = len(il) - len(s)
+                                break
+                        label = chr(ord("A") + (condition_letter % 26))
+                        item_lines.append(" " * prop_indent + "formulaid: " + label + "\n")
+                        n_fixed += 1
+
+                    condition_letter += 1
+                    out.extend(item_lines)
+                else:
+                    out.append(cline)
+                    i += 1
+            continue
+
+        out.append(line)
+        i += 1
+
+    return "".join(out), n_fixed
 
 # ---------------------------------------------------------------------------
 # Script version — bump this on every change so the printed header makes it
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.7"
+SCRIPT_VERSION = "2026-07-02.8"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -817,7 +827,9 @@ class ZabbixMigrator:
 
         # ── 4. Report skipped templates ──────────────────────────────────────
         not_needed = [t for t in all_templates if t["templateid"] not in needed_ids]
-        if not_needed:
+        if not_needed and not self.template_filter:
+            # Only report skipped templates when migrating the full set.
+            # When --template NAME is used, skipping the rest is expected — suppress.
             self.skipped_templates = [t["name"] for t in not_needed]
             print(f"  [Templates] Skipping {len(not_needed)} template(s) "
                   f"not linked to any enabled host (directly or indirectly).")
