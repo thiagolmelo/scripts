@@ -101,7 +101,7 @@ def _prequote_zabbix_yaml(text: str) -> str:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-03-19.5"
+SCRIPT_VERSION = "2026-07-02.5"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -541,6 +541,7 @@ class ZabbixMigrator:
                  skip_existing: bool = False,
                  dashboard_filter: Optional[str] = None,
                  host_filter: Optional[str] = None,
+                 template_filter: Optional[str] = None,
                  usergroup_filter: Optional[str] = None,
                  debug_json: bool = False,
                  debug_dashboard: bool = False,
@@ -551,6 +552,7 @@ class ZabbixMigrator:
         self.skip_existing          = skip_existing
         self.dashboard_filter       = dashboard_filter
         self.host_filter            = host_filter
+        self.template_filter        = template_filter
         self.usergroup_filter       = usergroup_filter
         self.debug_json             = debug_json
         self.debug_dashboard        = debug_dashboard
@@ -739,6 +741,23 @@ class ZabbixMigrator:
             return
 
         needed_list = [t for t in all_templates if t["templateid"] in needed_ids]
+
+        # ── template_filter: restrict to a single template by name ───────────
+        if self.template_filter:
+            match = [t for t in needed_list if t["name"] == self.template_filter]
+            if not match:
+                # Also try outside the "needed" set (template exists but has no host)
+                match_any = [t for t in all_templates if t["name"] == self.template_filter]
+                if match_any:
+                    print(f"  [Templates] WARNING: '{self.template_filter}' exists in source "
+                          f"but has no enabled host linked — migrating anyway (forced).")
+                    match = match_any
+                else:
+                    print(f"  [Templates] Template '{self.template_filter}' not found in source.")
+                    return
+            needed_list = match
+            needed_ids  = {t["templateid"] for t in needed_list}
+            print(f"  [Templates] Filtered to single template: '{self.template_filter}'.")
 
         # ── skip_existing: remove templates already in destination ───────────
         if self.skip_existing and needed_list:
@@ -3727,6 +3746,9 @@ COMPARE_ALL_SECTIONS = [
     "hosts", "templates", "items", "item-types", "unsup-types",
     "triggers", "discovery-rules", "unsup-items", "unsup-rules",
     "graphs", "host-groups", "maps", "dashboards", "proxies", "user-groups",
+    # deep-validation sections (object-level diff, generate report file)
+    "hosts-missing", "hosts-templates", "hosts-groups",
+    "template-objects", "group-host-count", "agent-triggers",
 ]
 
 # Item type IDs that exist in 6.4 but were unified in 7.0
@@ -3840,6 +3862,13 @@ class ZabbixComparator:
             ("dashboards",      "DASHBOARDS",                     self._section_dashboards,            "table"),
             ("proxies",         "PROXIES",                        self._section_proxies,               "table"),
             ("user-groups",     "USER GROUPS",                    self._section_user_groups,           "table"),
+            # ── deep-validation sections ─────────────────────────────────
+            ("hosts-missing",    "HOSTS MISSING IN DEST",           self._report_hosts_missing,          "report"),
+            ("hosts-templates",  "HOST→TEMPLATE DRIFT",             self._report_hosts_templates,        "report"),
+            ("hosts-groups",     "HOST→HOSTGROUP DRIFT",            self._report_hosts_groups,           "report"),
+            ("template-objects", "TEMPLATE OBJECT COUNTS",          self._report_template_objects,       "report"),
+            ("group-host-count", "HOSTGROUP ENABLED-HOST COUNTS",   self._report_group_host_count,       "report"),
+            ("agent-triggers",   "AGENT-UNAVAILABLE TRIGGERS",      self._report_agent_triggers,         "report"),
         ]
 
         print(f"\n{'═' * 74}")
@@ -4309,6 +4338,496 @@ class ZabbixComparator:
 
     def _report_top_unsupported_rules(self):
         self._report_top_unsupported("discoveryrule.get", "discovery rule")
+
+    # ── deep-validation report methods ───────────────────────────────────────
+
+    def _report_hosts_missing(self):
+        """
+        List every enabled host (flags=0) present in source but absent in dest.
+        Also lists hosts present in dest but absent in source (unexpected).
+        Writes a report file: compare_hosts_missing_<cia>.txt
+        """
+        print()
+        src_hosts = {h["host"]: h for h in self.src.host.get(
+            output=["hostid", "host", "name", "status", "flags"],
+            filter={"flags": "0"})}
+        dst_hosts = {h["host"]: h for h in self.dst.host.get(
+            output=["hostid", "host", "name", "status", "flags"],
+            filter={"flags": "0"})}
+
+        src_enabled = {k for k, v in src_hosts.items() if str(v["status"]) == "0"}
+        dst_enabled = {k for k, v in dst_hosts.items() if str(v["status"]) == "0"}
+        dst_all     = set(dst_hosts.keys())
+
+        missing      = sorted(src_enabled - dst_all)
+        unexpected   = sorted(dst_enabled - set(src_hosts.keys()))
+
+        print(f"  Source enabled hosts : {len(src_enabled)}")
+        print(f"  Dest   all hosts     : {len(dst_all)}")
+        print(f"  Missing in dest      : {len(missing)}")
+        print(f"  Unexpected in dest   : {len(unexpected)}")
+
+        lines = [
+            f"=== HOSTS MISSING IN DESTINATION  (CIA: {self.cia}) ===",
+            f"Source enabled : {len(src_enabled)}",
+            f"Dest all       : {len(dst_all)}",
+            "",
+        ]
+        if missing:
+            lines.append(f"MISSING ({len(missing)}):")
+            for h in missing:
+                lines.append(f"  - {h}")
+            self._warnings.append(f"hosts-missing: {len(missing)} host(s) absent from dest")
+        else:
+            lines.append("MISSING: none  ✓")
+
+        if unexpected:
+            lines += ["", f"UNEXPECTED IN DEST ({len(unexpected)}) — not in source:"]
+            for h in unexpected:
+                lines.append(f"  + {h}")
+
+        self._write_report("hosts_missing", lines)
+
+    def _report_hosts_templates(self):
+        """
+        For every enabled host in source, compare the set of linked templates
+        with the destination counterpart. Reports drift (added/removed templates).
+        """
+        print()
+        src_hosts = self.src.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectParentTemplates=["templateid", "name"])
+        dst_hosts = self.dst.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectParentTemplates=["templateid", "name"])
+
+        dst_by_name = {h["host"]: {t["name"] for t in h.get("parentTemplates", [])}
+                       for h in dst_hosts}
+
+        drifted = []
+        missing_in_dst = []
+        for h in src_hosts:
+            hname = h["host"]
+            src_tpls = {t["name"] for t in h.get("parentTemplates", [])}
+            if hname not in dst_by_name:
+                missing_in_dst.append(hname)
+                continue
+            dst_tpls = dst_by_name[hname]
+            added   = dst_tpls - src_tpls
+            removed = src_tpls - dst_tpls
+            if added or removed:
+                drifted.append((hname, sorted(removed), sorted(added)))
+
+        print(f"  Source enabled hosts checked : {len(src_hosts)}")
+        print(f"  Hosts missing in dest        : {len(missing_in_dst)}")
+        print(f"  Hosts with template drift    : {len(drifted)}")
+
+        lines = [
+            f"=== HOST→TEMPLATE DRIFT  (CIA: {self.cia}) ===",
+            f"Source enabled hosts : {len(src_hosts)}",
+            f"Missing in dest      : {len(missing_in_dst)}",
+            f"Template drift       : {len(drifted)}",
+            "",
+        ]
+        if drifted:
+            self._warnings.append(f"hosts-templates: {len(drifted)} host(s) with template drift")
+            for hname, removed, added in drifted:
+                lines.append(f"HOST: {hname}")
+                for t in removed:
+                    lines.append(f"  - REMOVED: {t}")
+                for t in added:
+                    lines.append(f"  + ADDED  : {t}")
+                lines.append("")
+        else:
+            lines.append("No template drift found  ✓")
+
+        self._write_report("hosts_templates", lines)
+
+    def _report_hosts_groups(self):
+        """
+        For every enabled host in source, compare the set of hostgroups
+        with the destination. Reports drift (added/removed groups).
+        """
+        print()
+        src_hosts = self.src.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectGroups=["groupid", "name"])
+        dst_hosts = self.dst.host.get(
+            output=["hostid", "host"],
+            filter={"status": "0", "flags": "0"},
+            selectGroups=["groupid", "name"])
+
+        dst_by_name = {h["host"]: {g["name"] for g in h.get("groups", [])}
+                       for h in dst_hosts}
+
+        drifted = []
+        missing_in_dst = []
+        for h in src_hosts:
+            hname = h["host"]
+            src_grps = {g["name"] for g in h.get("groups", [])}
+            if hname not in dst_by_name:
+                missing_in_dst.append(hname)
+                continue
+            dst_grps = dst_by_name[hname]
+            added   = dst_grps - src_grps
+            removed = src_grps - dst_grps
+            if added or removed:
+                drifted.append((hname, sorted(removed), sorted(added)))
+
+        print(f"  Source enabled hosts checked : {len(src_hosts)}")
+        print(f"  Hosts missing in dest        : {len(missing_in_dst)}")
+        print(f"  Hosts with group drift       : {len(drifted)}")
+
+        lines = [
+            f"=== HOST→HOSTGROUP DRIFT  (CIA: {self.cia}) ===",
+            f"Source enabled hosts : {len(src_hosts)}",
+            f"Missing in dest      : {len(missing_in_dst)}",
+            f"Group drift          : {len(drifted)}",
+            "",
+        ]
+        if drifted:
+            self._warnings.append(f"hosts-groups: {len(drifted)} host(s) with hostgroup drift")
+            for hname, removed, added in drifted:
+                lines.append(f"HOST: {hname}")
+                for g in removed:
+                    lines.append(f"  - REMOVED: {g}")
+                for g in added:
+                    lines.append(f"  + ADDED  : {g}")
+                lines.append("")
+        else:
+            lines.append("No hostgroup drift found  ✓")
+
+        self._write_report("hosts_groups", lines)
+
+    def _report_template_objects(self):
+        """
+        For every template present in source (that is in the "used" set),
+        export it from source and call configuration.importcompare on destination.
+
+        importcompare returns a structured diff with "new" and "changed" entries
+        for every object type — items, triggers, graphs, LLD rules, item/trigger/
+        graph prototypes, web scenarios, web scenario steps, template dashboards,
+        macros, value maps — covering ALL object types in one API call without
+        performing any actual import.
+
+        A template with ANY changed or new objects is reported as drifted.
+        Templates missing from destination are reported separately.
+        """
+        import json as _json
+        import requests as _req
+
+        print()
+
+        # Use the same "used" set as migrate_templates to avoid false positives
+        # for templates intentionally not migrated (no host link)
+        used_tpl_ids = self._build_transitively_used_templates(self.src)
+        src_all_tpls = self.src.template.get(output=["templateid", "name"])
+        src_tpls = {t["name"]: t["templateid"]
+                    for t in src_all_tpls
+                    if t["templateid"] in used_tpl_ids}
+
+        dst_tpl_names = {t["name"]
+                         for t in self.dst.template.get(output=["name"])}
+
+        src_total      = len(src_tpls)
+        missing_in_dst = sorted(n for n in src_tpls if n not in dst_tpl_names)
+        to_compare     = [(name, tid) for name, tid in sorted(src_tpls.items())
+                          if name in dst_tpl_names]
+
+        print(f"  Used templates in source  : {src_total}")
+        print(f"  Missing in dest           : {len(missing_in_dst)}")
+        print(f"  To compare via importcompare: {len(to_compare)}")
+
+        # importcompare rules — enable all object types so every diff is captured
+        COMPARE_RULES = {
+            "template_groups":    {"createMissing": True, "updateExisting": True},
+            "templates":          {"createMissing": True, "updateExisting": True},
+            "templateDashboards": {"createMissing": True, "updateExisting": True, "deleteMissing": True},
+            "templateLinkage":    {"createMissing": True, "deleteMissing": True},
+            "items":              {"createMissing": True, "updateExisting": True, "deleteMissing": True},
+            "triggers":           {"createMissing": True, "updateExisting": True, "deleteMissing": True},
+            "graphs":             {"createMissing": True, "updateExisting": True, "deleteMissing": True},
+            "discoveryRules":     {"createMissing": True, "updateExisting": True, "deleteMissing": True},
+            "httptests":          {"createMissing": True, "updateExisting": True, "deleteMissing": True},
+            "valueMaps":          {"createMissing": True, "updateExisting": True},
+        }
+
+        # dest raw API details (for direct HTTP call — importcompare not in pyzabbix)
+        dst_url   = self.dst._base_url if hasattr(self.dst, "_base_url") else None
+        dst_token = None
+        # Try to get token from pyzabbix internals
+        for attr in ("_ZabbixAPI__token", "token", "_token", "auth"):
+            if hasattr(self.dst, attr):
+                dst_token = getattr(self.dst, attr)
+                break
+
+        def _importcompare(exported_yaml: str):
+            """Call configuration.importcompare on dest and return result list."""
+            if dst_url is None or dst_token is None:
+                raise RuntimeError("Cannot determine dest URL or token for importcompare")
+            api_url = dst_url.rstrip("/") + "/api_jsonrpc.php"
+            payload = _json.dumps({
+                "jsonrpc": "2.0", "method": "configuration.importcompare",
+                "id": 1, "auth": dst_token,
+                "params": {"format": "yaml", "source": exported_yaml,
+                           "rules": COMPARE_RULES}
+            })
+            resp = _req.post(api_url, data=payload,
+                             headers={"Content-Type": "application/json"},
+                             timeout=60, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                raise Exception(data["error"].get("data") or
+                                data["error"].get("message", str(data["error"])))
+            return data.get("result", [])
+
+        def _count_objects(result_list: list) -> dict:
+            """
+            Parse importcompare result into counts per object type.
+            Each entry: {"type": "...", "name": "...", "data": {"new":{}, "current":{}}}
+            We count entries that have "new" (=created) or differ between new/current
+            (=changed). Returned as {type_label: {"new": n, "changed": n}}.
+            """
+            counts: dict = {}
+            for entry in result_list:
+                otype = entry.get("type", "unknown")
+                data  = entry.get("data", {})
+                if otype not in counts:
+                    counts[otype] = {"new": 0, "changed": 0}
+                if "current" not in data:
+                    counts[otype]["new"] += 1
+                else:
+                    counts[otype]["changed"] += 1
+            return counts
+
+        drifted      = []
+        errors       = []
+        ok_count     = 0
+
+        for i, (tname, tid) in enumerate(to_compare, 1):
+            if i % 50 == 0 or i == len(to_compare):
+                print(f"  Progress: {i}/{len(to_compare)} "
+                      f"({len(drifted)} with drift so far)...")
+            try:
+                exported = self.src.configuration.export(
+                    format="yaml", options={"templates": [tid]})
+                result   = _importcompare(exported)
+                counts   = _count_objects(result)
+                if counts:
+                    drifted.append((tname, counts))
+                else:
+                    ok_count += 1
+            except Exception as exc:
+                errors.append((tname, str(exc)))
+                continue
+
+        print(f"  Templates identical       : {ok_count}")
+        print(f"  Templates with drift      : {len(drifted)}")
+        print(f"  Errors during compare     : {len(errors)}")
+
+        lines = [
+            f"=== TEMPLATE OBJECT DRIFT (via importcompare)  (CIA: {self.cia}) ===",
+            f"Used templates in source : {src_total}",
+            f"Missing in dest          : {len(missing_in_dst)}",
+            f"Identical                : {ok_count}",
+            f"With object drift        : {len(drifted)}",
+            f"Compare errors           : {len(errors)}",
+            "",
+            "NOTE: Uses configuration.importcompare on destination — covers ALL",
+            "object types: items, triggers, graphs, LLD rules, item/trigger/graph",
+            "prototypes, web scenarios + steps, template dashboards, macros,",
+            "value maps. No changes are made.",
+            "",
+        ]
+
+        if missing_in_dst:
+            self._warnings.append(
+                f"template-objects: {len(missing_in_dst)} template(s) missing in dest")
+            lines.append(f"MISSING IN DEST ({len(missing_in_dst)}):")
+            for t in missing_in_dst:
+                lines.append(f"  - {t}")
+            lines.append("")
+
+        if drifted:
+            self._warnings.append(
+                f"template-objects: {len(drifted)} template(s) with object drift")
+            COL = 30
+            lines.append(f"TEMPLATES WITH DRIFT ({len(drifted)}):")
+            for tname, counts in drifted:
+                lines.append(f"  TEMPLATE: {tname}")
+                for otype, cnts in sorted(counts.items()):
+                    parts = []
+                    if cnts["new"]:
+                        parts.append(f"new={cnts['new']}")
+                    if cnts["changed"]:
+                        parts.append(f"changed={cnts['changed']}")
+                    lines.append(f"    {otype:<{COL}}  {', '.join(parts)}")
+                lines.append("")
+        else:
+            lines.append("No object drift found  ✓")
+
+        if errors:
+            lines.append(f"ERRORS ({len(errors)}):")
+            for tname, reason in errors:
+                lines.append(f"  - {tname}: {reason}")
+
+        self._write_report("template_objects", lines)
+
+    def _report_group_host_count(self):
+        """
+        For every hostgroup that exists in source, compare the count of enabled
+        hosts (flags=0, status=0) between source and destination.
+        """
+        print()
+        src_groups = {g["name"]: g["groupid"] for g in self.src.hostgroup.get(
+            output=["groupid", "name"])}
+        dst_groups = {g["name"]: g["groupid"] for g in self.dst.hostgroup.get(
+            output=["groupid", "name"])}
+
+        drifted      = []
+        missing_grps = []
+
+        for gname, sgid in sorted(src_groups.items()):
+            if gname not in dst_groups:
+                # Only flag groups that had enabled hosts in source
+                sc = int(self.src.host.get(countOutput=True, groupids=sgid,
+                                           filter={"status": "0", "flags": "0"}))
+                if sc > 0:
+                    missing_grps.append((gname, sc))
+                continue
+            dgid = dst_groups[gname]
+            sc = int(self.src.host.get(countOutput=True, groupids=sgid,
+                                       filter={"status": "0", "flags": "0"}))
+            dc = int(self.dst.host.get(countOutput=True, groupids=dgid,
+                                       filter={"status": "0", "flags": "0"}))
+            if sc != dc:
+                drifted.append((gname, sc, dc))
+
+        print(f"  Source groups checked     : {len(src_groups)}")
+        print(f"  Groups missing in dest    : {len(missing_grps)}")
+        print(f"  Groups with count drift   : {len(drifted)}")
+
+        lines = [
+            f"=== HOSTGROUP ENABLED-HOST COUNT DRIFT  (CIA: {self.cia}) ===",
+            f"Source groups    : {len(src_groups)}",
+            f"Missing in dest  : {len(missing_grps)}",
+            f"Count drift      : {len(drifted)}",
+            "",
+        ]
+        if missing_grps:
+            self._warnings.append(f"group-host-count: {len(missing_grps)} group(s) missing in dest")
+            lines.append(f"GROUPS MISSING IN DEST (had enabled hosts):")
+            for gname, sc in sorted(missing_grps):
+                lines.append(f"  - {gname}  (src enabled={sc})")
+            lines.append("")
+
+        if drifted:
+            self._warnings.append(f"group-host-count: {len(drifted)} group(s) with enabled-host count drift")
+            lines.append(f"COUNT DRIFT ({len(drifted)} groups):")
+            COL = 50
+            for gname, sc, dc in drifted:
+                sign = "+" if dc > sc else "-"
+                lines.append(f"  {gname:<{COL}}  src={sc:5}  dst={dc:5}  ({sign}{abs(dc-sc)})")
+            lines.append("")
+        else:
+            lines.append("No host-count drift found  ✓")
+
+        self._write_report("group_host_count", lines)
+
+    def _report_agent_triggers(self):
+        """
+        Compare the count of agent-unavailability triggers currently in PROBLEM
+        state between source and destination.
+        Looks for triggers whose description contains typical agent-check keywords.
+        Also lists the individual problem trigger names on each side.
+        """
+        print()
+        KEYWORDS = ["unreachable", "unavailable", "zbx-agent", "zabbix agent"]
+
+        def _fetch_agent_problems(api):
+            try:
+                triggers = api.trigger.get(
+                    output=["triggerid", "description", "value"],
+                    filter={"status": "0", "value": "1"},   # enabled + in PROBLEM
+                    only_true=True,
+                    limit=10000)
+            except Exception as exc:
+                print(f"    [WARN] trigger.get failed: {exc}")
+                return []
+            return [
+                t for t in triggers
+                if any(kw in t["description"].lower() for kw in KEYWORDS)
+            ]
+
+        src_problems = _fetch_agent_problems(self.src)
+        dst_problems = _fetch_agent_problems(self.dst)
+
+        src_names = sorted({t["description"] for t in src_problems})
+        dst_names = sorted({t["description"] for t in dst_problems})
+
+        only_src = sorted(set(src_names) - set(dst_names))
+        only_dst = sorted(set(dst_names) - set(src_names))
+
+        print(f"  Agent problems in source   : {len(src_problems)}")
+        print(f"  Agent problems in dest     : {len(dst_problems)}")
+        print(f"  Only in source (resolved?) : {len(only_src)}")
+        print(f"  Only in dest   (new?)      : {len(only_dst)}")
+
+        lines = [
+            f"=== AGENT-UNAVAILABILITY TRIGGERS IN PROBLEM  (CIA: {self.cia}) ===",
+            f"Source problems : {len(src_problems)}",
+            f"Dest   problems : {len(dst_problems)}",
+            f"Only in source  : {len(only_src)}",
+            f"Only in dest    : {len(only_dst)}",
+            "",
+        ]
+        if len(src_problems) != len(dst_problems):
+            diff = len(dst_problems) - len(src_problems)
+            sign = "+" if diff > 0 else ""
+            self._warnings.append(
+                f"agent-triggers: src={len(src_problems)} dst={len(dst_problems)} "
+                f"({sign}{diff}) agent problems")
+
+        if only_src:
+            lines.append(f"ONLY IN SOURCE ({len(only_src)}) — possibly resolved in dest:")
+            for t in only_src:
+                lines.append(f"  SRC: {t}")
+            lines.append("")
+
+        if only_dst:
+            lines.append(f"ONLY IN DEST ({len(only_dst)}) — possibly new problems in dest:")
+            for t in only_dst:
+                lines.append(f"  DST: {t}")
+            lines.append("")
+
+        lines.append(f"--- ALL SOURCE AGENT PROBLEMS ({len(src_names)}) ---")
+        for t in src_names:
+            lines.append(f"  {t}")
+        lines.append("")
+        lines.append(f"--- ALL DEST AGENT PROBLEMS ({len(dst_names)}) ---")
+        for t in dst_names:
+            lines.append(f"  {t}")
+
+        self._write_report("agent_triggers", lines)
+
+    def _write_report(self, section_key: str, lines: List[str]):
+        """Write report lines to a timestamped file next to the script."""
+        import os as _os
+        from datetime import datetime as _dt
+        ts      = _dt.now().strftime("%Y%m%d_%H%M%S")
+        fname   = f"compare_{section_key}_{self.cia}_{ts}.txt"
+        path    = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), fname)
+        content = "\n".join(lines) + "\n"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"  Report written: {path}")
+        except Exception as exc:
+            print(f"  [WARN] Could not write report: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -4784,6 +5303,83 @@ class MissingObjectsError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Fix helpers
+# ---------------------------------------------------------------------------
+
+def _fix_templates_from_report(dst_api, report_path: str, dry_run: bool = False):
+    """
+    Parse a report file generated by --compare hosts-templates and
+    re-link every REMOVED template to its host in the DESTINATION.
+    dry_run=True prints what would be done without calling host.update.
+    """
+    import os as _os
+    if not _os.path.exists(report_path):
+        print(f"  ERROR: report file not found: {report_path}")
+        return
+    to_fix: dict = {}
+    current_host = None
+    with open(report_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line_s = line.rstrip()
+            if line_s.startswith("HOST: "):
+                current_host = line_s[6:].strip()
+                if current_host not in to_fix:
+                    to_fix[current_host] = []
+            elif line_s.strip().startswith("- REMOVED:") and current_host:
+                tpl_name = line_s.strip()[len("- REMOVED:"):].strip()
+                to_fix[current_host].append(tpl_name)
+    if not to_fix:
+        print("  No REMOVED entries found in report — nothing to fix.")
+        return
+    total_pairs = sum(len(v) for v in to_fix.values())
+    print(f"  Report: {len(to_fix)} host(s), {total_pairs} template link(s) to restore.")
+    if dry_run:
+        print("  [DRY-RUN] No changes will be applied.\n")
+    dst_hosts_raw = dst_api.host.get(
+        output=["hostid", "host"], filter={"flags": "0"},
+        selectParentTemplates=["templateid", "name"])
+    dst_host_by_name = {h["host"]: h for h in dst_hosts_raw}
+    dst_tpls_raw = dst_api.template.get(output=["templateid", "name"])
+    dst_tpl_by_name = {t["name"]: t["templateid"] for t in dst_tpls_raw}
+    ok = skipped = failed = 0
+    for hname, tpl_names in sorted(to_fix.items()):
+        if hname not in dst_host_by_name:
+            print(f"  ! HOST '{hname}' not found in destination — skipped")
+            skipped += len(tpl_names)
+            continue
+        host_entry    = dst_host_by_name[hname]
+        hostid        = host_entry["hostid"]
+        current_tpls  = {t["templateid"] for t in host_entry.get("parentTemplates", [])}
+        current_names = {t["name"]       for t in host_entry.get("parentTemplates", [])}
+        to_add_ids = []; to_add_names = []
+        for tname in tpl_names:
+            if tname in current_names:
+                skipped += 1; continue
+            if tname not in dst_tpl_by_name:
+                print(f"  ! Template '{tname}' not in destination (host '{hname}') — skipped")
+                skipped += 1; failed += 1; continue
+            to_add_ids.append(dst_tpl_by_name[tname])
+            to_add_names.append(tname)
+        if not to_add_ids:
+            continue
+        merged = [{"templateid": tid} for tid in current_tpls | set(to_add_ids)]
+        if dry_run:
+            for tname in to_add_names:
+                print(f"  [DRY] Would link '{tname}' -> '{hname}'")
+            ok += len(to_add_ids); continue
+        try:
+            dst_api.host.update(hostid=hostid, templates=merged)
+            for tname in to_add_names:
+                print(f"  + Linked '{tname}' -> '{hname}'")
+            ok += len(to_add_ids)
+        except Exception as exc:
+            print(f"  x Failed '{hname}': {exc}")
+            failed += len(to_add_ids)
+    action = "Would restore" if dry_run else "Restored"
+    print(f"\n  {action}: {ok} link(s), skipped: {skipped}, failed: {failed}.")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -4991,6 +5587,14 @@ Config files (same directory as this script):
         help="(usergroups only) Migrate a single user group by exact name"
     )
     parser.add_argument(
+        "--template", default=None, metavar="NAME",
+        help=(
+            "(templates only) Migrate a single template by exact name. "
+            "If the template has no enabled host linked it is migrated anyway (forced). "
+            "Example: --migrate templates --template 'TPL.LNX.LINUX'"
+        )
+    )
+    parser.add_argument(
         "--skip-existing", action="store_true",
         help="Skip objects that already exist in destination (applies to all types)"
     )
@@ -5104,6 +5708,16 @@ Config files (same directory as this script):
             "entries matching the current --cia). Does not run the sync itself."
         )
     )
+    parser.add_argument(
+        "--fix-templates", default=None, metavar="REPORT_FILE",
+        help=(
+            "Read a hosts_templates report file generated by "
+            "--compare hosts-templates and re-link every REMOVED template "
+            "to its host in the DESTINATION. Requires --env and --cia. "
+            "Combine with --dry-run to preview without applying. "
+            "Example: --fix-templates compare_hosts_templates_biz00_20260702_120000.txt"
+        )
+    )
     args = parser.parse_args()
 
     # Logging
@@ -5128,7 +5742,7 @@ Config files (same directory as this script):
     # ── Validate migration/compare args ─────────────────────────────────────
     if (args.migrate or args.compare is not None or args.update_sharing
             or args.move_groups or args.sync_disabled_status or args.rollback_file
-            or args.sync_hostgroups):
+            or args.sync_hostgroups or args.fix_templates):
         missing = []
         if not args.env:
             missing.append("--env")
@@ -5219,6 +5833,8 @@ Config files (same directory as this script):
         print(f"  sync-hostgroups=on{'  mode=dry-run' if args.dry_run else ''}")
     if args.rollback_file:
         print(f"  rollback-file='{args.rollback_file}'")
+    if args.fix_templates:
+        print(f"  fix-templates='{args.fix_templates}'{'  [DRY-RUN]' if args.dry_run else ''}")
     print("=" * 70)
 
     # Global totals
@@ -5257,6 +5873,7 @@ Config files (same directory as this script):
                 skip_existing=args.skip_existing,
                 dashboard_filter=args.dashboard,
                 host_filter=args.host,
+                template_filter=args.template,
                 usergroup_filter=args.usergroup,
                 debug_json=args.debug_json,
                 debug_dashboard=args.debug_dashboard,
@@ -5350,6 +5967,14 @@ Config files (same directory as this script):
                 # args.compare == [] means --compare with no args → all sections
                 # args.compare == ["hosts", ...] → selected sections only
                 comp.run(sections=args.compare if args.compare else None)
+
+            if args.fix_templates:
+                print(f"\n  -- FIX TEMPLATES --")
+                _fix_templates_from_report(
+                    dst_api=migrator.dest,
+                    report_path=args.fix_templates,
+                    dry_run=args.dry_run,
+                )
 
         except Exception as exc:
             print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
