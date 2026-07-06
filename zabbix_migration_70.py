@@ -96,12 +96,99 @@ def _prequote_zabbix_yaml(text: str) -> str:
     text = _BOOL_FIX_RE.sub(lambda m: m.group(1) + "'" + m.group(2) + "'", text)
     return text
 
+
+def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
+    """
+    Workaround for Zabbix bug ZBX-19968:
+      "Invalid tag .../filter/conditions/condition(N): the tag 'formulaid' is missing"
+
+    When importing templates/hosts exported from older Zabbix versions (2.x–6.4)
+    into Zabbix 7.0, LLD rule filter conditions that were created with evaltype=0
+    (AND_OR) may have their 'formulaid' field missing. Zabbix 7.0 requires it.
+
+    Fix: parse the YAML, walk every discovery_rule.filter.conditions list, and
+    inject 'formulaid: A', 'formulaid: B', ... for any condition that lacks it.
+    The formulaid is only meaningful when evaltype is CUSTOM_EXPRESSION (1);
+    for AND_OR (0) Zabbix itself assigns A/B/C/... sequentially, so we mirror
+    that logic.
+
+    Returns (fixed_yaml_text, n_fixed) where n_fixed is the number of conditions
+    patched. If n_fixed == 0 the original text is returned unchanged.
+    """
+    import yaml as _yaml
+
+    # Fast path — skip YAML parse if no conditions block present at all
+    if "formulaid" in yaml_text or "conditions:" not in yaml_text:
+        # Already has formulaid everywhere, or no conditions block — nothing to do
+        # (still need to check in case some conditions have it and others don't)
+        if "formulaid" in yaml_text and yaml_text.count("conditions:") == yaml_text.count("formulaid"):
+            return yaml_text, 0
+
+    try:
+        data = _yaml.safe_load(yaml_text)
+    except Exception:
+        # If YAML parse fails, return as-is — _raw_import will surface the real error
+        return yaml_text, 0
+
+    if not isinstance(data, dict):
+        return yaml_text, 0
+
+    n_fixed = 0
+    root    = data.get("zabbix_export", data)
+
+    def _fix_conditions(conditions: list) -> int:
+        """Inject formulaid A/B/C/... into conditions that lack it. Returns fix count."""
+        fixed = 0
+        for idx, cond in enumerate(conditions):
+            if isinstance(cond, dict) and "formulaid" not in cond:
+                # Assign A, B, C, ... (wrap at Z with AA, AB, ... — extremely unlikely)
+                label_idx = idx % 26
+                label     = chr(ord("A") + label_idx)
+                cond["formulaid"] = label
+                fixed += 1
+        return fixed
+
+    def _walk(obj):
+        nonlocal n_fixed
+        if isinstance(obj, dict):
+            # discovery_rules can appear under templates, hosts
+            for dr_list_key in ("discovery_rules",):
+                dr_list = obj.get(dr_list_key)
+                if isinstance(dr_list, list):
+                    for dr in dr_list:
+                        if isinstance(dr, dict):
+                            flt = dr.get("filter")
+                            if isinstance(flt, dict):
+                                conds = flt.get("conditions")
+                                if isinstance(conds, list) and conds:
+                                    n_fixed += _fix_conditions(conds)
+            # Recurse into all values
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+
+    _walk(root)
+
+    if n_fixed == 0:
+        return yaml_text, 0
+
+    # Re-serialise — use yaml.dump which produces clean YAML
+    # Preserve the original structure; only re-dump if we actually patched something
+    try:
+        fixed_text = _yaml.dump(data, allow_unicode=True, default_flow_style=False,
+                                sort_keys=False, width=4096)
+        return fixed_text, n_fixed
+    except Exception:
+        return yaml_text, 0
+
 # ---------------------------------------------------------------------------
 # Script version — bump this on every change so the printed header makes it
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.5"
+SCRIPT_VERSION = "2026-07-02.6"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2901,8 +2988,20 @@ class ZabbixMigrator:
         result = data.get("result", "")
         # result is a plain string for both json and yaml formats
         if isinstance(result, str):
-            return result
-        return json.dumps(result)
+            raw = result
+        else:
+            raw = json.dumps(result)
+
+        # Workaround ZBX-19968: inject missing 'formulaid' in LLD filter conditions
+        # before returning — Zabbix 7.0 rejects YAML/XML that lacks this field.
+        # Only applies to YAML exports (templates and hosts); maps use JSON.
+        if fmt == "yaml":
+            raw, n_formulaid = _fix_yaml_lld_formulaid(raw)
+            if n_formulaid:
+                logger.debug("_raw_export: patched %d LLD condition(s) with formulaid",
+                             n_formulaid)
+
+        return raw
 
     @staticmethod
     def _sanitize(obj):
