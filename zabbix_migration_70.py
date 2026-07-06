@@ -188,7 +188,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.6"
+SCRIPT_VERSION = "2026-07-02.7"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -2992,10 +2992,20 @@ class ZabbixMigrator:
         else:
             raw = json.dumps(result)
 
-        # Workaround ZBX-19968: inject missing 'formulaid' in LLD filter conditions
-        # before returning — Zabbix 7.0 rejects YAML/XML that lacks this field.
-        # Only applies to YAML exports (templates and hosts); maps use JSON.
+        # ── YAML post-processing (templates + hosts only; maps use JSON) ────
         if fmt == "yaml":
+            # 1. Pre-quote hex colours and YES/NO booleans BEFORE any YAML parse.
+            #    PyYAML 1.1 corrupts "000000" → int(0), "YES" → True, etc.
+            #    This covers graph_item.color, font_color, background_color, etc.
+            #    (same fix that was already applied to maps via JSON path).
+            raw_before = raw
+            raw = _prequote_zabbix_yaml(raw)
+            if raw != raw_before:
+                logger.debug("_raw_export: _prequote_zabbix_yaml applied (hex/bool fix)")
+
+            # 2. Workaround ZBX-19968: inject missing 'formulaid' in LLD filter
+            #    conditions — Zabbix 7.0 rejects YAML that lacks this field.
+            #    Must run AFTER _prequote_zabbix_yaml so the YAML is safe to parse.
             raw, n_formulaid = _fix_yaml_lld_formulaid(raw)
             if n_formulaid:
                 logger.debug("_raw_export: patched %d LLD condition(s) with formulaid",
