@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.9"
+SCRIPT_VERSION = "2026-07-02.10"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -446,8 +446,9 @@ class MigrationLog:
             for name in migrator.missing_hosts_after_import:
                 lines.append(f"    - {name}  [MISSING in destination]")
 
-        # Skipped templates
-        if "templates" in self.types_run and migrator.skipped_templates:
+        # Skipped templates — suppressed when --template NAME is used
+        if ("templates" in self.types_run and migrator.skipped_templates
+                and not migrator.template_filter):
             lines.append(
                 f"\n  Templates skipped (no enabled host link) "
                 f"[{len(migrator.skipped_templates)}]:"
@@ -3939,13 +3940,10 @@ class ZabbixComparator:
     _GRN    = "\033[92m"
     _RST    = "\033[0m"
 
-    def __init__(self, src_api, dst_api, cia_name: str,
-                 dst_url: str = "", dst_token: str = ""):
-        self.src       = src_api
-        self.dst       = dst_api
-        self.cia       = cia_name
-        self._dst_url   = dst_url    # for raw API calls (importcompare)
-        self._dst_token = dst_token  # for raw API calls (importcompare)
+    def __init__(self, src_api, dst_api, cia_name: str):
+        self.src  = src_api
+        self.dst  = dst_api
+        self.cia  = cia_name
         self._warnings: List[str] = []
 
     # ── public entry point ───────────────────────────────────────────────────
@@ -4657,8 +4655,6 @@ class ZabbixComparator:
                          for t in self.dst.template.get(output=["name"])}
 
         src_total      = len(src_tpls)
-        # Only flag as "missing" templates that ARE in the used set
-        # (src_tpls is already filtered to used_tpl_ids — so all are expected in dest)
         missing_in_dst = sorted(n for n in src_tpls if n not in dst_tpl_names)
         to_compare     = [(name, tid) for name, tid in sorted(src_tpls.items())
                           if name in dst_tpl_names]
@@ -4682,16 +4678,18 @@ class ZabbixComparator:
         }
 
         # dest raw API details (for direct HTTP call — importcompare not in pyzabbix)
-        dst_url   = self._dst_url
-        dst_token = self._dst_token
+        dst_url   = self.dst._base_url if hasattr(self.dst, "_base_url") else None
+        dst_token = None
+        # Try to get token from pyzabbix internals
+        for attr in ("_ZabbixAPI__token", "token", "_token", "auth"):
+            if hasattr(self.dst, attr):
+                dst_token = getattr(self.dst, attr)
+                break
 
         def _importcompare(exported_yaml: str):
             """Call configuration.importcompare on dest and return result list."""
-            if not dst_url or not dst_token:
-                raise RuntimeError(
-                    "dst_url/dst_token not set on ZabbixComparator — "
-                    "pass them when instantiating (dst_url=migrator._dest_url, "
-                    "dst_token=migrator._dest_token)")
+            if dst_url is None or dst_token is None:
+                raise RuntimeError("Cannot determine dest URL or token for importcompare")
             api_url = dst_url.rstrip("/") + "/api_jsonrpc.php"
             payload = _json.dumps({
                 "jsonrpc": "2.0", "method": "configuration.importcompare",
@@ -4709,23 +4707,37 @@ class ZabbixComparator:
                                 data["error"].get("message", str(data["error"])))
             return data.get("result", [])
 
-        def _count_objects(result_list: list) -> dict:
+        def _count_objects(result_list) -> dict:
             """
             Parse importcompare result into counts per object type.
-            Each entry: {"type": "...", "name": "...", "data": {"new":{}, "current":{}}}
-            We count entries that have "new" (=created) or differ between new/current
-            (=changed). Returned as {type_label: {"new": n, "changed": n}}.
+
+            Zabbix 7.0 importcompare result entries can be:
+              - dict: {"type":"...", "name":"...", "data":{"new":{}, "current":{}}}
+              - str:  path like ".../items/item(3)" when template is new in dest
+
+            Returns {type_label: {"new": n, "changed": n}}.
             """
+            if not result_list:
+                return {}
             counts: dict = {}
             for entry in result_list:
-                otype = entry.get("type", "unknown")
-                data  = entry.get("data", {})
-                if otype not in counts:
-                    counts[otype] = {"new": 0, "changed": 0}
-                if "current" not in data:
+                if isinstance(entry, str):
+                    # Extract type from path e.g. ".../items/item(3)" -> "items"
+                    import re as _re2
+                    m = _re2.search(r'/([^/]+)/[^/]+[(][0-9]+[)]$', entry)
+                    otype = m.group(1) if m else "unknown"
+                    if otype not in counts:
+                        counts[otype] = {"new": 0, "changed": 0}
                     counts[otype]["new"] += 1
-                else:
-                    counts[otype]["changed"] += 1
+                elif isinstance(entry, dict):
+                    otype = entry.get("type", "unknown")
+                    data  = entry.get("data", {})
+                    if otype not in counts:
+                        counts[otype] = {"new": 0, "changed": 0}
+                    if not isinstance(data, dict) or "current" not in data:
+                        counts[otype]["new"] += 1
+                    else:
+                        counts[otype]["changed"] += 1
             return counts
 
         drifted      = []
@@ -4737,8 +4749,9 @@ class ZabbixComparator:
                 print(f"  Progress: {i}/{len(to_compare)} "
                       f"({len(drifted)} with drift so far)...")
             try:
-                exported = self.src.configuration.export(
-                    format="yaml", options={"templates": [tid]})
+                # Use _raw_export — reliable HTTP direct call,
+                # already applies _prequote_zabbix_yaml + _fix_yaml_lld_formulaid
+                exported = self._raw_export("templates", [tid], fmt="yaml")
                 result   = _importcompare(exported)
                 counts   = _count_objects(result)
                 if counts:
@@ -5430,70 +5443,6 @@ class MissingObjectsError(Exception):
 # Fix helpers
 # ---------------------------------------------------------------------------
 
-def _list_orphan_templates(src_api, cia_name: str):
-    """
-    List all templates that have no enabled host linked directly or indirectly.
-    These are the templates that --migrate templates would skip.
-    Writes a report file: orphan_templates_<cia>.txt
-    """
-    import os as _os
-    from datetime import datetime as _dt
-
-    print("  Fetching all templates and host linkages...")
-    all_tpls = src_api.template.get(
-        output=["templateid", "name"],
-        selectParentTemplates=["templateid"])
-    tpl_by_id = {t["templateid"]: t for t in all_tpls}
-
-    # Build used set (same logic as migrate_templates)
-    enabled_hosts = src_api.host.get(
-        filter={"status": "0"},
-        output=["hostid"],
-        selectParentTemplates=["templateid"])
-    needed_ids: set = set()
-    for host in enabled_hosts:
-        for tpl in host.get("parentTemplates", []):
-            needed_ids.add(tpl["templateid"])
-    # Expand transitively
-    changed = True
-    while changed:
-        changed = False
-        for tid in list(needed_ids):
-            tpl = tpl_by_id.get(tid)
-            if not tpl:
-                continue
-            for parent in tpl.get("parentTemplates", []):
-                pid = parent["templateid"]
-                if pid not in needed_ids:
-                    needed_ids.add(pid)
-                    changed = True
-
-    orphans = sorted(
-        t["name"] for t in all_tpls
-        if t["templateid"] not in needed_ids)
-
-    print(f"  Total templates : {len(all_tpls)}")
-    print(f"  Used (migrated) : {len(needed_ids)}")
-    print(f"  Orphans         : {len(orphans)}")
-
-    ts    = _dt.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"orphan_templates_{cia_name}_{ts}.txt"
-    path  = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), fname)
-    lines = [
-        f"=== ORPHAN TEMPLATES (no enabled host link)  (CIA: {cia_name}) ===",
-        f"Total templates : {len(all_tpls)}",
-        f"Used (migrated) : {len(needed_ids)}",
-        f"Orphans         : {len(orphans)}",
-        "",
-        "These templates have no enabled host linked directly or indirectly.",
-        "--migrate templates will skip them.",
-        "",
-    ] + [f"  - {n}" for n in orphans]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"  Report written: {path}")
-
-
 def _fix_templates_from_report(dst_api, report_path: str, dry_run: bool = False):
     """
     Parse a report file generated by --compare hosts-templates and
@@ -5897,14 +5846,6 @@ Config files (same directory as this script):
         )
     )
     parser.add_argument(
-        "--list-orphan-templates", action="store_true",
-        help=(
-            "List all templates that have no enabled host linked directly or "
-            "indirectly (i.e. templates that would be skipped by --migrate templates). "
-            "Requires --env and --cia. No migration is performed."
-        )
-    )
-    parser.add_argument(
         "--fix-templates", default=None, metavar="REPORT_FILE",
         help=(
             "Read a hosts_templates report file generated by "
@@ -5938,8 +5879,7 @@ Config files (same directory as this script):
     # ── Validate migration/compare args ─────────────────────────────────────
     if (args.migrate or args.compare is not None or args.update_sharing
             or args.move_groups or args.sync_disabled_status or args.rollback_file
-            or args.sync_hostgroups or args.fix_templates
-            or args.list_orphan_templates):
+            or args.sync_hostgroups or args.fix_templates):
         missing = []
         if not args.env:
             missing.append("--env")
@@ -6160,8 +6100,6 @@ Config files (same directory as this script):
                     src_api=migrator.source,
                     dst_api=migrator.dest,
                     cia_name=cia_name,
-                    dst_url=migrator._dest_url,
-                    dst_token=migrator._dest_token,
                 )
                 # args.compare == [] means --compare with no args → all sections
                 # args.compare == ["hosts", ...] → selected sections only
@@ -6174,10 +6112,6 @@ Config files (same directory as this script):
                     report_path=args.fix_templates,
                     dry_run=args.dry_run,
                 )
-
-            if args.list_orphan_templates:
-                print(f"\n  -- ORPHAN TEMPLATES (no host link) --")
-                _list_orphan_templates(src_api=migrator.source, cia_name=cia_name)
 
         except Exception as exc:
             print(f"  FATAL for CIA '{cia_name}': {exc}", file=sys.stderr)
