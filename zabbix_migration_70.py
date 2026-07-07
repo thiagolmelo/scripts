@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.16"
+SCRIPT_VERSION = "2026-07-02.17"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5506,6 +5506,193 @@ class MissingObjectsError(Exception):
 # Fix helpers
 # ---------------------------------------------------------------------------
 
+
+def _reimport_retry_failed(migrator, template_name: str, report_path: str,
+                           dry_run: bool = False) -> bool:
+    """
+    Retry re-linking a template ONLY on hosts that failed in a previous
+    --reimport-template run, using the reimport_missing_*.txt report.
+
+    For each failed host:
+      1. Delete conflicting orphaned graphs — graphs on the host whose name
+         matches a graph/graph-prototype in the template but that are no
+         longer linked to it ("Graph already exists ... items are not
+         identical" root cause).
+      2. Delete orphaned items (templateid=0, not inherited, not discovered).
+      3. Re-link the template.
+      4. Verify.
+
+    Report format (lines of interest):
+        - <hostname>
+    """
+    lbl = "[DRY-RUN] " if dry_run else ""
+    print(f"  {lbl}Retry re-link for '{template_name}' from report: {report_path}")
+
+    import os as _os
+    if not _os.path.exists(report_path):
+        print(f"  ERROR: report file not found: {report_path}")
+        return False
+
+    # Parse report — host lines start with "  - "
+    failed_hosts = []
+    with open(report_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("- "):
+                failed_hosts.append(s[2:].strip())
+
+    if not failed_hosts:
+        print("  No failed hosts found in report.")
+        return True
+
+    print(f"  Hosts to retry: {len(failed_hosts)}")
+
+    dst_api = migrator.dest
+
+    # Resolve template in dest
+    dst_tpl = dst_api.template.get(filter={"name": template_name},
+                                   output=["templateid"])
+    if not dst_tpl:
+        print(f"  ERROR: '{template_name}' not found in destination.")
+        return False
+    dst_tid = dst_tpl[0]["templateid"]
+
+    # Get all graph names owned by the template (regular + prototypes) so we
+    # can identify conflicting host-local copies.
+    tpl_graphs = dst_api.graph.get(
+        templateids=[dst_tid], output=["name"])
+    tpl_graph_protos = dst_api.graphprototype.get(
+        templateids=[dst_tid], output=["name"])
+    # Prototype names contain LLD macros ({#IFNAME}); host copies have the
+    # macro EXPANDED (e.g. "... eth0 I/O bandwith"). Use the static prefix
+    # before the first macro for prefix-matching.
+    tpl_graph_names    = {g["name"] for g in tpl_graphs}
+    tpl_proto_prefixes = set()
+    for g in tpl_graph_protos:
+        name = g["name"]
+        idx  = name.find("{#")
+        tpl_proto_prefixes.add(name[:idx].rstrip() if idx > 0 else name)
+
+    print(f"  Template graphs: {len(tpl_graph_names)}, "
+          f"proto prefixes: {len(tpl_proto_prefixes)}")
+
+    ok = fail = 0
+    orphan_graphs_deleted = 0
+    orphan_items_deleted  = 0
+
+    for i, hname in enumerate(failed_hosts, 1):
+        hosts = dst_api.host.get(filter={"host": hname},
+                                 output=["hostid", "host"],
+                                 selectParentTemplates=["templateid"])
+        if not hosts:
+            print(f"  ! Host '{hname}' not found — skipped")
+            fail += 1
+            continue
+        h      = hosts[0]
+        hostid = h["hostid"]
+
+        # ── 1. Delete conflicting orphaned graphs on this host ──────────────
+        # Host graphs not inherited from any template (templateid=0 via
+        # discover flag or plain flags=0/4 with no template parent) whose name
+        # matches a template graph or starts with a prototype prefix.
+        host_graphs = dst_api.graph.get(
+            hostids=[hostid],
+            output=["graphid", "name", "templateid", "flags"])
+        to_delete = []
+        for g in host_graphs:
+            # only orphans: not currently inherited from a template
+            if str(g.get("templateid") or "0") != "0":
+                continue
+            gname = g["name"]
+            if gname in tpl_graph_names:
+                to_delete.append(g["graphid"])
+                continue
+            for prefix in tpl_proto_prefixes:
+                if prefix and gname.startswith(prefix):
+                    to_delete.append(g["graphid"])
+                    break
+
+        if to_delete:
+            if dry_run:
+                print(f"  [DRY] '{hname}': would delete {len(to_delete)} "
+                      f"conflicting graph(s)")
+            else:
+                try:
+                    dst_api.graph.delete(*to_delete)
+                    orphan_graphs_deleted += len(to_delete)
+                except Exception as exc:
+                    print(f"  ! '{hname}': graph delete failed: {exc}")
+
+        # ── 2. Delete orphaned items ─────────────────────────────────────────
+        try:
+            orphans = dst_api.item.get(
+                hostids=[hostid], output=["itemid"],
+                filter={"flags": "0", "templateid": "0"},
+                inherited=False)
+            if orphans:
+                ids = [it["itemid"] for it in orphans]
+                if dry_run:
+                    print(f"  [DRY] '{hname}': would delete {len(ids)} orphaned item(s)")
+                else:
+                    dst_api.item.delete(*ids)
+                    orphan_items_deleted += len(ids)
+        except Exception as exc:
+            print(f"  ! '{hname}': item cleanup failed: {exc}")
+
+        # ── 3. Re-link ────────────────────────────────────────────────────────
+        if dry_run:
+            print(f"  [DRY] '{hname}': would re-link '{template_name}'")
+            ok += 1
+            continue
+
+        cur_tids = {t["templateid"] for t in h.get("parentTemplates", [])}
+        cur_tids.add(dst_tid)
+        try:
+            dst_api.host.update(
+                hostid=hostid,
+                templates=[{"templateid": tid} for tid in cur_tids])
+            ok += 1
+            print(f"  + '{hname}' re-linked OK "
+                  f"({len(to_delete)} graph(s) cleaned)")
+        except Exception as exc:
+            fail += 1
+            print(f"  x '{hname}': {exc}")
+
+        if i % 50 == 0:
+            print(f"  Progress: {i}/{len(failed_hosts)}...")
+
+    # ── 4. Verify ────────────────────────────────────────────────────────────
+    if not dry_run:
+        linked = {h["host"] for h in dst_api.host.get(
+            output=["host"], filter={"flags": "0"},
+            templateids=[dst_tid])}
+        still_missing = sorted(set(failed_hosts) - linked)
+        print(f"\n  Retry done: {ok} OK, {fail} failed.")
+        print(f"  Orphan graphs deleted: {orphan_graphs_deleted}")
+        print(f"  Orphan items deleted : {orphan_items_deleted}")
+        if still_missing:
+            import os as _os2
+            from datetime import datetime as _dt
+            ts    = _dt.now().strftime("%Y%m%d_%H%M%S")
+            safe  = template_name.replace("/","_").replace(" ","_")[:40]
+            rpath = _os2.path.join(
+                _os2.path.dirname(_os2.path.abspath(__file__)),
+                f"reimport_missing_{safe}_{ts}.txt")
+            lines = [f"=== STILL MISSING AFTER RETRY ===",
+                     f"Template : {template_name}",
+                     f"Missing  : {len(still_missing)}", ""]
+            lines += [f"  - {hn}" for hn in still_missing]
+            with open(rpath, "w") as _f:
+                _f.write("\n".join(lines) + "\n")
+            print(f"  WARNING: {len(still_missing)} still missing. Report: {rpath}")
+        else:
+            print(f"  All previously-failed hosts now linked  ✓")
+    else:
+        print(f"\n  [DRY-RUN] {ok} host(s) would be processed.")
+
+    return fail == 0
+
+
 def _fix_templates_from_report(dst_api, report_path: str, dry_run: bool = False):
     """
     Parse a report file generated by --compare hosts-templates and
@@ -6103,6 +6290,16 @@ Config files (same directory as this script):
         )
     )
     parser.add_argument(
+        "--reimport-retry", default=None, metavar="REPORT_FILE",
+        help=(
+            "Retry re-linking a template only on hosts that failed in a "
+            "previous --reimport-template run. Reads the reimport_missing_*.txt "
+            "report, deletes conflicting orphaned graphs and items from each "
+            "failed host, then re-links. Requires --reimport-template NAME "
+            "to identify the template. Use --dry-run to preview."
+        )
+    )
+    parser.add_argument(
         "--reimport-template", default=None, metavar="NAME",
         help=(
             "Safe re-import for large templates that time out. "
@@ -6381,7 +6578,15 @@ Config files (same directory as this script):
                 # args.compare == ["hosts", ...] → selected sections only
                 comp.run(sections=args.compare if args.compare else None)
 
-            if args.reimport_template:
+            if args.reimport_template and args.reimport_retry:
+                print(f"\n  -- REIMPORT RETRY (failed hosts only) --")
+                _reimport_retry_failed(
+                    migrator=migrator,
+                    template_name=args.reimport_template,
+                    report_path=args.reimport_retry,
+                    dry_run=args.dry_run,
+                )
+            elif args.reimport_template:
                 print(f"\n  -- REIMPORT TEMPLATE (large) --")
                 _reimport_template_large(
                     migrator=migrator,
