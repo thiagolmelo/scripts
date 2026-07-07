@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.14"
+SCRIPT_VERSION = "2026-07-02.15"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5583,6 +5583,200 @@ def _fix_templates_from_report(dst_api, report_path: str, dry_run: bool = False)
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+def _reimport_template_large(migrator, template_name: str, dry_run: bool = False) -> bool:
+    """
+    Safe re-import workflow for large templates (timeout workaround).
+
+    Steps:
+      1. Find template in source.
+      2. Find dest hosts linked to this template.
+      3. Create staging hostgroup /PRD-INF-METROLOGIE-INSTRU/ZBC_TEMPLATES/<NAME>.
+      4. Add linked hosts to staging group.
+      5. Unlink template from all hosts (host.update templates=remaining).
+      6. Import template (two-pass: no-dashboards then full).
+      7. Re-link template to all hosts.
+      8. Verify every host is re-linked; write gap report if any missing.
+      9. Remove orphaned items (templateid=0, not inherited) from re-linked hosts.
+    """
+    HG_PREFIX = "/PRD-INF-METROLOGIE-INSTRU/ZBC_TEMPLATES"
+    hg_name   = f"{HG_PREFIX}/{template_name}"
+    lbl       = "[DRY-RUN] " if dry_run else ""
+
+    print(f"  {lbl}Re-import workflow for '{template_name}'")
+    print(f"  Staging hostgroup : {hg_name}\n")
+
+    src_api = migrator.source
+    dst_api = migrator.dest
+
+    # 1. Verify template exists in source
+    src_tpls = src_api.template.get(filter={"name": template_name},
+                                    output=["templateid", "name"])
+    if not src_tpls:
+        print(f"  ERROR: '{template_name}' not found in source.")
+        return False
+    src_tid = src_tpls[0]["templateid"]
+
+    # 2. Find dest hosts linked to this template
+    dst_tpl = dst_api.template.get(filter={"name": template_name},
+                                   output=["templateid"])
+    linked_hosts = []
+    if dst_tpl:
+        dst_tid = dst_tpl[0]["templateid"]
+        linked_hosts = dst_api.host.get(
+            output=["hostid", "host"],
+            filter={"flags": "0"},
+            templateids=[dst_tid],
+            selectParentTemplates=["templateid", "name"],
+        )
+    else:
+        dst_tid = None
+
+    print(f"  Source template ID : {src_tid}")
+    print(f"  Dest linked hosts  : {len(linked_hosts)}\n")
+
+    if dry_run:
+        print(f"  [DRY-RUN] Would execute {6 if linked_hosts else 3} steps:")
+        print(f"    1. Create/find staging hostgroup '{hg_name}'")
+        if linked_hosts:
+            print(f"    2. Add {len(linked_hosts)} host(s) to staging group")
+            print(f"    3. Unlink '{template_name}' from {len(linked_hosts)} host(s)")
+        print(f"    4. Import template from source (2-pass)")
+        if linked_hosts:
+            print(f"    5. Re-link '{template_name}' to {len(linked_hosts)} host(s)")
+            print(f"    6. Verify linkage + clean orphaned items")
+        print(f"  Run without --dry-run to apply.")
+        return True
+
+    # 3. Create staging hostgroup if absent
+    existing_hg = dst_api.hostgroup.get(filter={"name": hg_name}, output=["groupid"])
+    if existing_hg:
+        hg_id = existing_hg[0]["groupid"]
+        print(f"  Staging group already exists (id={hg_id})")
+    else:
+        result = dst_api.hostgroup.create(name=hg_name)
+        hg_id  = result["groupids"][0]
+        print(f"  Created staging group '{hg_name}' (id={hg_id})")
+
+    # 4. Add linked hosts to staging group
+    if linked_hosts:
+        print(f"  Step 4: Adding {len(linked_hosts)} host(s) to staging group...")
+        for i, h in enumerate(linked_hosts, 1):
+            cur_grps = dst_api.hostgroup.get(hostids=h["hostid"], output=["groupid"])
+            grp_ids  = [{"groupid": g["groupid"]} for g in cur_grps]
+            if not any(g["groupid"] == hg_id for g in cur_grps):
+                grp_ids.append({"groupid": hg_id})
+            dst_api.host.update(hostid=h["hostid"], groups=grp_ids)
+            if i % 500 == 0 or i == len(linked_hosts):
+                print(f"    {i}/{len(linked_hosts)} added...")
+
+    # 5. Unlink template from all linked hosts
+    if linked_hosts and dst_tid:
+        print(f"  Step 5: Unlinking '{template_name}' from {len(linked_hosts)} host(s)...")
+        for i, h in enumerate(linked_hosts, 1):
+            remaining = [{"templateid": t["templateid"]}
+                         for t in h.get("parentTemplates", [])
+                         if t["templateid"] != dst_tid]
+            dst_api.host.update(hostid=h["hostid"], templates=remaining)
+            if i % 500 == 0 or i == len(linked_hosts):
+                print(f"    {i}/{len(linked_hosts)} unlinked...")
+
+    # 6. Import template (2-pass: items+graphs first, then dashboards)
+    print(f"  Step 6: Importing '{template_name}' from source...")
+    try:
+        exported = migrator._raw_export("templates", [src_tid], fmt="yaml")
+        migrator._raw_import(fmt="yaml", source=exported,
+                             rules=TEMPLATE_IMPORT_RULES_NO_DASHBOARDS)
+        migrator._raw_import(fmt="yaml", source=exported,
+                             rules=TEMPLATE_IMPORT_RULES)
+        print(f"  Import OK.")
+    except Exception as exc:
+        print(f"  ERROR importing: {exc}")
+        print(f"  WARNING: hosts are still unlinked! Re-run after fixing the import.")
+        return False
+
+    # 7. Re-link template to all hosts
+    if linked_hosts:
+        dst_tpl_new = dst_api.template.get(filter={"name": template_name},
+                                           output=["templateid"])
+        if not dst_tpl_new:
+            print(f"  ERROR: template not in dest after import!")
+            return False
+        dst_tid_new = dst_tpl_new[0]["templateid"]
+
+        print(f"  Step 7: Re-linking to {len(linked_hosts)} host(s)...")
+        relink_ok = relink_fail = 0
+        for i, h in enumerate(linked_hosts, 1):
+            cur = dst_api.host.get(hostids=h["hostid"], output=["hostid"],
+                                   selectParentTemplates=["templateid"])
+            cur_tids = {t["templateid"] for t in cur[0].get("parentTemplates", [])}
+            cur_tids.add(dst_tid_new)
+            try:
+                dst_api.host.update(
+                    hostid=h["hostid"],
+                    templates=[{"templateid": tid} for tid in cur_tids])
+                relink_ok += 1
+            except Exception as exc:
+                print(f"    ERROR '{h['host']}': {exc}")
+                relink_fail += 1
+            if i % 500 == 0 or i == len(linked_hosts):
+                print(f"    {i}/{len(linked_hosts)} re-linked...")
+        print(f"  Re-link: {relink_ok} OK, {relink_fail} failed.")
+
+    # 8. Verify
+    print(f"  Step 8: Verifying...")
+    dst_tpl_v = dst_api.template.get(filter={"name": template_name},
+                                     output=["templateid"])
+    still_linked = set()
+    if dst_tpl_v:
+        still_linked = {h["host"] for h in dst_api.host.get(
+            output=["host"], filter={"flags": "0"},
+            templateids=[dst_tpl_v[0]["templateid"]])}
+
+    expected     = {h["host"] for h in linked_hosts}
+    missing_link = sorted(expected - still_linked)
+
+    print(f"  Expected: {len(expected)}  Confirmed: {len(still_linked)}")
+    if missing_link:
+        import os as _os; from datetime import datetime as _dt
+        ts    = _dt.now().strftime("%Y%m%d_%H%M%S")
+        safe  = template_name.replace("/","_").replace(" ","_")[:40]
+        rpath = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                              f"reimport_missing_{safe}_{ts}.txt")
+        lines = [f"=== MISSING TEMPLATE LINK AFTER REIMPORT ===",
+                 f"Template : {template_name}",
+                 f"Missing  : {len(missing_link)}", ""]
+        lines += [f"  - {hn}" for hn in missing_link]
+        with open(rpath, "w") as _f:
+            _f.write("\n".join(lines) + "\n")
+        print(f"  WARNING: {len(missing_link)} host(s) missing! Report: {rpath}")
+    else:
+        print(f"  All hosts confirmed  ✓")
+
+    # 9. Remove orphaned items
+    print(f"  Step 9: Cleaning orphaned items...")
+    orphan_del = 0
+    for h in linked_hosts:
+        try:
+            orphans = dst_api.item.get(
+                hostids=h["hostid"], output=["itemid"],
+                filter={"flags": "0", "templateid": "0"},
+                inherited=False)
+            if orphans:
+                ids = [i["itemid"] for i in orphans]
+                dst_api.item.delete(*ids)
+                orphan_del += len(ids)
+        except Exception:
+            pass
+    if orphan_del:
+        print(f"  Removed {orphan_del} orphaned item(s).")
+    else:
+        print(f"  No orphaned items found.")
+
+    print(f"\n  Done. Staging group '{hg_name}' kept (remove manually if unneeded).")
+    return True
+
+
 def parse_migrate_types(raw: List[str]) -> List[str]:
     """Expand 'all' and deduplicate while preserving MIGRATION_ORDER.
     Note: 'all' does NOT include 'usergroups' — run that explicitly.
@@ -5909,6 +6103,15 @@ Config files (same directory as this script):
         )
     )
     parser.add_argument(
+        "--reimport-template", default=None, metavar="NAME",
+        help=(
+            "Safe re-import for large templates that time out. "
+            "Unlinks all dest hosts, imports from source, re-links. "
+            "Creates staging hostgroup and verifies every host. "
+            "Use --dry-run to preview. Requires --env and --cia."
+        )
+    )
+    parser.add_argument(
         "--fix-templates", default=None, metavar="REPORT_FILE",
         help=(
             "Read a hosts_templates report file generated by "
@@ -5942,7 +6145,8 @@ Config files (same directory as this script):
     # ── Validate migration/compare args ─────────────────────────────────────
     if (args.migrate or args.compare is not None or args.update_sharing
             or args.move_groups or args.sync_disabled_status or args.rollback_file
-            or args.sync_hostgroups or args.fix_templates):
+            or args.sync_hostgroups or args.fix_templates
+            or args.reimport_template):
         missing = []
         if not args.env:
             missing.append("--env")
@@ -6033,6 +6237,9 @@ Config files (same directory as this script):
         print(f"  sync-hostgroups=on{'  mode=dry-run' if args.dry_run else ''}")
     if args.rollback_file:
         print(f"  rollback-file='{args.rollback_file}'")
+    if args.reimport_template:
+        print(f"  reimport-template='{args.reimport_template}'"
+              f"{'  [DRY-RUN]' if args.dry_run else ''}")
     if args.fix_templates:
         print(f"  fix-templates='{args.fix_templates}'{'  [DRY-RUN]' if args.dry_run else ''}")
     print("=" * 70)
@@ -6172,6 +6379,14 @@ Config files (same directory as this script):
                 # args.compare == [] means --compare with no args → all sections
                 # args.compare == ["hosts", ...] → selected sections only
                 comp.run(sections=args.compare if args.compare else None)
+
+            if args.reimport_template:
+                print(f"\n  -- REIMPORT TEMPLATE (large) --")
+                _reimport_template_large(
+                    migrator=migrator,
+                    template_name=args.reimport_template,
+                    dry_run=args.dry_run,
+                )
 
             if args.fix_templates:
                 print(f"\n  -- FIX TEMPLATES --")
