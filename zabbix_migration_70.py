@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.18"
+SCRIPT_VERSION = "2026-07-02.19-diag"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5607,6 +5607,16 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
         host_graphs = dst_api.graph.get(
             hostids=[hostid],
             output=["graphid", "name", "templateid", "flags"])
+
+        # Diagnostic: show what we found vs what we're matching against
+        print(f"    Host '{hname}': {len(host_graphs)} graph(s) on host")
+        _network_graphs = [g for g in host_graphs if "NETWORK" in g["name"].upper()]
+        for g in _network_graphs[:5]:
+            print(f"      graph: name={g['name']!r} flags={g.get('flags')} "
+                  f"templateid={g.get('templateid')}")
+        if tpl_proto_prefixes:
+            print(f"      matching against prefixes: {sorted(tpl_proto_prefixes)!r}")
+
         to_delete = []
         for g in host_graphs:
             gname = g["name"]
@@ -5617,6 +5627,7 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
                 if prefix and gname.startswith(prefix):
                     to_delete.append((g["graphid"], gname))
                     break
+        print(f"      matched for deletion: {len(to_delete)}")
 
         if to_delete:
             if dry_run:
