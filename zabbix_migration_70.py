@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.13"
+SCRIPT_VERSION = "2026-07-02.14"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -3942,14 +3942,16 @@ class ZabbixComparator:
 
     def __init__(self, src_api, dst_api, cia_name: str,
                  dst_url: str = "", dst_token: str = "",
-                 src_url: str = "", src_token: str = ""):
-        self.src        = src_api
-        self.dst        = dst_api
-        self.cia        = cia_name
-        self._dst_url   = dst_url
-        self._dst_token = dst_token
-        self._src_url   = src_url
-        self._src_token = src_token
+                 src_url: str = "", src_token: str = "",
+                 template_filter: Optional[str] = None):
+        self.src             = src_api
+        self.dst             = dst_api
+        self.cia             = cia_name
+        self._dst_url        = dst_url
+        self._dst_token      = dst_token
+        self._src_url        = src_url
+        self._src_token      = src_token
+        self.template_filter = template_filter
         self._warnings: List[str] = []
 
     # ── public entry point ───────────────────────────────────────────────────
@@ -4660,6 +4662,23 @@ class ZabbixComparator:
         dst_tpl_names = {t["name"]
                          for t in self.dst.template.get(output=["name"])}
 
+        # Apply single-template filter if set (--template NAME with --compare)
+        if self.template_filter:
+            match = {k: v for k, v in src_tpls.items()
+                     if k == self.template_filter}
+            if not match:
+                # Also allow templates outside the used set
+                match_any = self.src.template.get(
+                    filter={"name": self.template_filter},
+                    output=["templateid", "name"])
+                if match_any:
+                    match = {match_any[0]["name"]: match_any[0]["templateid"]}
+            if not match:
+                print(f"  Template '{self.template_filter}' not found in source.")
+                return
+            src_tpls = match
+            print(f"  Filtered to: '{self.template_filter}'")
+
         src_total      = len(src_tpls)
         missing_in_dst = sorted(n for n in src_tpls if n not in dst_tpl_names)
         to_compare     = [(name, tid) for name, tid in sorted(src_tpls.items())
@@ -4830,7 +4849,8 @@ class ZabbixComparator:
             "",
         ]
 
-        # MISSING IN DEST not reported here (use --list-orphan-templates)
+        # MISSING IN DEST not reported here (use --list-orphan-templates).
+        # When template_filter is set, only one template is compared — skip.
 
         if drifted:
             self._warnings.append(
@@ -6147,6 +6167,7 @@ Config files (same directory as this script):
                     dst_token=migrator._dest_token,
                     src_url=migrator._source_url,
                     src_token=migrator._src_token,
+                    template_filter=args.template,
                 )
                 # args.compare == [] means --compare with no args → all sections
                 # args.compare == ["hosts", ...] → selected sections only
