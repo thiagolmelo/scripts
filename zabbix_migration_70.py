@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.15"
+SCRIPT_VERSION = "2026-07-02.16"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5599,7 +5599,7 @@ def _reimport_template_large(migrator, template_name: str, dry_run: bool = False
       8. Verify every host is re-linked; write gap report if any missing.
       9. Remove orphaned items (templateid=0, not inherited) from re-linked hosts.
     """
-    HG_PREFIX = "/PRD-INF-METROLOGIE-INSTRU/ZBC_TEMPLATES"
+    HG_PREFIX = "PRD-INF-METROLOGIE-INSTRU/ZBC_TEMPLATES"
     hg_name   = f"{HG_PREFIX}/{template_name}"
     lbl       = "[DRY-RUN] " if dry_run else ""
 
@@ -6374,7 +6374,8 @@ Config files (same directory as this script):
                     dst_token=migrator._dest_token,
                     src_url=migrator._source_url,
                     src_token=migrator._src_token,
-                    template_filter=args.template,
+                    # --template OR --reimport-template both filter the compare
+                    template_filter=args.template or args.reimport_template,
                 )
                 # args.compare == [] means --compare with no args → all sections
                 # args.compare == ["hosts", ...] → selected sections only
