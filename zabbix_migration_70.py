@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.19-diag"
+SCRIPT_VERSION = "2026-07-02.19"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5591,6 +5591,38 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
         h      = hosts[0]
         hostid = h["hostid"]
 
+        # ── 0. Delete orphaned LLD rules on this host ─────────────────────────
+        # When the template was unlinked WITHOUT clear, its discovery rules
+        # were copied to the host as local objects (templateid=0). The new
+        # template's LLD rules then collide on graph prototypes:
+        #   'Graph "... {#IFNAME} ..." already exists (items are not identical)'
+        # Deleting the orphaned LLD rule cascade-deletes its item/trigger/graph
+        # prototypes AND all discovered objects — exactly what we need.
+        tpl_lld_keys = {r["key_"] for r in dst_api.discoveryrule.get(
+            templateids=[dst_tid], output=["key_"])}
+
+        host_llds = dst_api.discoveryrule.get(
+            hostids=[hostid],
+            output=["itemid", "name", "key_", "templateid"],
+            inherited=False)
+        lld_to_delete = []
+        for r in host_llds:
+            # orphaned copy of a template rule: same key, templateid=0
+            if str(r.get("templateid") or "0") == "0" and r["key_"] in tpl_lld_keys:
+                lld_to_delete.append((r["itemid"], r["name"]))
+
+        if lld_to_delete:
+            if dry_run:
+                print(f"  [DRY] '{hname}': would delete {len(lld_to_delete)} "
+                      f"orphaned LLD rule(s) (cascades prototypes + discovered)")
+            else:
+                for rid, rname in lld_to_delete:
+                    try:
+                        dst_api.discoveryrule.delete(rid)
+                        print(f"    - deleted orphaned LLD rule '{rname}'")
+                    except Exception as exc:
+                        print(f"    ! cannot delete LLD rule '{rname}': {exc}")
+
         # ── 1. Delete conflicting graphs on this host ─────────────────────────
         # The "Graph already exists (items are not identical)" error comes from
         # LLD-discovered graphs (flags=4) created by the OLD template's graph
@@ -5608,15 +5640,6 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
             hostids=[hostid],
             output=["graphid", "name", "templateid", "flags"])
 
-        # Diagnostic: show what we found vs what we're matching against
-        print(f"    Host '{hname}': {len(host_graphs)} graph(s) on host")
-        _network_graphs = [g for g in host_graphs if "NETWORK" in g["name"].upper()]
-        for g in _network_graphs[:5]:
-            print(f"      graph: name={g['name']!r} flags={g.get('flags')} "
-                  f"templateid={g.get('templateid')}")
-        if tpl_proto_prefixes:
-            print(f"      matching against prefixes: {sorted(tpl_proto_prefixes)!r}")
-
         to_delete = []
         for g in host_graphs:
             gname = g["name"]
@@ -5627,7 +5650,6 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
                 if prefix and gname.startswith(prefix):
                     to_delete.append((g["graphid"], gname))
                     break
-        print(f"      matched for deletion: {len(to_delete)}")
 
         if to_delete:
             if dry_run:
