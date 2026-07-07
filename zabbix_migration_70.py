@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.12"
+SCRIPT_VERSION = "2026-07-02.13"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -4741,64 +4741,55 @@ class ZabbixComparator:
 
         def _count_objects(result_data) -> dict:
             """
-            Parse importcompare result into counts per object type.
+            Parse importcompare result into a summary of changes per object type.
 
-            Zabbix 7.0 importcompare returns a DICT keyed by object type:
-              {
-                "templates": [{"name": "...", "data": {"new": {...}}}, ...],
-                "items":     [{"name": "...", "data": {"new": {...}, "current": {...}}}, ...],
-                "triggers":  [...],
-                ...
+            Real Zabbix 7.0 importcompare response structure:
+            {
+              "template_groups": {"added": [...], "updated": [...], "deleted": [...]},
+              "templates": {
+                "added":   [{"after": {...}}],
+                "updated": [{"before": {...}, "after": {...},
+                             "items":    {"added": [...], "updated": [...], "deleted": [...]},
+                             "triggers": {"updated": [...]},
+                             "graphs":   {...}, ...}],
+                "deleted": [...]
               }
+            }
 
-            An entry with only "new" key in data = object is new in source.
-            An entry with both "new" and "current" keys = object exists but changed.
+            Recursively walks the entire tree counting added/updated/deleted
+            for every object type encountered.
 
-            Returns {type_label: {"new": n, "changed": n}}.
+            Returns {object_type: {"added": n, "updated": n, "deleted": n}}
+            with only types that have at least one change.
             """
-            if not result_data:
+            if not result_data or not isinstance(result_data, dict):
                 return {}
 
-            counts: dict = {}
+            summary: dict = {}
 
-            # Handle dict structure (normal case)
-            if isinstance(result_data, dict):
-                for otype, entries in result_data.items():
-                    if not isinstance(entries, list):
+            def _add(otype, action, n=1):
+                if otype not in summary:
+                    summary[otype] = {"added": 0, "updated": 0, "deleted": 0}
+                summary[otype][action] += n
+
+            def _walk(obj):
+                if not isinstance(obj, dict):
+                    return
+                for key, changes in obj.items():
+                    if key in ("before", "after") or not isinstance(changes, dict):
                         continue
-                    for entry in entries:
-                        if not isinstance(entry, dict):
+                    for action in ("added", "updated", "deleted"):
+                        entries = changes.get(action, [])
+                        if not isinstance(entries, list) or not entries:
                             continue
-                        data = entry.get("data", {})
-                        if otype not in counts:
-                            counts[otype] = {"new": 0, "changed": 0}
-                        if isinstance(data, dict) and "current" in data:
-                            counts[otype]["changed"] += 1
-                        else:
-                            counts[otype]["new"] += 1
-                return counts
+                        _add(key, action, len(entries))
+                        if action == "updated":
+                            for entry in entries:
+                                if isinstance(entry, dict):
+                                    _walk(entry)
 
-            # Fallback: flat list (older API versions)
-            if isinstance(result_data, list):
-                for entry in result_data:
-                    if isinstance(entry, str):
-                        import re as _re2
-                        m = _re2.search(r'/([^/]+)/[^/]+[(][0-9]+[)]$', entry)
-                        otype = m.group(1) if m else "unknown"
-                        if otype not in counts:
-                            counts[otype] = {"new": 0, "changed": 0}
-                        counts[otype]["new"] += 1
-                    elif isinstance(entry, dict):
-                        otype = entry.get("type", "unknown")
-                        data  = entry.get("data", {})
-                        if otype not in counts:
-                            counts[otype] = {"new": 0, "changed": 0}
-                        if isinstance(data, dict) and "current" in data:
-                            counts[otype]["changed"] += 1
-                        else:
-                            counts[otype]["new"] += 1
-
-            return counts
+            _walk(result_data)
+            return {k: v for k, v in summary.items() if any(v.values())}
 
         drifted  = []
         errors   = []
@@ -4850,11 +4841,11 @@ class ZabbixComparator:
                 lines.append(f"  TEMPLATE: {tname}")
                 for otype, cnts in sorted(counts.items()):
                     parts = []
-                    if cnts["new"]:
-                        parts.append(f"new={cnts['new']}")
-                    if cnts["changed"]:
-                        parts.append(f"changed={cnts['changed']}")
-                    lines.append(f"    {otype:<{COL}}  {', '.join(parts)}")
+                    if cnts.get("added"):   parts.append(f"added={cnts['added']}")
+                    if cnts.get("updated"): parts.append(f"updated={cnts['updated']}")
+                    if cnts.get("deleted"): parts.append(f"deleted={cnts['deleted']}")
+                    if parts:
+                        lines.append(f"    {otype:<{COL}}  {', '.join(parts)}")
                 lines.append("")
         else:
             lines.append("No object drift found  ✓")
