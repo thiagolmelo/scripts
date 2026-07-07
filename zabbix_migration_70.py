@@ -198,7 +198,7 @@ def _fix_yaml_lld_formulaid(yaml_text: str) -> tuple:
 # easy to confirm which build is actually running.
 # Format: YYYY-MM-DD.N  (N = patch number within the day)
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "2026-07-02.17"
+SCRIPT_VERSION = "2026-07-02.18"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -5591,25 +5591,31 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
         h      = hosts[0]
         hostid = h["hostid"]
 
-        # ── 1. Delete conflicting orphaned graphs on this host ──────────────
-        # Host graphs not inherited from any template (templateid=0 via
-        # discover flag or plain flags=0/4 with no template parent) whose name
-        # matches a template graph or starts with a prototype prefix.
+        # ── 1. Delete conflicting graphs on this host ─────────────────────────
+        # The "Graph already exists (items are not identical)" error comes from
+        # LLD-discovered graphs (flags=4) created by the OLD template's graph
+        # prototypes. They block re-linking because the new prototype would
+        # create a graph with the same name using different (new) items.
+        #
+        # These discovered graphs are NOT inherited (templateid may point to
+        # the old prototype), so we match purely by NAME against the template's
+        # graphs and prototype prefixes, and delete every match regardless of
+        # flags/templateid. Discovered graphs whose parent prototype is gone
+        # are deletable; ones still owned by an active LLD get skipped
+        # individually (delete one-by-one so a single failure doesn't abort
+        # the whole batch).
         host_graphs = dst_api.graph.get(
             hostids=[hostid],
             output=["graphid", "name", "templateid", "flags"])
         to_delete = []
         for g in host_graphs:
-            # only orphans: not currently inherited from a template
-            if str(g.get("templateid") or "0") != "0":
-                continue
             gname = g["name"]
             if gname in tpl_graph_names:
-                to_delete.append(g["graphid"])
+                to_delete.append((g["graphid"], gname))
                 continue
             for prefix in tpl_proto_prefixes:
                 if prefix and gname.startswith(prefix):
-                    to_delete.append(g["graphid"])
+                    to_delete.append((g["graphid"], gname))
                     break
 
         if to_delete:
@@ -5617,11 +5623,18 @@ def _reimport_retry_failed(migrator, template_name: str, report_path: str,
                 print(f"  [DRY] '{hname}': would delete {len(to_delete)} "
                       f"conflicting graph(s)")
             else:
-                try:
-                    dst_api.graph.delete(*to_delete)
-                    orphan_graphs_deleted += len(to_delete)
-                except Exception as exc:
-                    print(f"  ! '{hname}': graph delete failed: {exc}")
+                deleted_here = 0
+                for gid, gname in to_delete:
+                    try:
+                        dst_api.graph.delete(gid)
+                        deleted_here += 1
+                    except Exception as exc:
+                        # Discovered graph still owned by an active LLD rule —
+                        # try clearing via its discovery parent is not possible
+                        # through graph API; log and continue.
+                        print(f"    ! '{hname}': cannot delete graph "
+                              f"'{gname}': {exc}")
+                orphan_graphs_deleted += deleted_here
 
         # ── 2. Delete orphaned items ─────────────────────────────────────────
         try:
